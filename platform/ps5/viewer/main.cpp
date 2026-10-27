@@ -106,6 +106,7 @@
 #include "ui_host.h"
 #include "ui_setup.h"
 #include "videoout.h"
+#include "viewer_env_defaults.h"
 #include "vr_mode.h"
 
 extern "C" int sceSystemServiceHideSplashScreen(void);
@@ -879,7 +880,13 @@ std::string last_component(const std::string& path) {
 // app_crt's _start(process_parameters, loader_teardown) calls this as main().
 // A title gets no arguments from the launch route, so viewer.env is the input.
 int main(int, char**) {
-    line("viewer: start (ps5-splat-vr, C6 renderer, RADV linked directly, no loader)");
+    // The title's own version, compiled in by the viewer Makefile: the one
+    // place a klog line (and so a bug report) can name what is running.
+#ifndef SPLAT_VERSION
+#define SPLAT_VERSION "0.0.0-unknown"
+#endif
+    line("viewer: start (ps5-splat-vr v%s, C6 renderer, RADV linked directly, no loader)",
+         SPLAT_VERSION);
     sceSystemServiceHideSplashScreen();
 
     // Before anything GPU: the pool RADV's winsys reports as its heap.
@@ -898,7 +905,8 @@ int main(int, char**) {
     const std::string env_text = load_env_file(kEnvPath);
     options.env_ok = !env_text.empty();
     if (!options.env_ok) {
-        line("viewer: no %s (using defaults: mode vr, the first scene, the 30 min cap)",
+        line("viewer: no %s (using defaults: mode vr, the first scene of the gallery, no "
+             "auto-exit)",
              kEnvPath.c_str());
     }
     const std::string mode = env_value(env_text, "MODE");
@@ -945,12 +953,18 @@ int main(int, char**) {
     options.scene = env_value(env_text, "SCENE");
     const std::string scenes_dir = env_value(env_text, "SCENES_DIR");
     if (!scenes_dir.empty()) options.scenes_dir = scenes_dir;
-    // MODE=vr defaults, after every key has been read: the standing comfort
-    // radius when COMFORT_RADIUS is absent (the TV path keeps 0.25 m) and the
-    // spec's 30-minute cap when SECONDS is absent (not the TV's 60 s).
+    // MODE=vr defaults, after every key has been read: SECONDS absent means no
+    // auto-exit (the v0.1 release leaked the dev bench's 30-minute cap into it,
+    // so a fresh install quit to the home screen half an hour in), and
+    // COMFORT_RADIUS absent is the spec's standing VR radius (the TV path keeps
+    // 0.25 m). viewer_env_defaults.h holds both rules, which the desktop tests
+    // drive as well.
     if (options.mode == "vr") {
-        if (!options.seconds_given) options.seconds = 30 * 60;
-        if (!options.comfort_given) options.comfort_radius = splat::kDefaultVrComfortRadius;
+        const viewer::VrDefaults vr_defaults = viewer::apply_vr_defaults(
+            options.seconds_given, options.seconds, options.comfort_given,
+            options.comfort_radius);
+        options.seconds = vr_defaults.seconds;
+        options.comfort_radius = vr_defaults.comfort_radius;
     }
     if (options.mode == "vr") {
         line("viewer: config %s: mode=vr scene=%s seconds=%d comfort_radius=%.3f m world_scale=%.2f "
@@ -1024,13 +1038,10 @@ int main(int, char**) {
         vr.world_scale = options.world_scale;
         vr.preload = options.preload;
         vr.mirror = options.mirror;
-        // A hard cap: the spec's 30 minutes, or SECONDS when that is shorter.
-        // SECONDS=0 (TV's "until the quit file") still means the cap in VR.
-        // options.seconds is already 1800 when MODE=vr had no SECONDS.
-        vr.cap_seconds = 30 * 60;
-        if (options.seconds > 0 && options.seconds < vr.cap_seconds) {
-            vr.cap_seconds = options.seconds;
-        }
+        // SECONDS is the session's only cap: 0 (the default, and an explicit
+        // SECONDS=0) means no auto-exit at all; the panel's Quit and the quit
+        // file still end the session. A dev run caps itself with SECONDS=1800.
+        vr.cap_seconds = viewer::vr_cap_seconds(options.seconds);
         line("viewer: mode vr (MODE=vr in %s); TV mode is MODE=tv",
              options.env_ok ? kEnvPath.c_str() : "(defaults)");
         const int status = viewer::run_vr(vr);

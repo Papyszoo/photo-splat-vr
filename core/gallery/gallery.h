@@ -55,6 +55,47 @@ std::vector<AlbumEntry> list_albums(const Path& root);
 // missing album directory yields an empty list.
 std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album = "");
 
+// What a viewer boots from when no scene was picked by hand: one album and its
+// scenes, in the gallery's own order (the same list_albums/list_scenes a screen
+// reads).
+struct BootAlbum {
+    std::string album;               // album folder name; "" for the loose scenes
+    std::vector<SceneEntry> scenes;  // that album's scenes, gallery order
+    size_t index = 0;                // the scene to show first
+};
+
+// The album a fresh start shows: the loose-scene album (Unsorted) first, then
+// the albums in list_albums() order - the first one that holds a scene. A
+// `preferred` folder name (viewer.env's SCENE) wins wherever it sits, and its
+// own album comes with it, so the caller's scene stepping stays inside one
+// album exactly as the gallery screen lists it. Empty `scenes` means the
+// gallery holds no scene at all (a fresh install before any seed, an empty
+// data folder); that is not an error: the caller opens its menu instead.
+BootAlbum boot_album(const Path& root, const std::string& preferred = "");
+
+// One scene the boot loader walked past because it would not read.
+struct BootSceneSkip {
+    std::size_t index = 0;  // its place in the boot playlist
+    std::string name;       // scene folder name
+    std::string error;      // read_scene_path()'s message
+};
+
+// What the viewer got from its boot playlist.
+struct BootSceneLoad {
+    std::size_t index = 0;   // playlist index of the scene that loaded
+    bool loaded = false;     // false: every scene tried failed, the empty-view path
+    LoadedScene scene;
+    std::vector<BootSceneSkip> skipped;  // one entry per failed scene, in order
+};
+
+// Reads the boot playlist's scene folders from `start` to its end and returns
+// the first that loads, so a corrupt, truncated, unreadable or wrong-format
+// scene is skipped instead of ending the session. `loaded == false` means none
+// of the scenes tried would read; the caller then behaves as if the gallery
+// were empty (empty view, the menu on the folders home). The caller logs one
+// line per `skipped` entry.
+BootSceneLoad load_boot_scene(const std::vector<Path>& scene_folders, std::size_t start = 0);
+
 // Creates root/<name> (and the root). Fails when the name is invalid, reserved
 // or already taken.
 Status create_album(const Path& root, const std::string& name);

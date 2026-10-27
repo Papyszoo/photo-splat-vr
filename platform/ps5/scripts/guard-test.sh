@@ -4,17 +4,20 @@
 #
 #   platform/ps5/scripts/guard-test.sh
 #
-# User decision (AGENTS.md): two installs live on the console. Agent scripts may
-# drive only the dev identity, and no script in this repo may read, list, write
-# or delete under the release identity's data folder (the user's private data).
-# Both facts come from platform/ps5/title/identities.json: "agentsMayRun" and
-# each identity's dataDir. This test runs every console script against the
-# release identity and against the private data path and requires a refusal that
-# happens before any request: PS5_HOST is unset, so a regression that reached
-# the request stage would stop at "set PS5_HOST" (a different message) instead.
-# It also checks that the same scripts still plan a dev run (the guards are not
-# a blanket refusal), and that installing the release package files is still
-# allowed (only launching it and touching its data are refused).
+# User decision (AGENTS.md): three installs live on the console. Agent scripts
+# may drive the dev and the fresh identity and never the release one, and no
+# script in this repo may read, list, write or delete under the release
+# identity's data folder (the user's private data). Both facts come from
+# platform/ps5/title/identities.json: "agentsMayRun" and each identity's
+# dataDir. This test runs every console script against the release identity and
+# against the private data path and requires a refusal that happens before any
+# request: PS5_HOST is unset, so a regression that reached the request stage
+# would stop at "set PS5_HOST" (a different message) instead. It also checks
+# that the same scripts still plan a dev run and a fresh run (the guards are not
+# a blanket refusal), that installing the release package files is still
+# allowed (only launching it and touching its data are refused), and that
+# IDENTITY selects an identity by name while an unknown name or RELEASE=1
+# beside another name is refused.
 #
 # Last, a mock package with the bundled sample names ("Living room",
 # "York street") and shell/URL metacharacters must install: every upload and
@@ -42,7 +45,7 @@ run_offline() {
     local envs=()
     while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
     shift
-    output="$(env -u PS5_HOST -u RELEASE PS5_ENV_FILE=/dev/null "${envs[@]}" \
+    output="$(env -u PS5_HOST -u RELEASE -u IDENTITY PS5_ENV_FILE=/dev/null "${envs[@]}" \
         "$@" 2>&1)"
     status=$?
 }
@@ -81,7 +84,7 @@ check_allowed() {  # check_allowed LABEL MESSAGE -- ENV... -- COMMAND...
     shift
     run_offline "${envs[@]}" -- "$@"
     if [ "$status" -eq 0 ] && printf '%s' "$output" | grep -qF -- "$message"; then
-        printf '  ok   %-52s exit 0, dev plan printed\n' "$label"
+        printf '  ok   %-52s exit 0, plan printed\n' "$label"
         allowed=$((allowed + 1))
     else
         printf '  FAIL %-52s exit %s\n%s\n' "$label" "$status" "$output"
@@ -89,8 +92,29 @@ check_allowed() {  # check_allowed LABEL MESSAGE -- ENV... -- COMMAND...
     fi
 }
 
+check_permitted() {  # check_permitted LABEL MESSAGE -- ENV... -- COMMAND...
+    # Like check_allowed, for a call that prints no plan of its own (a guard
+    # function): exit 0 and, when MESSAGE is not empty, that text.
+    local label="$1" message="$2"
+    shift 2
+    local envs=()
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
+    shift
+    run_offline "${envs[@]}" -- "$@"
+    if [ "$status" -eq 0 ] &&
+       { [ -z "$message" ] || printf '%s' "$output" | grep -qF -- "$message"; }; then
+        printf '  ok   %-52s exit 0, allowed\n' "$label"
+        allowed=$((allowed + 1))
+    else
+        printf '  FAIL %-52s exit %s (wanted 0)\n%s\n' "$label" "$status" "$output"
+        failures=$((failures + 1))
+    fi
+}
+
 guard_message="agent scripts never launch the release install"
 private_message="is the user's private data folder"
+absolute_message="must be absolute"
+empty_message="an empty console path"
 
 # ---- a fake release package (the scripts only read its param.json/eboot) -----
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/ps5splat-guard.XXXXXX")"
@@ -103,6 +127,12 @@ python3 "$title_script/identity.py" --param "$title_script/param.json" \
 # The same fake for the dev identity: run-viewer.sh and title.sh want a package
 # before they print their plan, and this test must not depend on a build (or on
 # whatever the real package happens to carry today).
+fresh_package="$tmp/PPSA99771"
+mkdir -p "$fresh_package/sce_sys" "$fresh_package/shaders"
+printf 'not an eboot\n' >"$fresh_package/eboot.bin"
+printf 'not a shader\n' >"$fresh_package/shaders/project.comp.spv"
+python3 "$title_script/identity.py" --param "$title_script/param.json" \
+    --out "$fresh_package/sce_sys/param.json" --title-id PPSA99771
 dev_package="$tmp/PPSA99202"
 mkdir -p "$dev_package/sce_sys" "$dev_package/shaders"
 printf 'not an eboot\n' >"$dev_package/eboot.bin"
@@ -153,6 +183,66 @@ check_allowed "title.sh install --dry-run dev package" "install PPSA99202 -> /da
     -- "$here/title.sh" install --dry-run "$dev_package"
 check_allowed "run-viewer.sh --dry-run (dev)" "title route: PPSA99202" \
     -- "$here/run-viewer.sh" --dry-run --package "$dev_package"
+
+say "the fresh identity (IDENTITY=fresh) builds, installs, launches and is uninstalled like dev"
+check_allowed "title.sh install --dry-run fresh package" "install PPSA99771 -> /data/homebrew/PPSA99771" \
+    IDENTITY=fresh -- "$here/title.sh" install --dry-run "$fresh_package"
+check_allowed "title.sh launch --dry-run fresh package" "launch PPSA99771" \
+    IDENTITY=fresh -- "$here/title.sh" launch --dry-run "$fresh_package"
+check_allowed "title.sh stop --dry-run fresh package" "stop PPSA99771" \
+    IDENTITY=fresh -- "$here/title.sh" stop --dry-run "$fresh_package"
+check_allowed "title.sh put --dry-run fresh data dir" "-> /data/psvr-fresh-test/title-quit" \
+    IDENTITY=fresh -- "$here/title.sh" put --dry-run "$tmp/quit.txt" \
+    "/data/psvr-fresh-test/title-quit"
+check_allowed "run-viewer.sh --dry-run (fresh)" "title route: PPSA99771" \
+    IDENTITY=fresh -- "$here/run-viewer.sh" --dry-run --package "$fresh_package"
+check_permitted "ps5_agent_guard_identity PPSA99771" "" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_agent_guard_identity PPSA99771' _ "$here"
+check_permitted "ps5_guard_remote_path /data/psvr-fresh-test/x" "" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2/x"' _ "$here" /data/psvr-fresh-test
+check_permitted "ps5_guard_remote_path /data/photo-splat-vr-x/x" "" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2/x"' _ "$here" /data/photo-splat-vr-x
+
+say "the fresh identity refuses what it always refused"
+# An identity is not a key to the release install: the guard reads the package's
+# title id, so IDENTITY=fresh changes nothing about PPSA99770.
+check_refused "title.sh launch release package, IDENTITY=fresh" "$guard_message" \
+    IDENTITY=fresh -- "$here/title.sh" launch --dry-run "$release_package"
+check_refused "title.sh put private path, IDENTITY=fresh" "$private_message" \
+    IDENTITY=fresh -- "$here/title.sh" put --dry-run "$tmp/quit.txt" \
+    "$private_dir/title-quit"
+check_refused "ps5_guard_remote_path private dir, IDENTITY=fresh" "$private_message" \
+    IDENTITY=fresh -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2/x"' _ "$here" "$private_dir"
+# Component-wise comparison, not a string prefix: "." collapses to the private
+# folder and a ".." is refused rather than resolved.
+check_refused "ps5_guard_remote_path /data/./photo-splat-vr" "$private_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2/x"' _ "$here" "/data/./photo-splat-vr"
+check_refused "ps5_guard_remote_path /data/photo-splat-vr/../x" "a '..' component" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2"' _ "$here" "$private_dir/../x"
+check_refused "ps5_guard_remote_path //data//photo-splat-vr" "$private_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "$2"' _ "$here" "//data//photo-splat-vr"
+# A path the whole-component check cannot compare is refused, never let through:
+# a relative path never matches an absolute private folder, and an empty one
+# names nothing. ".." is refused before it can be resolved to the private folder.
+check_refused "ps5_guard_remote_path relative data/photo-splat-vr" "$absolute_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "data/photo-splat-vr"' _ "$here"
+check_refused "ps5_guard_remote_path relative photo-splat-vr/x" "$absolute_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "photo-splat-vr/x"' _ "$here"
+check_refused "ps5_guard_remote_path (empty)" "$empty_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path ""' _ "$here"
+check_refused "ps5_guard_remote_path /data/../data/photo-splat-vr" "a '..' component" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "/data/../data/photo-splat-vr"' _ "$here"
+check_refused "ps5_guard_remote_path //data/photo-splat-vr" "$private_message" \
+    -- bash -c '. "$1/ps5-env.sh"; ps5_guard_remote_path "//data/photo-splat-vr"' _ "$here"
+# IDENTITY itself: a name the table does not hold, and RELEASE=1 beside another
+# name, stop before any request is built.
+check_refused "IDENTITY=<unknown name>" "unknown identity 'nope'" \
+    IDENTITY=nope -- "$here/run-viewer.sh" --dry-run --package "$dev_package"
+check_refused "RELEASE=1 with IDENTITY=fresh" "asks for another one" \
+    IDENTITY=fresh RELEASE=1 -- "$here/run-viewer.sh" --dry-run --package "$dev_package"
+check_refused "RELEASE=1 with IDENTITY=dev" "asks for another one" \
+    IDENTITY=dev RELEASE=1 -- "$here/title.sh" put --dry-run "$tmp/quit.txt" \
+    "/data/ps5-splat-vr/title-quit"
 
 # ---- install plans: spaces and shell/URL metacharacters ---------------------
 # The bundled sample folders are "Living room", "Sailboats" and "York street"

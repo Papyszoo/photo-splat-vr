@@ -14,6 +14,15 @@
       "agentsMayRun": true
     },
     {
+      "name": "fresh",
+      "titleId": "PPSA99771",
+      "conceptId": "99771",
+      "contentId": "IV0000-PPSA99771_00-PHOTOSPLATFRESH1",
+      "titleName": "Photo Splat VR Fresh Test",
+      "dataDir": "/data/psvr-fresh-test",
+      "agentsMayRun": true
+    },
+    {
       "name": "release",
       "titleId": "PPSA99770",
       "conceptId": "99770",

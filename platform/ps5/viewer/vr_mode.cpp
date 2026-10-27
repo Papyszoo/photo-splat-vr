@@ -4,8 +4,11 @@
 //
 // What one session does:
 //
-//   1. read the scene list (ScenePlaylist) and the .psplat the TV path would
-//      show, then bring RADV up (the caller logged the pools);
+//   1. read the boot album from the gallery (core/gallery: the loose scenes
+//      first, then the albums in gallery order, which is where a fresh
+//      install's Samples live) and the .psplat the TV path would show, then
+//      bring RADV up (the caller logged the pools); with no scene anywhere the
+//      renderer starts empty and the menu opens on the folders home;
 //   2. create the three host-visible eye buffers Hmd2 samples (eye_buffers.h),
 //      bring Hmd2 up in external-buffer mode, and read the headset's field of
 //      view: per-eye tangents out/in/top/bottom, which are asymmetric (PSVR2:
@@ -22,7 +25,8 @@
 //      world scale 1.0, and the scene stays anchored there;
 //   5. render one frame per 60 Hz slot with hmd2's pacing, copy it into the eye
 //      buffer Hmd2 gave us (GPU copy, no CPU pixels), submit, and repeat until
-//      the panel's Quit item, the quit file, or the 30-minute cap;
+//      the panel's Quit item, the quit file or SECONDS (a dev cap only: 0, the
+//      release default, means the session has no auto-exit);
 //   6. tear down on every path: the pads (Sense left, right, then the
 //      DualSense), VR mode off, buffers unregistered, display, Hmd2, tracker,
 //      then the Vulkan objects.
@@ -689,6 +693,7 @@ public:
         preloader_.cancel();
         preload_index_ = -1;
         refused_preload_ = -1;
+        failed_preload_ = -1;
     }
 
     bool upload(std::size_t index) override {
@@ -736,8 +741,11 @@ public:
             renderer_.discard_staged_scene();
             return false;
         }
-        // A new current scene: a preload refused for budget earlier may fit now.
+        // A new current scene: a preload refused for budget earlier may fit now,
+        // and a scene whose read failed is worth one more try (the file may have
+        // been replaced).
         refused_preload_ = -1;
+        failed_preload_ = -1;
         return true;
     }
 
@@ -752,6 +760,10 @@ public:
             auto next = preloader_.take();
             preload_index_ = -1;
             if (!next.ok()) {
+                // Remember the scene: a corrupt next scene must not be re-read
+                // every frame (one log line, not a log storm). It is still
+                // attempted on demand when the user steps onto it.
+                failed_preload_ = want;
                 line("viewer: vr preload failed: %s", next.message().c_str());
                 return;
             }
@@ -774,8 +786,10 @@ public:
                  static_cast<double>(renderer_.staged_bytes()) / (1024.0 * 1024.0));
             return;
         }
-        // Idle: prefetch the next scene, unless it does not fit the budget.
+        // Idle: prefetch the next scene, unless it does not fit the budget or
+        // its read already failed.
         const size_t next_index = (scenes_.index() + 1) % scenes_.size();
+        if (static_cast<long>(next_index) == failed_preload_) return;
         if (static_cast<long>(next_index) == refused_preload_) return;
         const size_t bytes = preload_score(next_index);
         if (bytes > kPreloadBudgetBytes) {
@@ -832,6 +846,7 @@ private:
     long staged_ = -1;              // playlist index in the slot, -1 = empty
     long preload_index_ = -1;       // playlist index the worker is reading
     long refused_preload_ = -1;     // index known to be over the preload budget
+    long failed_preload_ = -1;      // index whose read failed; skipped until the scene changes
     float median_depth_ = 1.6f;     // the slot's scene's centre (log, depth)
     float near_depth_ = 1.6f;       // the slot's scene's nearest content (pivot clamp)
     std::vector<float> pivot_samples_;  // decimated splat positions for a press's cone
@@ -847,9 +862,12 @@ int run_vr(const VrOptions& options) {
     // A quit file from an earlier stop must not end this run: only one written
     // after the session started counts (the TV path's contract).
     const std::time_t started_wall = std::time(nullptr);
-    line("viewer: vr session (mode vr): eye %ux%u per eye, 60 rendered -> 120 Hz reprojected, "
-         "cap %d s",
-         kEyeWidth, kEyeHeight, options.cap_seconds);
+    line("viewer: vr session (mode vr): eye %ux%u per eye, 60 rendered -> 120 Hz reprojected, %s",
+         kEyeWidth, kEyeHeight,
+         options.cap_seconds > 0 ? "SECONDS cap set" : "no auto-exit (SECONDS absent or 0)");
+    if (options.cap_seconds > 0) {
+        line("viewer: vr cap: %d s from this run's viewer.env SECONDS", options.cap_seconds);
+    }
 
     // The head-pose and input log of this run. Optional: a /data that refuses
     // the write must not cost the session (the first title to write there
@@ -865,30 +883,56 @@ int run_vr(const VrOptions& options) {
     }
 
     // ---- scene list -------------------------------------------------------
-    auto playlist_result = splat::ScenePlaylist::from_folder(splat::Path(options.scenes_dir));
-    if (!playlist_result.ok()) {
-        line("viewer: FAIL scenes: %s", playlist_result.message().c_str());
-        return 2;
-    }
-    splat::ScenePlaylist& scenes = playlist_result.value();
-    line("viewer: vr scenes: %zu folder(s) under %s", scenes.size(),
-         options.scenes_dir.c_str());
-    size_t scene_index = 0;
-    if (!options.scene.empty()) {
-        bool found = false;
-        for (size_t i = 0; i < scenes.size(); ++i) {
-            if (scenes.entry(i).folder.filename().string() == options.scene) {
-                scene_index = i;
-                found = true;
-                break;
-            }
+    // The gallery's own boot order, not a second scan of the root: the loose
+    // scenes (Unsorted) first, then the albums in list_albums() order - which is
+    // where a fresh install's samples live, so the first launch shows a scene
+    // instead of failing (v0.1 exited 2 here with "no scene folders"). SCENE=
+    // still picks a folder by name and brings its own album with it, and the
+    // playlist covers exactly that album, so L1/R1 step as the gallery lists.
+    const splat::Path scenes_root(options.scenes_dir);
+    splat::ScenePlaylist scenes;
+    std::string boot_album;
+    const splat::BootAlbum boot = splat::boot_album(scenes_root, options.scene);
+    if (!boot.scenes.empty()) {
+        boot_album = boot.album;
+        auto built = splat::ScenePlaylist::from_entries(splat::playlist_entries(boot.scenes));
+        if (built.ok()) {
+            scenes = built.take();
+            scenes.set_index(boot.index);
         }
-        if (!found) {
-            line("viewer: vr SCENE=%s is not one of the %zu folders under %s; using the first",
-                 options.scene.c_str(), scenes.size(), options.scenes_dir.c_str());
-        }
+    } else {
+        // No scene in the gallery: a SCENES_DIR that is itself a scene folder is
+        // still a one-entry playlist (the pre-gallery behaviour of a dev setup).
+        auto root_playlist = splat::ScenePlaylist::from_folder(scenes_root);
+        if (root_playlist.ok()) scenes = root_playlist.take();
     }
-    scenes.set_index(scene_index);
+    // True while the session has a scene to show. It becomes false when the
+    // boot playlist's scenes all fail to read: from there the session is the
+    // empty-gallery one (empty view, the menu on the folders home).
+    bool boot_has_scene = !scenes.empty();
+    if (boot_has_scene && !boot.scenes.empty()) {
+        line("viewer: vr scenes: %zu scene(s) in album %s under %s", scenes.size(),
+             boot_album.empty() ? "(Unsorted)" : boot_album.c_str(), options.scenes_dir.c_str());
+        if (!options.scene.empty() && scenes.current().folder.filename().string() != options.scene) {
+            line("viewer: vr SCENE=%s is not in the gallery under %s; using the first scene of "
+                 "album %s",
+                 options.scene.c_str(), options.scenes_dir.c_str(),
+                 boot_album.empty() ? "(Unsorted)" : boot_album.c_str());
+        } else if (!options.scene.empty()) {
+            line("viewer: vr SCENE=%s: album %s, scene %zu/%zu", options.scene.c_str(),
+                 boot_album.empty() ? "(Unsorted)" : boot_album.c_str(), scenes.index() + 1,
+                 scenes.size());
+        }
+    } else if (boot_has_scene) {
+        line("viewer: vr scenes: %s is itself a scene folder; the playlist is that one scene",
+             options.scenes_dir.c_str());
+    } else {
+        // An empty gallery is not an error any more: the session comes up, the
+        // panel opens on the folders home and the user can add photos there.
+        line("viewer: vr scenes: none in %s (Unsorted or its albums); the menu opens over an "
+             "empty view",
+             options.scenes_dir.c_str());
+    }
 
     // ---- device -----------------------------------------------------------
     const double device_started = now_ms();
@@ -907,22 +951,47 @@ int run_vr(const VrOptions& options) {
     }
 
     // ---- first scene, read before anything is on the headset --------------
-    const splat::Path first_path = scenes.current().scene_file;
-    const double scene_started = now_ms();
-    auto first_result = splat::read_scene_path(first_path);
-    if (!first_result.ok()) {
-        line("viewer: FAIL load %s: %s", first_path.string().c_str(),
-             first_result.message().c_str());
-        return 3;
-    }
-    splat::LoadedScene loaded = first_result.take();
-    line("viewer: vr scene %zu/%zu %s: %zu splats, load %.1f ms", scene_index + 1, scenes.size(),
-         scenes.current().folder.filename().string().c_str(), loaded.scene.count(),
-         now_ms() - scene_started);
-    if (loaded.meta.intrinsics.fx > 0.0f) {
-        line("viewer: vr capture intrinsics fx %.2f fy %.2f cx %.1f cy %.1f, image %ux%u",
-             loaded.meta.intrinsics.fx, loaded.meta.intrinsics.fy, loaded.meta.intrinsics.cx,
-             loaded.meta.intrinsics.cy, loaded.meta.intrinsics.width, loaded.meta.intrinsics.height);
+    // A scene that will not read (corrupt, truncated, unreadable, another
+    // format) is skipped, not fatal: the next scene of the boot playlist is
+    // tried (load_boot_scene), one log line per skip. When none reads, the
+    // session takes the empty-gallery path: the renderer starts empty (the TV
+    // path's UI=1 precedent) and the panel opens on the folders home, where the
+    // user can pick another scene. v0.1.1 exited 3 here.
+    splat::LoadedScene loaded;
+    if (boot_has_scene) {
+        std::vector<splat::Path> boot_folders;
+        boot_folders.reserve(scenes.size());
+        for (size_t i = 0; i < scenes.size(); ++i) boot_folders.push_back(scenes.entry(i).folder);
+        const size_t boot_size = scenes.size();
+        const size_t boot_start = scenes.index();
+        const double scene_started = now_ms();
+        splat::BootSceneLoad boot_load = splat::load_boot_scene(boot_folders, boot_start);
+        for (const splat::BootSceneSkip& skip : boot_load.skipped) {
+            line("viewer: vr scene %zu/%zu %s will not load: %s; skipping it", skip.index + 1,
+                 boot_size, skip.name.c_str(), skip.error.c_str());
+        }
+        if (boot_load.loaded) {
+            scenes.set_index(boot_load.index);
+            loaded = std::move(boot_load.scene);
+            line("viewer: vr scene %zu/%zu %s: %zu splats, load %.1f ms", scenes.index() + 1,
+                 scenes.size(), scenes.current().folder.filename().string().c_str(),
+                 loaded.scene.count(), now_ms() - scene_started);
+            if (loaded.meta.intrinsics.fx > 0.0f) {
+                line("viewer: vr capture intrinsics fx %.2f fy %.2f cx %.1f cy %.1f, image %ux%u",
+                     loaded.meta.intrinsics.fx, loaded.meta.intrinsics.fy,
+                     loaded.meta.intrinsics.cx, loaded.meta.intrinsics.cy,
+                     loaded.meta.intrinsics.width, loaded.meta.intrinsics.height);
+            }
+        } else {
+            // Same session as an empty gallery: no playlist (so a ResumeScene
+            // in the panel does not close it onto a black view) and the panel
+            // boot-opens on the folders home.
+            scenes = splat::ScenePlaylist{};
+            boot_has_scene = false;
+            line("viewer: vr scenes: no scene of the boot playlist would load from scene "
+                 "%zu/%zu under %s; the menu opens over an empty view",
+                 boot_start + 1, boot_size, options.scenes_dir.c_str());
+        }
     }
 
     // ---- eye buffers and Hmd2 ---------------------------------------------
@@ -1083,8 +1152,11 @@ int run_vr(const VrOptions& options) {
             loaded.meta.intrinsics.cy};
         renderer_options.capture_width = loaded.meta.intrinsics.width;
         renderer_options.capture_height = loaded.meta.intrinsics.height;
-    } else {
+    } else if (boot_has_scene) {
         line("viewer: vr no capture intrinsics in meta.json; the capture-frustum fade is off");
+    } else {
+        line("viewer: vr no scene yet: the renderer starts empty and keeps its 60 degree fallback "
+             "until the menu loads one");
     }
     const double renderer_started = now_ms();
     splat::Result<std::unique_ptr<splat::SplatRenderer>> renderer_result;
@@ -1112,11 +1184,13 @@ int run_vr(const VrOptions& options) {
     // pass over 1.2 M splats.
     SceneDepths first_depths = scene_depths(loaded.scene);
     loaded.scene = splat::SplatScene{};
-    line("viewer: vr scene centre %.2f m ahead on the capture camera axis, near content %.2f m "
-         "(scale: the maquette (Settings > Scale) lands the cone's median centre on a table point "
-         "0.7 m ahead / 0.35 m below the eyes and scales there; Front keeps the 5th-percentile "
-         "depth put, Centre the median; L2/R2 never move the viewer)",
-         static_cast<double>(first_depths.median), static_cast<double>(first_depths.near));
+    if (boot_has_scene) {
+        line("viewer: vr scene centre %.2f m ahead on the capture camera axis, near content %.2f m "
+             "(scale: the maquette - Settings > Scale - lands the cone's median centre on a table "
+             "point 0.7 m ahead / 0.35 m below the eyes and scales there; Front keeps the "
+             "5th-percentile depth put, Centre the median; L2/R2 never move the viewer)",
+             static_cast<double>(first_depths.median), static_cast<double>(first_depths.near));
+    }
 
     // ---- the panel (W16) --------------------------------------------------
     // The same panel the TV path builds (ui_setup.h: one UiApp, one UiHost), over
@@ -1124,6 +1198,13 @@ int run_vr(const VrOptions& options) {
     // the eyes and the scene keeps rendering behind it. viewer.env's UI key
     // decides whether the headset has a panel at all - VR default: available,
     // UI=0: none, exactly the pre-W16 session - and UI=1 boots into it.
+    //
+    // With no scene in the gallery the menu is the session: it boot-opens on the
+    // folders home (the Albums screen), over the empty view. With a scene it
+    // boot-opens too when viewer.env gave no SCENE (a fresh install: the first
+    // sample renders behind the folders home, so the user sees what the package
+    // brought and can pick another); a dev run with SCENE= keeps the pre-W34
+    // session, where Options opens the panel.
     viewer::Options ui_options = viewer::ui_options_from_env();
     ui_options.scenes_dir = options.scenes_dir;
     bool panel_available = ui_options.ui_given ? ui_options.ui : true;
@@ -1142,20 +1223,28 @@ int run_vr(const VrOptions& options) {
     // A failed panel must not cost the headset session: the scene still runs,
     // and the log says why the menu is not there.
     if (ui_runtime != nullptr) {
-        ui_runtime->app->set_scene_loaded(true);
+        ui_runtime->app->set_scene_loaded(boot_has_scene);
     }
-    viewer::PanelMode panel(panel_available, panel_available && ui_options.ui);
+    const bool boot_open_panel = ui_options.ui || !boot_has_scene || options.scene.empty();
+    viewer::PanelMode panel(panel_available, panel_available && boot_open_panel);
     if (ui_runtime != nullptr) {
         line("viewer: vr ui: panel %s (UI %s, %s); Options opens and closes it, Quit is its last "
-             "item",
+             "item%s",
              panel.open() ? "open at boot" : "available",
              ui_options.ui_given ? (ui_options.ui ? "=1" : "=0") : "not set, VR default",
-             ui_options.ui_fake ? "fake services" : "models, jobs and captures real");
+             ui_options.ui_fake ? "fake services" : "models, jobs and captures real",
+             boot_has_scene ? "" : "; no scene in the gallery, so the folders home is the session");
     } else if (!panel_error.empty()) {
         line("viewer: vr ui: no panel (%s); the session runs with the scene only",
              panel_error.c_str());
     } else {
         line("viewer: vr ui: off (UI=0 in viewer.env); the session runs with the scene only");
+    }
+    if (!boot_has_scene && ui_runtime == nullptr) {
+        // Nothing to show and no menu: the headset stays black until a scene
+        // arrives, but the session is still alive (a pose wait, the quit file
+        // and SECONDS end it). Say so instead of failing.
+        line("viewer: vr no scene and no panel: the headset shows the empty view");
     }
 
     const VkExtent2D extent = renderer->target_extent();
@@ -1278,7 +1367,11 @@ int run_vr(const VrOptions& options) {
     // press (scene_switch.h).
     bool intrinsics_noted = false;
 
-    auto current_folder = [&]() { return scenes.current().folder.filename().string(); };
+    // The playlist's current folder, for the logs and the pose log. Empty when
+    // the gallery had no scene at boot (until the menu loads one).
+    auto current_folder = [&]() {
+        return scenes.empty() ? std::string() : scenes.current().folder.filename().string();
+    };
 
     auto note_intrinsics = [&](const splat::LoadedScene& next) {
         const splat::Intrinsics& now_intrinsics = loaded.meta.intrinsics;
@@ -1568,7 +1661,7 @@ int run_vr(const VrOptions& options) {
 
     // The initial scene's label, now that the renderer and the playlist are
     // both ready. Every later scene switch refreshes it in show_scene().
-    refresh_label(scenes.index());
+    if (boot_has_scene) refresh_label(scenes.index());
 
     // The preload slot: the renderer's staging buffers, the worker that reads
     // the next scene, and the playlist bookkeeping (see VrSwitchSlot and
@@ -1774,7 +1867,10 @@ int run_vr(const VrOptions& options) {
     for (;;) {
         const double now_loop = now_ms();
         log_event[0] = '\0';
-        if (placed && (now_loop - placed_at) / 1000.0 >= static_cast<double>(options.cap_seconds)) {
+        // SECONDS only ends the session when the dev run asked for it: 0 is no
+        // auto-exit, so the title never quits to the home screen on its own.
+        if (placed && options.cap_seconds > 0 &&
+            (now_loop - placed_at) / 1000.0 >= static_cast<double>(options.cap_seconds)) {
             line("viewer: vr session cap reached (%.0f s of %d s)", (now_loop - placed_at) / 1000.0,
                  options.cap_seconds);
             log_pose("cap");
@@ -2446,6 +2542,14 @@ int run_vr(const VrOptions& options) {
                         // Options in the panel: back to the scene that is still
                         // loaded, with the menu where the user left it.
                         line("viewer: ui command resume_scene");
+                        // With no scene loaded there is nothing to resume to: the
+                        // menu stays up instead of leaving the user on the empty
+                        // view with no way back except Options.
+                        if (scenes.empty()) {
+                            ui_runtime->app->toast("No scene yet - pick one");
+                            line("viewer: vr resume scene: no scene loaded; the menu stays open");
+                            break;
+                        }
                         panel.close();
                         ui_host.set_visible(false);
                         line("viewer: ui close");

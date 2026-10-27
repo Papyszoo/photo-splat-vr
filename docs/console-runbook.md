@@ -38,6 +38,8 @@ folder whatever identity is selected. `title.sh install/status` still work for
 the release package: they touch `/data/homebrew/PPSA99770` only, and installing
 its files is allowed. `title-uninstall.sh --data PPSA99770` is refused.
 
+`fresh` (`PPSA99771` "Photo Splat VR Fresh Test", data `/data/psvr-fresh-test`, `make … IDENTITY=fresh`) is the throwaway slot for the pre-release fresh-install check — install the release zip there, run the first-use check, then `title-uninstall.sh --yes --data PPSA99771`, so it is gone after each check (the guards allow it like dev; `PPSA99770` and `/data/photo-splat-vr` stay refused).
+
 Within one identity, nothing else needs deleting or reinstalling per test, but an install of
 one program replaces whatever eboot was there: after a bench or `run-vr-hello.sh`
 run, the tile starts that program until you install the viewer again

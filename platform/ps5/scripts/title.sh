@@ -37,8 +37,8 @@
 #            takes no package and never writes outside the data directory.
 #
 # <dataDir> is the data folder of the identity the package was built as
-# (identities.json): /data/ps5-splat-vr for the dev build, the release
-# identity's own folder for a release package.
+# (identities.json): /data/ps5-splat-vr for the dev build, /data/psvr-fresh-test
+# for the fresh build, the release identity's own folder for a release package.
 #
 # Safety, the same rules as push-data.sh:
 #   - every remote path is /data/homebrew/<our TITLE_ID> or that data folder;
@@ -173,9 +173,10 @@ else
 fi
 [ -n "$data_root" ] || fail "no data folder for ${title_id:-the selected identity} in platform/ps5/title/identities.json" 2
 
-# Only the dev identity may be launched or stopped, and only its data folder may
-# be written: agents never drive the release install (AGENTS.md). install and
-# status stay allowed for a release package: they touch /data/homebrew only.
+# Only an identity the table marks agentsMayRun=true may be launched or stopped
+# (dev and fresh), and only its data folder may be written: agents never drive
+# the release install (AGENTS.md). install and status stay allowed for a release
+# package: they touch /data/homebrew only.
 case "$verb" in
     launch|stop|put) ps5_agent_guard_identity "${title_id:-}" ;;
 esac

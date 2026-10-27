@@ -20,24 +20,26 @@
 #
 # Safety:
 #   - hard allowlist: the id must be a titleId in
-#     platform/ps5/title/identities.json (the dev and the release build). An id
-#     in neither entry is refused before a single request is sent.
+#     platform/ps5/title/identities.json (the dev, the fresh and the release
+#     build). An id in neither entry is refused before a single request is sent.
 #   - ownership proof from the param.json that is on the console (homebrew
 #     folder, appmeta or /user/app staging copy): it must carry that titleId and
 #     one of that identity's own names — for PPSA99202 exactly "Photo Splat VR
 #     Dev" (this build) or "PS5 Splat VR Viewer" (the build installed before the
-#     dev name), for PPSA99770 exactly "Photo Splat VR". A foreign title that
-#     took an id (Twiso on PPSA99202) is refused, another identity's name is
-#     refused, and nothing under its folder is deleted.
+#     dev name), for PPSA99771 exactly "Photo Splat VR Fresh Test", for
+#     PPSA99770 exactly "Photo Splat VR". A foreign title that took an id (Twiso
+#     on PPSA99202) is refused, another identity's name is refused, and nothing
+#     under its folder is deleted.
 #   - the bare id must look like PPSA9#### (one homebrew title id) before any
 #     request is built; every id is checked before the first action, and one bad
 #     id stops all of them.
 #   - the only tree this script deletes is exactly /data/homebrew/<ID> (one
 #     POST /api/ftp/delete per id: no wildcard, no recursion of our own) and,
-#     only with --data, exactly the data folder of the dev identity
-#     (/data/ps5-splat-vr). --data is REFUSED for PPSA99770: its folder is the
-#     user's private data and no script in this repo deletes it (this is the
-#     same hard guard the other console scripts use).
+#     only with --data, exactly the data folder of the selected identity (the
+#     dev one /data/ps5-splat-vr, or the fresh one /data/psvr-fresh-test).
+#     --data is REFUSED for PPSA99770: its folder is the user's private data and
+#     no script in this repo deletes it (this is the same hard guard the other
+#     console scripts use).
 #   - /user/app/<ID>, /user/appmeta/<ID> and the /system_ex mount point are
 #     never deleted here: they are the system's, not ours. They are checked and
 #     reported (exit 6 when something is left behind).
@@ -163,9 +165,10 @@ for title_id in $ids; do
 done
 
 # The data folder each id owns, and the --data policy, decided from the table
-# before any request: --data may remove only the dev folder. The release
-# identity's folder is the user's private data and is never deleted, so
-# `--data PPSA99770` stops here with nothing sent. A run removes one folder.
+# before any request: --data may remove only the folder of the identity the id
+# belongs to (the dev or the fresh one). The release identity's folder is the
+# user's private data and is never deleted, so `--data PPSA99770` stops here
+# with nothing sent. A run removes one folder.
 data_root=""
 for title_id in $ids; do
     root="$(ps5_title_field dataDir --title-id "$title_id" 2>/dev/null)" || root=""
@@ -350,8 +353,9 @@ print("%.2f %s" % (n, units[i]))'
 # ours_check ID TEXT -> "yes" when that installed param.json proves the id is
 # ours: it must carry that titleId and one of that identity's own names (for
 # PPSA99202 ""Photo Splat VR Dev"" or the name of the build installed before it;
-# for PPSA99770 ""Photo Splat VR""). The decision lives in
-# platform/ps5/title/identity.py so the offline test
+# for PPSA99771 exactly ""Photo Splat VR Fresh Test""; for PPSA99770 ""Photo
+# Splat VR""). A title on PPSA99771 with any other name is not ours. The
+# decision lives in platform/ps5/title/identity.py so the offline test
 # (platform/ps5/title/ownership-test.sh) checks the same code a console run uses.
 ours_check() {
     local answer
@@ -363,7 +367,7 @@ ours_check() {
 
 # ---- preflight -------------------------------------------------------------
 say "mode: $mode"
-if [ "$want_data" = 1 ]; then say "--data: $data_root is removed as well (the dev identity's folder)"; fi
+if [ "$want_data" = 1 ]; then say "--data: $data_root is removed as well (that identity's folder)"; fi
 say "titles: $(printf '%s' "$ids")"
 mkdir -p "$data_dir"
 
@@ -638,7 +642,7 @@ except Exception:
     fi
 done
 
-# 4. --data: exactly the dev identity's folder, only when it was asked for.
+# 4. --data: exactly that identity's folder (dev or fresh), only when asked for.
 # The table refused the release identity's folder before the first request.
 if [ "$want_data" = 1 ]; then
     printf '\n== %s (--data)\n' "$data_root" >&2

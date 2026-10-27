@@ -3,6 +3,7 @@
 #   export PS5_PAYLOAD_SDK="$SPLAT_DATA_DIR/ref/radv-ps5/sdk"
 #   export LLVM_CONFIG=/opt/homebrew/opt/llvm@21/bin/llvm-config
 #   make -C platform/ps5/helper                 # dev identity (default)
+#   make -C platform/ps5/helper IDENTITY=fresh  # fresh-check identity
 #   make -C platform/ps5/helper RELEASE=1       # release identity
 #
 # The protocol lives in core/capture/helper_protocol.* and is compiled here by
@@ -27,18 +28,13 @@ ELF  := splat-helper.elf
 REPO := $(abspath $(CURDIR)/../../..)
 
 # --- the identity ------------------------------------------------------------
-# Same table and the same selector as build-title.mk (one source, no second
-# copy): RELEASE=1 builds the release identity, TITLE_ID=… selects one by id,
-# otherwise the dev identity is used.
-IDENTITY_PY := $(REPO)/platform/ps5/title/identity.py
-TITLE_RELEASE ?= $(if $(strip $(RELEASE)),$(strip $(RELEASE)),0)
-IDENTITY_SELECTOR := $(if $(strip $(TITLE_ID)),--title-id $(strip $(TITLE_ID)),$(if $(filter-out 0 no false,$(strip $(TITLE_RELEASE))),--name release,--name dev))
-IDENTITY_FIELDS := $(shell python3 $(IDENTITY_PY) $(IDENTITY_SELECTOR))
-TITLE_ID     := $(word 1,$(IDENTITY_FIELDS))
-DATA_ROOT    := $(word 4,$(IDENTITY_FIELDS))
-ifeq ($(strip $(DATA_ROOT)),)
-$(error no data dir: identity.py printed nothing for '$(IDENTITY_SELECTOR)' (see its message above; platform/ps5/title/identities.json holds the table))
-endif
+# The one selector every console build uses — platform/ps5/title/identity.mk,
+# the same file build-title.mk includes: RELEASE=1 builds the release identity,
+# IDENTITY=fresh the pre-release check one, TITLE_ID=… one by id, and the dev
+# identity is the default. There is no second copy of those rules here, so a
+# helper always carries the data folder the title it ships with carries (the
+# viewer passes its TITLE_ID down).
+include $(REPO)/platform/ps5/title/identity.mk
 
 # core/common/path.cpp provides normal_absolute(), the lexical normal form the
 # protocol compares capture paths with; it is compiled in by path because the
@@ -52,7 +48,7 @@ HEADERS := $(REPO)/core/capture/helper_protocol.h $(REPO)/core/common/path.h
 # under 1 MiB (platform/ps5/viewer/verify-package.sh). -Os plus section GC and a
 # strip of the packaged copy (the viewer Makefile) leaves ~0.7 MiB.
 CXXFLAGS := -std=c++17 -Wall -Werror -Os -g -ffunction-sections -fdata-sections \
-            -DSPLAT_TITLE_ID=\"$(TITLE_ID)\" -DSPLAT_DATA_ROOT=\"$(DATA_ROOT)\"
+            -DSPLAT_TITLE_ID=\"$(TITLE_ID)\" -DSPLAT_DATA_ROOT=\"$(TITLE_DATA_DIR)\"
 LDFLAGS  := -Wl,--gc-sections
 
 # nlohmann json is vendored (third_party/json); the protocol uses it for both

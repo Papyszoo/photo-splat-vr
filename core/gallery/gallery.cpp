@@ -174,6 +174,60 @@ std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album) 
     return scenes;
 }
 
+BootAlbum boot_album(const Path& root, const std::string& preferred) {
+    BootAlbum first;      // the gallery's own first scene: Unsorted, then albums
+    BootAlbum chosen;     // the SCENE= album, when that scene is in the gallery
+    bool found_preferred = false;
+    // One pass over the gallery in its own order: the implicit Unsorted album
+    // is first (list_albums), then the named albums sorted by name. The first
+    // album that holds a scene is the fallback; a `preferred` scene anywhere in
+    // the gallery replaces it, and its own album comes with it.
+    for (const AlbumEntry& album : list_albums(root)) {
+        if (album.scene_count == 0) continue;
+        // "" names the root's loose scenes; every other album its folder.
+        const std::string key = album.dir == root ? std::string() : album.name;
+        std::vector<SceneEntry> scenes = list_scenes(root, key);
+        if (scenes.empty()) continue;
+        if (first.scenes.empty()) {
+            first.album = key;
+            first.scenes = scenes;  // a copy: `scenes` is searched below
+            first.index = 0;
+        }
+        if (preferred.empty()) break;  // no SCENE=: the gallery's first scene is the answer
+        bool found = false;
+        for (size_t i = 0; i < scenes.size(); ++i) {
+            if (scenes[i].name != preferred) continue;
+            chosen.album = key;
+            chosen.scenes = std::move(scenes);
+            chosen.index = i;
+            found_preferred = true;
+            found = true;
+            break;
+        }
+        if (found) break;  // the SCENE= scene was found: no album is read further
+    }
+    return found_preferred ? chosen : first;
+}
+
+BootSceneLoad load_boot_scene(const std::vector<Path>& scene_folders, std::size_t start) {
+    BootSceneLoad load;
+    load.index = start;
+    for (std::size_t i = start; i < scene_folders.size(); ++i) {
+        const Path scene_file = scene_files(scene_folders[i]).splat;
+        Result<LoadedScene> result = read_scene_path(scene_file);
+        if (!result.ok()) {
+            load.skipped.push_back(
+                BootSceneSkip{i, scene_folders[i].filename().string(), result.message()});
+            continue;
+        }
+        load.index = i;
+        load.loaded = true;
+        load.scene = result.take();
+        break;
+    }
+    return load;
+}
+
 Status create_album(const Path& root, const std::string& name) {
     if (!valid_album_name(name)) return Status::error("invalid album name: \"" + name + "\"");
     if (is_reserved(name)) return Status::error("album name is reserved: \"" + name + "\"");

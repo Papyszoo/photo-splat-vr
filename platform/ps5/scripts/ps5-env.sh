@@ -14,7 +14,8 @@
 #   PS5_KLOGSRV_PAYLOAD  payload name to launch, default klogsrv.elf
 #
 # Identity and data paths come from platform/ps5/title/identities.json only
-# (ps5_title_id, ps5_title_data_dir). Agents never drive the release identity
+# (ps5_title_id, ps5_title_data_dir). IDENTITY=<name> selects any identity in
+# the table, RELEASE=1 the release one; agents never drive the release identity
 # and never touch its data folder: ps5_agent_guard_identity and ps5_guard_*
 # refuse both before a request is built, printed or sent (AGENTS.md).
 #
@@ -90,21 +91,45 @@ ps5_data_dir() {
 }
 
 # ps5_identity_selector [NAME]: the identity.py selector for this command:
-# TITLE_ID=PPSA… first, then NAME if given, then RELEASE=1, else the table's
-# default (the dev identity). One meaning for every script and every build.
+# TITLE_ID=PPSA… first, then NAME if given, then IDENTITY=<name> (any identity
+# in the table), then RELEASE=1, else the table's default (the dev identity).
+# One meaning for every script and every build: build-title.mk resolves
+# IDENTITY and RELEASE the same way. An unknown IDENTITY, and RELEASE=1
+# together with another IDENTITY, are refused here (exit 2, message on stderr,
+# nothing selected) — so callers must not ignore this function's status.
 ps5_identity_selector() {
+    local want="${IDENTITY:-}" release="${RELEASE:-0}" known
     if [ -n "${TITLE_ID:-}" ]; then
         printf -- '--title-id %s' "$TITLE_ID"
+        return 0
     elif [ -n "${1:-}" ]; then
         printf -- '--name %s' "$1"
-    else
-        # Same off-values as build-title.mk (RELEASE=no is a dev build there):
-        # a shell run and its build must never choose different identities.
-        case "${RELEASE:-0}" in
-            0|no|false) printf -- '--name dev' ;;
-            *) printf -- '--name release' ;;
+        return 0
+    elif [ -n "$want" ]; then
+        # Same off-values as build-title.mk (RELEASE=no is a dev build there),
+        # so a shell run and its build never choose different identities.
+        case "$release" in
+            0|no|false) ;;
+            *)
+                if [ "$want" != "release" ]; then
+                    printf 'ps5-env.sh: RELEASE=%s selects the release identity but IDENTITY=%s asks for another one; pass one of them, not both. Nothing was sent.\n' \
+                           "$release" "$want" >&2
+                    return 2
+                fi ;;
         esac
+        # The table is the list of names: identity.py refuses one it does not
+        # hold, and its message is the error here too.
+        if ! known="$(ps5_title_field name --name "$want" 2>&1)"; then
+            printf '%s\n' "$known" >&2
+            return 2
+        fi
+        printf -- '--name %s' "$want"
+        return 0
     fi
+    case "$release" in
+        0|no|false) printf -- '--name dev' ;;
+        *) printf -- '--name release' ;;
+    esac
 }
 
 # ps5_title_field FIELD [--name NAME|--title-id ID]: one field of one identity
@@ -117,12 +142,15 @@ ps5_title_field() {
 }
 
 # ps5_title_id [NAME]: the title id of one build identity (dev by default).
-# TITLE_ID=PPSA… selects one by id and RELEASE=1 the release identity, so a
-# shell run and a `make … RELEASE=1` build agree on build/ps5/title/<id> and
-# /data/homebrew/<id>.
+# TITLE_ID=PPSA… selects one by id, IDENTITY=<name> by name and RELEASE=1 the
+# release identity, so a shell run and a `make … IDENTITY=fresh` /
+# `make … RELEASE=1` build agree on build/ps5/title/<id> and
+# /data/homebrew/<id>. An identity selector this refuses (unknown IDENTITY, or
+# RELEASE=1 with another IDENTITY) stops the caller with exit 2.
 ps5_title_id() {
-    python3 "$PS5_REPO_ROOT/platform/ps5/title/identity.py" \
-        $(ps5_identity_selector "${1:-}") | awk '{print $1}'
+    local selector=""
+    selector="$(ps5_identity_selector "${1:-}")" || exit 2
+    python3 "$PS5_REPO_ROOT/platform/ps5/title/identity.py" $selector | awk '{print $1}'
 }
 
 # ps5_title_package [NAME]: build/ps5/title/<id> for the same identity.
@@ -134,7 +162,9 @@ ps5_title_package() {
 # The title was built with the same value (SPLAT_DATA_ROOT), so a script writes
 # where that title reads.
 ps5_title_data_dir() {
-    ps5_title_field dataDir $(ps5_identity_selector "${1:-}")
+    local selector=""
+    selector="$(ps5_identity_selector "${1:-}")" || exit 2
+    ps5_title_field dataDir $selector
 }
 
 # ps5_package_title_id PACKAGE_DIR: the titleId in a package's generated
@@ -169,28 +199,59 @@ ps5_agent_guard_identity() {
     else
         id="$(ps5_title_id)"
     fi
-    [ -n "$id" ] || ps5_die "no identity selected (TITLE_ID/RELEASE); nothing was sent"
+    [ -n "$id" ] || ps5_die "no identity selected (TITLE_ID/IDENTITY/RELEASE); nothing was sent"
     allowed="$(ps5_title_field agentsMayRun --title-id "$id" 2>/dev/null)" || allowed=""
     if [ "$allowed" != "true" ]; then
         ps5_die "refusing $id: agent scripts never launch the release install or act on it" \
                 "(identities.json marks it agentsMayRun=false; its data folder is the user's private one)." \
-                "Only the dev identity is allowed here. Nothing was sent."
+                "Only an identity the table marks agentsMayRun=true (dev, fresh) is allowed here. Nothing was sent."
     fi
 }
 
 # ps5_guard_remote_path PATH...: refuse any console path at or below a private
 # data folder before a request is built, printed or sent.
+#
+# Every path is first required to be a non-empty absolute path with no ".."
+# component: an empty or relative one names no console location this guard can
+# compare, so it is refused instead of let through (a relative path never
+# matches an absolute private folder, which used to make this fail open). A ".."
+# is refused outright: it could reach the private folder or leave /data, and no
+# caller in this repo has a reason to name one.
+#
+# The path is then split into components (repeated slashes and "." collapse)
+# and compared by whole component, so /data/photo-splat-vr and everything below
+# it is refused while /data/photo-splat-vr-x is a different folder and passes.
 ps5_guard_remote_path() {
-    local path dir private
+    local path dir private norm rest part
     # An unreadable table must not turn the guard off (see ps5_private_data_dirs).
     private="$(ps5_private_data_dirs)" ||
         ps5_die "cannot read platform/ps5/title/identities.json; refusing every console path until the table is readable. Nothing was sent."
-    [ -n "$private" ] || return 0
     for path in "$@"; do
-        [ -n "$path" ] || continue
+        case "$path" in
+            '') ps5_die "refusing an empty console path: it names no console location. Nothing was sent." ;;
+            /*) ;;
+            *) ps5_die "refusing $path: a console path must be absolute (start with /), so the private-folder" \
+                       "check can compare it. Nothing was sent." ;;
+        esac
+        norm=""
+        rest="${path#/}"
+        while [ -n "$rest" ]; do
+            part="${rest%%/*}"
+            case "$rest" in
+                */*) rest="${rest#*/}" ;;
+                *) rest="" ;;
+            esac
+            case "$part" in
+                ''|.) continue ;;
+                ..) ps5_die "refusing $path: a console path with a '..' component is not sent;" \
+                            "it could reach the user's private data folder or leave /data. Nothing was sent." ;;
+            esac
+            norm="$norm/$part"
+        done
+        [ -n "$norm" ] || norm="/"
         while IFS= read -r dir; do
             [ -n "$dir" ] || continue
-            case "$path" in
+            case "$norm" in
                 "$dir"|"$dir"/*)
                     ps5_die "refusing $path: $dir is the user's private data folder;" \
                             "no script in this repo may read, list, write or delete there. Nothing was sent." ;;

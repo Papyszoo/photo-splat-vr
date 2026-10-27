@@ -65,35 +65,19 @@ TITLE_REPO_ROOT  := $(abspath $(TITLE_RECIPE_DIR)/../../..)
 SPLAT_DATA_DIR   ?= $(abspath $(TITLE_REPO_ROOT)/..)
 
 # --- the identity ------------------------------------------------------------
-# Two identities in identities.json: the dev build (default) and the release
-# build (`RELEASE=1`). `TITLE_ID=…` selects one of them by id, and any other id
-# is refused there rather than silently producing a package whose contentId does
+# Three identities in identities.json: the dev build (default), the fresh
+# pre-release check build (`IDENTITY=fresh`) and the release build
+# (`RELEASE=1`). `TITLE_ID=…` selects one of them by id, and any other id is
+# refused there rather than silently producing a package whose contentId does
 # not carry it, or whose data dir is not its own. The table is the only place an
 # id or a console data path is written down: the package's param.json is
 # generated from the identity-free param.json template below, and the data root
 # is compiled in from the same entry.
-TITLE_IDENTITIES   ?= $(TITLE_RECIPE_DIR)/identities.json
-TITLE_IDENTITY_PY  ?= $(TITLE_RECIPE_DIR)/identity.py
-# `make … RELEASE=1` selects the release identity; the dev build is the default.
-TITLE_RELEASE      ?= $(if $(strip $(RELEASE)),$(strip $(RELEASE)),0)
-TITLE_IDENTITY     ?= $(if $(filter-out 0 no false,$(strip $(TITLE_RELEASE))),release,dev)
-# A command-line TITLE_ID is an *input* only: the selector is built from it
-# before the outputs are set, and the outputs are forced with `override` so the
-# command-line value can never survive a failed lookup (W32 left `make
-# TITLE_ID=PPSA12345` planning a build the table refuses; now it stops here).
-TITLE_IDENTITY_SELECTOR := $(if $(strip $(TITLE_ID)),--title-id $(strip $(TITLE_ID)),--name $(TITLE_IDENTITY))
-
-TITLE_IDENTITY_FIELDS := $(shell python3 $(TITLE_IDENTITY_PY) $(TITLE_IDENTITY_SELECTOR))
-override TITLE_ID         := $(word 1,$(TITLE_IDENTITY_FIELDS))
-override TITLE_CONCEPT_ID := $(word 2,$(TITLE_IDENTITY_FIELDS))
-override TITLE_CONTENT_ID := $(word 3,$(TITLE_IDENTITY_FIELDS))
-override TITLE_DATA_DIR   := $(word 4,$(TITLE_IDENTITY_FIELDS))
-ifeq ($(TITLE_ID),)
-$(error no title id: identity.py printed nothing for '$(TITLE_IDENTITY_SELECTOR)' (see its message above; identities.json holds the table))
-endif
-ifeq ($(TITLE_DATA_DIR),)
-$(error no data dir: identity.py printed nothing for '$(TITLE_IDENTITY_SELECTOR)' (see its message above; identities.json holds the table))
-endif
+#
+# The rules themselves live in identity.mk, the one file every console Makefile
+# includes (platform/ps5/helper/Makefile too), so a title and the helper it ships
+# always resolve IDENTITY / RELEASE / TITLE_ID the same way.
+include $(TITLE_RECIPE_DIR)/identity.mk
 
 TITLE_PARAM_JSON ?= $(TITLE_RECIPE_DIR)/param.json
 TITLE_STEM     ?= $(notdir $(CURDIR))

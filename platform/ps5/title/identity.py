@@ -2,7 +2,8 @@
 """The one table that maps a build identity to its title id, name and data dir.
 
 identities.json in this directory is the only place a console identity is
-written down. It holds two entries — "dev" (the default build) and "release"
+written down. It holds three entries — "dev" (the default build), "fresh"
+(IDENTITY=fresh, the throwaway pre-release fresh-install check) and "release"
 (RELEASE=1, the user's install) — each with:
 
   titleId            the homebrew id the package is installed as
@@ -12,14 +13,14 @@ written down. It holds two entries — "dev" (the default build) and "release"
   previousTitleNames older names the same id may still carry on the console
                      (the build an earlier version installed stays removable)
   dataDir            the one folder the title and its helper write on the console
-  agentsMayRun       false for the user's install: no script in this repo may
-                     launch it or read, list, write or delete its dataDir
+  agentsMayRun       false only for the user's install: no script in this repo
+                     may launch it or read, list, write or delete its dataDir
 
-Everything that needs one of these values reads it from here: build-title.mk
-(package id and the compiled-in data root), platform/ps5/helper/Makefile (the
-payload's data root), platform/ps5/scripts/ps5-env.sh (ids and data paths for
-the shell scripts), title-uninstall.sh (the ownership proof) and
-viewer/verify-package.sh (the package's titleName). No other file carries a
+Everything that needs one of these values reads it from here: title/identity.mk
+(the one selector build-title.mk and platform/ps5/helper/Makefile include: the
+package id and the compiled-in data root), platform/ps5/scripts/ps5-env.sh (ids
+and data paths for the shell scripts), title-uninstall.sh (the ownership proof)
+and viewer/verify-package.sh (the package's titleName). No other file carries a
 concrete id or data path.
 
 A table the console or the guards would refuse is refused here: an id outside
