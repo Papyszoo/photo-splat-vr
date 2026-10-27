@@ -1,0 +1,31 @@
+# W23/W24: the Captures tab, from the capture helper to the inbox.
+#
+# Boots into the folders, opens the first one (Unsorted), moves to its "+" tile
+# and opens the photo picker (Inbox first), goes to the Captures tab with L1
+# (it is always the last tab, so this works with or without a USB stick; the
+# helper must be running: W24 starts splat-helper and sets helper/root.txt),
+# takes a shot of the listed captures, selects the first tile with Cross,
+# copies it with Square -- the picker then jumps to the Inbox tab -- takes a
+# shot of the copied photo and quits from the script (the title ends with PASS).
+#
+# Preconditions on the console (W24 owns them):
+#   - splat-helper is resident, so helper/alive is fresh and the tab lists the
+#     captures (without it the tab says "Captures need the payload loader");
+#   - helper/root.txt points at a test tree whose NEWEST capture is a supported
+#     JPG or PNG: the grid's first tile is the one Cross selects, and an HDR
+#     .jxr there only toasts "is HDR, not supported".
+#
+# Run: platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/captures.txt
+# Expected klog: "ui: sources inbox", "helper: request answered" (list and
+# copy), then "viewer: script done".
+0.5  mark captures-start
+1.0  press Cross
+2.0  press Left
+2.6  press Cross
+3.6  shot photos-inbox
+4.4  press L1
+5.9  shot captures
+6.6  press Cross
+7.4  press Square
+9.4  shot inbox-copy
+11.4 quit

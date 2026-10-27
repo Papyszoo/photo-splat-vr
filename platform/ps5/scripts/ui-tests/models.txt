@@ -1,0 +1,71 @@
+# W21/W22: the real models service on the TV panel - list, download DA2-Small,
+# select it as the converter, then read SHARP's licence and back out without
+# accepting it.
+#
+# Run (real services, UI_FAKE must be off - ui-test.sh does not set it):
+#   platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/models.txt
+#
+# Preconditions, checked by W22 before it launches:
+#   * /data/ps5-splat-vr/state is fresh for the models part, or DA2-Small is not
+#     ready yet: a ready row does not download again, and the models-dl-* shots
+#     would show "Ready" instead of a percentage.
+#   * SHARP's licence is NOT accepted yet (no 'sharp' entry in
+#     /data/ps5-splat-vr/state/licenses.json): an accepted gate turns the last
+#     Cross into a 2.6 GB download instead of the licence screen. Run this
+#     script before models-accept.txt, or remove that state file first.
+#   * The console can reach the network (W9 proved sceHttp works from a title).
+#
+# Expected klog:
+#   viewer: models: state /data/ps5-splat-vr/state, legacy .../models, fetcher sceHttp
+#   viewer: models: sharp license_required
+#   viewer: models: da2 accepted
+#   viewer: ui: UiApp at the menu, scenes ..., services models real (ui_setup.cpp)
+#   viewer: models: converted da2 in ... s, 287 tensor(s), ... peak RSS ... (+...)
+#   viewer: quit from the menu
+#   viewer: done, exit 0
+#
+# Expected shots: home, models-list, models-dl-5, models-dl-15, models-dl-45,
+# models-dl-90, models-ready, models-selected, licence-1, licence-2.
+#
+# Times are seconds from the first UI frame. The panel boots into the folders;
+# Options opens Settings (Models, Conversions, Quit). The Models rows are SHARP,
+# DA2-Small, then "Default model" (Cross switches it to the next ready model).
+
+0.5   mark models-start
+1.0   shot home
+1.6   press Options
+2.4   press Cross
+3.6   shot models-list
+
+# DA2-Small is ungated: Cross starts its 99 MB download straight away.
+4.4   press Down
+5.0   press Cross
+11.0  shot models-dl-5
+21.0  shot models-dl-15
+45.0  shot models-dl-45
+90.0  shot models-dl-90
+
+# The transfer, the SHA-256 check and the conversion finish well inside 120 s
+# (W9 measured the console's stack; W22 records the real time in the klog).
+# Then the Default model row (below DA2-Small) picks it.
+126.0 shot models-ready
+127.0 press Down
+128.0 press Cross
+130.0 shot models-selected
+
+# SHARP is gated: Cross opens the licence screen, which fetches the text (one
+# small HTTPS GET) before drawing. Back out without accepting, then Settings >
+# Quit.
+134.0 press Up
+134.6 press Up
+135.2 press Cross
+138.0 shot licence-1
+141.0 press R1
+143.5 shot licence-2
+146.0 press L1
+147.5 press Circle
+149.0 press Circle
+150.5 press Down
+151.1 press Down
+151.7 press Cross
+152.0 quit

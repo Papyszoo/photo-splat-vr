@@ -1,0 +1,36 @@
+# W15/W17 (redesign): the TV viewer's real panel tour, no pad and no headset.
+# Boots into the folder grid (home), opens the first folder, views its first
+# scene, steps with R1, opens the panel over the scene with Options, opens
+# Settings with Options and walks down to its Quit row.
+#
+# Settings starts with the Comfort section (Scale around, Move speed, Turn
+# speed) and the Display section (Edge softness, Blending), then System (Models,
+# Conversions, Quit): the focus starts on Scale around, so Quit is seven
+# selectable rows down. The script stops there and ends through its own `quit`,
+# because activating Quit ends the title through LoadExec and the run would then
+# have no "viewer: script done" line (ui-test.sh's default end line).
+#
+# Run: platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/browse.txt
+# Expected klog: "viewer: tv scene 1/", a second "viewer: tv scene 2/",
+# "viewer: script done", then "viewer: done, exit 0".
+0.5  mark home
+1.0  shot home
+2.0  press Cross
+3.2  shot folder
+4.0  press Cross
+7.0  shot view-0
+8.0  press R1
+11.0 shot view-1
+12.0 press Options
+13.0 shot panel-over-scene
+14.0 press Options
+15.0 shot settings
+16.0 press Down
+16.6 press Down
+17.2 press Down
+17.8 press Down
+18.4 press Down
+19.0 press Down
+19.6 press Down
+20.6 shot settings-quit
+21.6 quit

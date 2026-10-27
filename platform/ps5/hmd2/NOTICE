@@ -1,0 +1,7 @@
+PS VR2 / Hmd2 bindings (platform/ps5/hmd2/)
+===========================================
+
+The notices for the code ported into this directory (PS5VR,
+HLA-PSVR2's PS5XR runtime, and ps5-native-app-boilerplate via PS5_Vulkan) live
+in the repository's top-level THIRD_PARTY_NOTICES.md, under "Ported into the
+PS5 payloads and titles". That file is the one to update when the port changes.

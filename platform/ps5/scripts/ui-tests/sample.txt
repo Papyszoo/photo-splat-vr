@@ -1,0 +1,20 @@
+# Scripted UI run: the panel is driven by text instead of a pad (W6/W8).
+# One event per line. Times are seconds from start(), non-decreasing.
+#   <t> press <Button>              down for 0.1 s, then up
+#   <t> down <Button>               down until an up (or the end of the run)
+#   <t> up <Button>
+#   <t> hold <Button> <secs>        down now, up after <secs>
+#   <t> stick <lx> <ly> <rx> <ry>   each -1..1, held until the next stick line
+#   <t> shot <name>                 write <name>.png: 1-48 of A-Za-z0-9._-
+#   <t> mark <free text>            a note, echoed to the log
+#   <t> quit                        end the run
+# Buttons: Cross Circle Square Triangle L1 R1 L2 R2 L3 R3 Options Create Up Down Left Right.
+# A '#' at the start of a line is a comment; blank lines and CRLF are fine.
+0.5  mark home opens
+1.00 down Down
+1.60 up Down
+2.00 press Cross
+2.60 shot folder
+3.20 press Circle
+3.80 shot home
+4.40 quit

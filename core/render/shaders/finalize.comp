@@ -1,0 +1,24 @@
+#version 450
+
+// Fills the indirect draw command from the visible splat count. Runs after the
+// projection pass and before the radix sort (which also reads the count).
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 9) readonly buffer Counters {
+    uint visible_count;
+};
+
+layout(std430, set = 0, binding = 10) writeonly buffer DrawCommand {
+    uint vertex_count;
+    uint instance_count;
+    uint first_vertex;
+    uint first_instance;
+} draw;
+
+void main() {
+    draw.vertex_count = 4u;  // triangle strip quad
+    draw.instance_count = visible_count;
+    draw.first_vertex = 0u;
+    draw.first_instance = 0u;
+}

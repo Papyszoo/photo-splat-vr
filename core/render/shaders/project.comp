@@ -1,0 +1,245 @@
+#version 450
+
+// Cull and project one Gaussian splat (SH degree 0). Every splat writes its
+// depth key and its own index at slot == id; the radix sort then orders the
+// whole array. Culled splats get the largest key, so the first `visible_count`
+// sorted entries are exactly the visible splats.
+//
+// Writing slot == id (instead of an atomicAdd compaction slot) is what makes
+// a frame deterministic: the radix sort's tie order is a deterministic
+// function of the input array, so an identical pose and scene produce
+// identical bytes. The atomic counter now only counts.
+//
+// The depth key is the bitwise complement of the midpoint view depth, so an
+// ascending radix sort draws far to near. `0xffffffff` (complement of +0.0,
+// which the near plane culls) marks a culled splat.
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+// Largest sort key; culled splats store this so they sort after every visible
+// splat. A visible view depth is > the near plane, so its complement is never
+// this value.
+const uint kCulledKey = 0xffffffffu;
+
+// Anti-aliasing knobs, from RendererOptions (see docs/render.md, "Anti-
+// aliasing"):
+//  - `aa.x` is the screen-space low-pass added to the 2D covariance diagonal,
+//    in pixels^2 (gsplat's eps2d). SHARP's own still renderer uses 0.0 and the
+//    classic rasterisation mode, which is sharp but aliases badly when the
+//    splats shrink below a pixel in a wide headset eye.
+//  - `aa.y` = 1 enables the Mip-Splatting 2D-filter opacity compensation:
+//    dilating the covariance spreads the splat over more area, so its peak
+//    alpha is scaled by sqrt(det(Sigma) / det(Sigma + eps)) to keep the same
+//    energy.
+//  - `aa.z` is the end of the near fade in metres (0 disables it): alpha ramps
+//    up from the near plane to this depth so a splat crossing the plane does
+//    not pop.
+
+// Largest 3-sigma screen radius of one splat, in pixels. A splat whose centre
+// sits just past the near plane projects to a conic thousands of pixels wide;
+// a thousand of those fill both eyes and cost 180-245 ms of overdraw, the VR2
+// headset run's symptom when the camera was inside the cloud. Clamping the
+// quad keeps one splat from covering the eye: 512 px is a 1024 px quad at the
+// 1984x2048 PSVR2 eye, half its width and about a quarter of its area. Normal
+// splats are far below the cap and render unchanged.
+const float kMaxScreenRadiusPx = 512.0;
+
+layout(std140, set = 0, binding = 0) uniform Camera {
+    mat4 view;        // world -> camera, OpenCV axes (x right, y down, z forward)
+    vec4 intrinsics;  // fx, fy, cx, cy in eye pixels
+    vec4 screen;      // width, height, near, far
+    vec4 params;      // scene_scale, half IPD, srgb target, comfort fade
+    vec4 backdrop;    // neutral backdrop, linear RGB
+    uvec4 counts;     // splat count, unused, unused, unused
+    // The comfort pass owns these; only camera_position.w (half IPD on a
+    // stereo frame, 0 on mono) is read here, for the per-eye cull margin.
+    vec4 capture;       // capture fx, fy, cx, cy
+    vec4 capture_size;  // capture width, height, outer margin, inner margin
+    vec4 camera_position;  // xyz midpoint eye position; w = half IPD in stereo
+    vec4 eye_shift;        // per-eye principal-point x offset in pixels
+    vec4 aa;  // low-pass eps px^2, compensate flag, near-fade end m, unused
+} camera;
+
+layout(std430, set = 0, binding = 1) readonly buffer Position {
+    float16_t position[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer LogScale {
+    float16_t log_scale[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer Rotation {
+    float16_t rotation[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer ShDc {
+    float16_t sh_dc[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer Opacity {
+    float16_t opacity_logit[];
+};
+
+// Three vec4 per splat, indexed by splat id: midpoint view position, 2D conic
+// axes in NDC, premultiply-ready RGBA colour.
+layout(std430, set = 0, binding = 6) writeonly buffer Instances {
+    vec4 instances[];
+};
+
+layout(std430, set = 0, binding = 7) writeonly buffer Keys {
+    uint keys[];
+};
+
+layout(std430, set = 0, binding = 8) writeonly buffer Values {
+    uint values[];
+};
+
+layout(std430, set = 0, binding = 9) buffer Counters {
+    uint visible_count;  // visible splats this frame; the draw instance count
+};
+
+// GLSL fills mat3 column by column, so passing the rows of R in order would
+// build R^T. The nine values below are the rows of R; transpose() turns them
+// into the matrix the covariance needs. Same maths as
+// core/render/project_math.h:quaternion_to_rotation.
+mat3 quaternion_to_matrix(vec4 q) {
+    float w = q.x;
+    float x = q.y;
+    float y = q.z;
+    float z = q.w;
+    return transpose(mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y),
+                          2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+                          2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)));
+}
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    if (id >= camera.counts.x) return;
+
+    // Deterministic slots: the splat's own index. Culled splats keep the
+    // largest key so they sort to the tail of the full-array sort.
+    keys[id] = kCulledKey;
+    values[id] = id;
+
+    const float scale = camera.params.x;
+    const vec3 local = vec3(float(position[id * 3u + 0u]), float(position[id * 3u + 1u]),
+                            float(position[id * 3u + 2u])) *
+                       scale;
+    const vec4 view_pos = camera.view * vec4(local, 1.0);
+
+    const float near_plane = camera.screen.z;
+    const float far_plane = camera.screen.w;
+    if (!(view_pos.z > near_plane) || view_pos.z >= far_plane) return;
+
+    // 3D covariance in camera space: R S S^T R^T, rotated by the view. World
+    // scale scales the whole scene about the capture point, so the Gaussian
+    // standard deviations scale with it; otherwise a scaled-up world would
+    // keep metre-sized splats and turn grainy.
+    const vec3 sigma = exp(vec3(float(log_scale[id * 3u + 0u]), float(log_scale[id * 3u + 1u]),
+                                float(log_scale[id * 3u + 2u]))) *
+                       scale;
+    const vec4 q = normalize(vec4(float(rotation[id * 4u + 0u]), float(rotation[id * 4u + 1u]),
+                                  float(rotation[id * 4u + 2u]), float(rotation[id * 4u + 3u])));
+    const mat3 rot = quaternion_to_matrix(q);
+    const mat3 cov3d = rot * mat3(sigma.x * sigma.x, 0.0, 0.0, 0.0, sigma.y * sigma.y, 0.0, 0.0,
+                                 0.0, sigma.z * sigma.z) *
+                       transpose(rot);
+    const mat3 view3 = mat3(camera.view);
+    const mat3 cov = view3 * cov3d * transpose(view3);
+
+    // EWA projection: J maps camera space to pixels, so J must be built with
+    // the same column/row care as R above (transpose of the row list).
+    const float inv_z = 1.0 / view_pos.z;
+    const float fx = camera.intrinsics.x;
+    const float fy = camera.intrinsics.y;
+    const mat3 jacobian = transpose(mat3(fx * inv_z, 0.0, -fx * view_pos.x * inv_z * inv_z, 0.0,
+                                         fy * inv_z, -fy * view_pos.y * inv_z * inv_z, 0.0, 0.0,
+                                         0.0));
+    mat2 cov2d = mat2(jacobian * cov * transpose(jacobian));
+    // Screen-space low-pass. `det_raw` is the undilated determinant, kept for
+    // the opacity compensation below.
+    const float low_pass_eps = camera.aa.x;
+    const float det_raw = cov2d[0][0] * cov2d[1][1] - cov2d[0][1] * cov2d[0][1];
+    cov2d[0][0] += low_pass_eps;
+    cov2d[1][1] += low_pass_eps;
+
+    const float a = cov2d[0][0];
+    const float b = cov2d[0][1];
+    const float d = cov2d[1][1];
+    const float det = a * d - b * b;
+    if (!(det > 0.0)) return;
+    const float mid = 0.5 * (a + d);
+    const float disc = sqrt(max(0.0, mid * mid - det));
+    const float lambda1 = mid + disc;
+    const float lambda0 = mid - disc;
+    if (!(lambda0 > 0.0) || !(lambda1 > 0.0)) return;
+    const float s0 = sqrt(lambda1);
+    const float s1 = sqrt(lambda0);
+    const float theta = 0.5 * atan(2.0 * b, a - d);
+    const float cos_theta = cos(theta);
+    const float sin_theta = sin(theta);
+
+    const vec2 to_ndc = 2.0 / camera.screen.xy;
+    const vec2 axis0_px = vec2(s0 * cos_theta, s0 * sin_theta);
+    const vec2 axis1_px = vec2(-s1 * sin_theta, s1 * cos_theta);
+    // 3-sigma reach in pixels; the axes are orthogonal, so the lengths add.
+    const float reach_px = 3.0 * (length(axis0_px) + length(axis1_px));
+    const float shrink = reach_px > kMaxScreenRadiusPx ? kMaxScreenRadiusPx / reach_px : 1.0;
+    const vec2 axis0 = axis0_px * (shrink * to_ndc);
+    const vec2 axis1 = axis1_px * (shrink * to_ndc);
+
+    // Project the centre and cull quads that cannot touch the viewport.
+    // splat.vert emits the quad corners at ndc + 3*(+/-axis0 +/-axis1), so the
+    // quad reaches 3*(|axis0| + |axis1|) from the centre on each NDC axis.
+    // Culling with 3*max(|axis0|, |axis1|) instead drops quads whose corner
+    // still crosses the border, which pops along the viewport edges.
+    //
+    // The sort is shared by both eyes and only the x centre moves per eye
+    // (splat.vert shifts by -/+half IPD and by that eye's principal point), so
+    // the cull has to cover both eye positions. Without the extra x reach the
+    // left eye loses the splats just outside the midpoint's left border and its
+    // leftmost strip fills with stretched, blurred neighbours, which the right
+    // eye does not show.
+    const vec2 pixels = camera.intrinsics.xy * view_pos.xy * inv_z + camera.intrinsics.zw;
+    const vec2 ndc = pixels * to_ndc - 1.0;
+    const float eye_ndc =
+        abs(camera.intrinsics.x * camera.camera_position.w * inv_z) * to_ndc.x +
+        max(abs(camera.eye_shift.x), abs(camera.eye_shift.y)) * to_ndc.x;
+    const vec2 reach = 3.0 * (abs(axis0) + abs(axis1)) + vec2(eye_ndc, 0.0);
+    if (ndc.x + reach.x < -1.0 || ndc.x - reach.x > 1.0 || ndc.y + reach.y < -1.0 ||
+        ndc.y - reach.y > 1.0) {
+        return;
+    }
+
+    float alpha = 1.0 / (1.0 + exp(-float(opacity_logit[id])));
+    // Mip-Splatting's 2D filter opacity compensation: the low-pass spreads a
+    // splat over more pixels, so its peak alpha has to drop by the square root
+    // of the determinant ratio to keep the same integrated energy. Without it
+    // the dilation brightens every sub-pixel splat and the frame gets brighter
+    // and softer than the reference.
+    if (low_pass_eps > 0.0 && camera.aa.y > 0.5) {
+        alpha *= det_raw > 0.0 ? sqrt(min(det_raw / det, 1.0)) : 0.0;
+    }
+    // Near fade: splats crossing the near plane pop if the cull is hard.
+    if (camera.aa.z > near_plane) {
+        alpha *= smoothstep(near_plane, camera.aa.z, view_pos.z);
+    }
+    if (!(alpha > 1.0 / 255.0)) return;
+
+    vec3 rgb = vec3(float(sh_dc[id * 3u + 0u]), float(sh_dc[id * 3u + 1u]),
+                    float(sh_dc[id * 3u + 2u])) *
+                   0.28209479177387814 + 0.5;
+    rgb = clamp(rgb, 0.0, 1.0);
+
+    // Only the count matters now; the value array holds the splat index and
+    // the instance arrays are indexed by it, so the sort input does not
+    // depend on GPU scheduling.
+    atomicAdd(visible_count, 1u);
+
+    keys[id] = ~floatBitsToUint(view_pos.z);
+    instances[id * 3u + 0u] = view_pos;
+    instances[id * 3u + 1u] = vec4(axis0, axis1);
+    instances[id * 3u + 2u] = vec4(rgb, alpha);
+}

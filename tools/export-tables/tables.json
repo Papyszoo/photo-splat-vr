@@ -1,0 +1,135 @@
+{
+  "_comment": [
+    "Per-firmware export offsets for the PS VR2 system libraries, keyed by the",
+    "function name the app resolves. Generated from decrypted libraries by",
+    "gen_export_table.py (see README.md); consumed by the same script to emit",
+    "platform/ps5/hmd2/hmd2_exports.h. Never edit offsets by hand: a wrong",
+    "offset cannot be detected at runtime, only the anchor string can.",
+    "fw is the firmware without the dot (1360 = 13.60), as in PS5VR.",
+    "'anchor' is the check string: {virtual address in the library, text}. The",
+    "app uses a table only if the string sits at that address in the loaded",
+    "library's read-only segment, so a table can never be applied to a build it",
+    "was not generated from.",
+    "Source: PS5VR app/src/vr_exports_1360.h and vr_exports_761.h (GPL-3.0,",
+    "see platform/ps5/hmd2/NOTICE). 7.61 and 7.20 ship the same libraries, so",
+    "the 761 table serves both."
+  ],
+  "libraries": {
+    "libSceHmd2": {
+      "firmware": {
+        "1360": {
+          "covers": "13.20, 13.60",
+          "anchor": {
+            "va": 509574,
+            "text": "Not Initialized"
+          },
+          "exports": {
+            "sceHmd2Initialize": 173680,
+            "sceHmd2Terminate": 173840,
+            "sceHmd2Open": 173888,
+            "sceHmd2Close": 174304,
+            "sceHmd2GetDeviceInformation": 174992,
+            "sceHmd2GetFieldOfViewWithoutHandle": 162112,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 137408,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 137536,
+            "sceHmd2ReprojectionInitialize": 137728,
+            "sceHmd2ReprojectionTerminate": 138736,
+            "sceHmd2ReprojectionEnableVrMode": 139008,
+            "sceHmd2ReprojectionDisableVrMode": 139152,
+            "sceHmd2ReprojectionBeginFrame": 139472,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 139488,
+            "sceHmd2ReprojectionSetParam": 139536,
+            "sceHmd2ReprojectionSetRenderConfig": 139568,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 139696,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 139712,
+            "sceHmd2ReprojectionEnableMirroring": 139728,
+            "sceHmd2ReprojectionDisableMirroring": 139856,
+            "sceHmd2ReprojectionSetMirroringOption": 139968
+          }
+        },
+        "761": {
+          "covers": "7.20, 7.61",
+          "anchor": {
+            "va": 1246915,
+            "text": "Awarped depth mip chain R"
+          },
+          "exports": {
+            "sceHmd2Initialize": 143200,
+            "sceHmd2Terminate": 143344,
+            "sceHmd2Open": 143392,
+            "sceHmd2Close": 143808,
+            "sceHmd2GetDeviceInformation": 144496,
+            "sceHmd2GetFieldOfViewWithoutHandle": 131840,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 125584,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 125712,
+            "sceHmd2ReprojectionInitialize": 125856,
+            "sceHmd2ReprojectionTerminate": 126800,
+            "sceHmd2ReprojectionEnableVrMode": 127072,
+            "sceHmd2ReprojectionDisableVrMode": 127216,
+            "sceHmd2ReprojectionBeginFrame": 127520,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 127536,
+            "sceHmd2ReprojectionSetParam": 127584,
+            "sceHmd2ReprojectionSetRenderConfig": 127616,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 127648,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 127664,
+            "sceHmd2ReprojectionEnableMirroring": 127680,
+            "sceHmd2ReprojectionDisableMirroring": 127808,
+            "sceHmd2ReprojectionSetMirroringOption": 127920
+          }
+        }
+      }
+    },
+    "libSceVrTracker2": {
+      "firmware": {
+        "1360": {
+          "covers": "13.20, 13.40, 13.60",
+          "anchor": {
+            "va": 1189349,
+            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 560,
+            "sceVrTracker2Finalize": 4416,
+            "sceVrTracker2RegisterDevice": 4576,
+            "sceVrTracker2UnregisterDevice": 5072,
+            "sceVrTracker2GetResult": 10384
+          }
+        },
+        "761": {
+          "covers": "7.20, 7.61",
+          "anchor": {
+            "va": 1140601,
+            "text": "SceVrtMtxDepthMapWork"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 560,
+            "sceVrTracker2Finalize": 2912,
+            "sceVrTracker2RegisterDevice": 3056,
+            "sceVrTracker2UnregisterDevice": 3584,
+            "sceVrTracker2GetResult": 8944
+          }
+        }
+      }
+    },
+    "libSceVrHand": {
+      "firmware": {
+        "1360": {
+          "covers": "12.20 and later only; 10.x and 11.60 take other parameters",
+          "anchor": {
+            "va": 754912,
+            "text": "handPose_%02d"
+          },
+          "exports": {
+            "sceVrHandInitialize": 104384,
+            "sceVrHandFinalize": 107840,
+            "sceVrHandStart": 108368,
+            "sceVrHandStop": 108224,
+            "sceVrHandGetResult": 108960
+          }
+        }
+      }
+    }
+  }
+}

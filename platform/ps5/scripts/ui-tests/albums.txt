@@ -1,0 +1,150 @@
+# smoke4: folder and scene management through the TV panel, on the ui_test_*
+# tree only. Same tour as W17's albums.txt / smoke3, with the two changes this
+# console needs: VR9's QWERTY key coordinates and the extra folder tile
+# ("test", not ours) that shifts the home grid.
+#
+# The keyboard is 10 columns (1-0, qwertyuiop, asdfghjkl + Shift, zxcvbnm,
+# then . - _ Space Delete OK):
+#   index 31 = 'x' (row 3, col 1), index 0 = '1' (row 0, col 0),
+#   index 13 = 'r' (row 1, col 3), index 42 = OK (row 4, col 2),
+#   index 40 = Space (row 4, col 0).
+# In the old ABC grid 'x' was index 33 and 'r' index 17, so the Right counts
+# are shorter here; a discrete press is far shorter than VR9's ~0.35 s repeat
+# delay, so hold-repeat never adds a step.
+#
+# Flow: create folder x1 through the keyboard, rename it to x1r, move
+# ui_test_a's scene into x1r, delete the empty ui_test_a, open x1r, rename the
+# scene (append "r"), then delete it through the panel.
+#
+# Run: platform/ps5/scripts/ui-test.sh <this file>
+#
+# Preconditions (created outside the UI, by exact name):
+#   scenes/ui_test_a holds a copy of 02_da2_photo1, scenes/ui_test_b a copy of
+#   immichvr-2 (the folder the tour never touches), plus the existing empty
+#   "test" folder. Home tiles when it starts (four columns per row):
+#   0 Unsorted, 1 test, 2 ui_test_a, 3 ui_test_b, 4 New folder (second row),
+#   so the script reaches New folder with one Down from Unsorted (Right does
+#   not wrap to the next row).
+#
+# Presses are 0.4-0.6 s apart: a long frame collapses edges closer than one
+# frame (W17).
+0.5   mark albums-start
+1.0   shot home
+1.6   press Down
+3.5   shot new-folder
+4.0   press Cross
+5.2   shot keyboard-default
+5.8   press Square
+6.2   press Square
+6.6   press Square
+7.0   press Square
+7.4   press Square
+7.8   press Square
+8.2   press Square
+8.6   press Square
+9.0   press Square
+9.4   press Square
+9.8   press Square
+10.2  press Square
+10.6  press Square
+11.0  press Square
+11.4  press Square
+11.8  press Down
+12.3  press Down
+12.8  press Down
+13.3  press Right
+13.8  press Cross
+14.8  press Up
+15.3  press Up
+15.8  press Up
+16.3  press Left
+16.9  press Cross
+18.0  shot keyboard-x1
+18.6  press Down
+19.1  press Down
+19.6  press Down
+20.1  press Down
+20.6  press Right
+21.1  press Right
+21.8  press Cross
+23.0  press Left
+23.8  shot album-created
+24.4  press Triangle
+25.4  shot album-menu
+26.0  press Cross
+26.8  press Down
+27.3  press Right
+27.8  press Right
+28.3  press Right
+28.9  press Cross
+29.9  press Left
+30.4  press Left
+30.9  press Left
+31.5  press Down
+32.0  press Down
+32.5  press Down
+33.0  press Down
+33.5  press Right
+34.0  press Right
+34.6  press Cross
+35.8  shot album-renamed
+36.4  press Up
+36.9  press Right
+37.4  press Right
+38.0  press Cross
+39.3  shot folder-a
+39.9  press Triangle
+40.9  shot scene-menu
+41.5  press Cross
+42.7  press Down
+43.2  press Down
+43.7  press Down
+44.2  press Down
+44.7  press Down
+45.3  press Up
+46.3  shot album-pick
+46.9  press Cross
+48.1  shot folder-a-empty
+48.7  press Circle
+49.9  shot home-after-move
+50.5  press Triangle
+51.5  shot album-menu-empty
+52.1  press Down
+52.7  press Cross
+53.9  shot delete-album-confirm
+54.5  press Right
+55.1  press Cross
+56.3  shot album-deleted
+56.9  press Right
+57.7  press Cross
+58.9  shot folder-x1r
+59.5  press Triangle
+60.5  press Down
+61.1  press Cross
+62.3  shot keyboard-scene-rename
+62.9  press Down
+63.4  press Right
+63.9  press Right
+64.4  press Right
+65.0  press Cross
+66.0  press Left
+66.5  press Left
+67.0  press Left
+67.6  press Down
+68.1  press Down
+68.6  press Down
+69.1  press Down
+69.6  press Right
+70.1  press Right
+70.7  press Cross
+71.9  shot scene-renamed
+72.5  press Triangle
+73.5  press Down
+74.0  press Down
+74.6  press Cross
+75.8  shot scene-delete-confirm
+76.4  press Right
+77.0  press Cross
+78.2  shot folder-x1r-empty
+78.8  press Circle
+80.0  quit

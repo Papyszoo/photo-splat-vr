@@ -1,0 +1,54 @@
+# W21/W22: accept SHARP's licence, start its 2.6 GB download and cancel it after
+# about 30 s, leaving the .part for a resume. This pulls ~tens of MB from
+# Apple's CDN; W22 runs it only if the user allows the SHARP download.
+#
+# Run (real services, UI_FAKE must be off - ui-test.sh does not set it):
+#   platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/models-accept.txt
+#
+# Preconditions, checked by W22 before it launches:
+#   * SHARP's licence is NOT accepted yet (no 'sharp' entry in
+#     /data/ps5-splat-vr/state/licenses.json): otherwise Cross downloads from
+#     the Models row and never shows the licence screen. Run models.txt first,
+#     or remove that entry.
+#   * There is room for the .part plus the finished files: the Models screen
+#     refuses a download that does not fit (99 MB source + ~1.22 GB GGUF is the
+#     DA2 case; SHARP is 2.6 GB + ~1.22 GB).
+#
+# What W22 must check afterwards (the script cannot):
+#   * klog has the acceptance and the failure line:
+#       viewer: models: converting ...            (only on a later resume)
+#       viewer: models: sharp failed - download failed: download cancelled
+#     and the run ends with viewer: quit from the menu / done, exit 0.
+#   * /data/ps5-splat-vr/state/downloads/sharp_2572gikvuh.pt.part exists with a
+#     non-zero size, i.e. the cancel kept the partial file for a resume, and
+#     /data/ps5-splat-vr/state/models/sharp.gguf does NOT exist.
+#   * licenses.json holds one 'sharp' entry (the acceptance survives the cancel).
+#
+# Expected shots: home, models-accept-list, licence-accept-1, models-accepting,
+# models-cancel-30, models-cancelled.
+#
+# The panel boots into the folders; Options opens Settings, whose first row is
+# Models. The Models screen focuses the default model when there is one, so two
+# Ups land on SHARP whatever models.txt left behind.
+
+0.5   mark models-accept-start
+1.0   shot home
+1.6   press Options
+2.4   press Cross
+3.6   shot models-accept-list
+
+# SHARP is the first row and is gated: Cross opens its licence; Cross there
+# accepts the text shown and starts the download.
+4.2   press Up
+4.8   press Up
+5.4   press Cross
+8.0   shot licence-accept-1
+9.0   press Cross
+12.0  shot models-accepting
+
+# ~30 s of transfer from the licence acceptance, then Square cancels: the
+# manager stops at the next 64 KiB chunk and keeps the .part.
+40.0  shot models-cancel-30
+41.0  press Square
+44.0  shot models-cancelled
+45.0  quit

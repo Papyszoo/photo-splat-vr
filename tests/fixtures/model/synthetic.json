@@ -1,0 +1,251 @@
+{
+ "source": "synthetic.pt",
+ "checkpoint_sha256": "41c30ab37643701b5010cbeb57bf12396b23ce17bab11bee921f08ab8518dee2",
+ "checkpoint_bytes": 9314,
+ "tensor_count": 13,
+ "converted_tensor_count": 9,
+ "dropped_count": 4,
+ "dropped": [
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.head.weight",
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.head.bias",
+  "depth_alignment.scale_map_estimator.conv_out.weight",
+  "depth_alignment.scale_map_estimator.conv_out.bias"
+ ],
+ "tensor_order": [
+  "feature_model.decoder.convs.0.weight",
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.blocks.23.attn.proj.weight",
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.blocks.0.mlp.fc1.weight",
+  "monodepth_model.monodepth_predictor.decoder.convs.0.weight",
+  "monodepth_model.monodepth_predictor.decoder.norm.weight",
+  "monodepth_model.monodepth_predictor.decoder.norm.bias",
+  "feature_model.decoder.convs.1.bias",
+  "prediction_head.weight",
+  "prediction_head.bias",
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.head.weight",
+  "monodepth_model.monodepth_predictor.encoder.patch_encoder.head.bias",
+  "depth_alignment.scale_map_estimator.conv_out.weight",
+  "depth_alignment.scale_map_estimator.conv_out.bias"
+ ],
+ "tensors": [
+  {
+   "name": "feature_model.decoder.convs.0.weight",
+   "gguf_name": "feature_model.decoder.convs.0.weight",
+   "shape": [
+    8,
+    16,
+    1,
+    1
+   ],
+   "dtype": "float16",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    64,
+    126,
+    127
+   ],
+   "spot_values": [
+    0.0,
+    2.0,
+    1.0,
+    64.0,
+    126.19999694824219,
+    127.30000305175781
+   ]
+  },
+  {
+   "name": "monodepth_model.monodepth_predictor.encoder.patch_encoder.blocks.23.attn.proj.weight",
+   "gguf_name": "encoder.patch_encoder.blocks.23.attn.proj.weight",
+   "shape": [
+    8,
+    16,
+    1,
+    1
+   ],
+   "dtype": "float16",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    64,
+    126,
+    127
+   ],
+   "spot_values": [
+    0.5,
+    1.3333333730697632,
+    4.5,
+    64.5,
+    127.0,
+    126.0
+   ]
+  },
+  {
+   "name": "monodepth_model.monodepth_predictor.encoder.patch_encoder.blocks.0.mlp.fc1.weight",
+   "gguf_name": "encoder.patch_encoder.blocks.0.mlp.fc1.weight",
+   "shape": [
+    16,
+    8
+   ],
+   "dtype": "float16",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    64,
+    126,
+    127
+   ],
+   "spot_values": [
+    2.5,
+    -1.5,
+    65506.0,
+    66.5,
+    126.5,
+    127.33333587646484
+   ]
+  },
+  {
+   "name": "monodepth_model.monodepth_predictor.decoder.convs.0.weight",
+   "gguf_name": "decoder.convs.0.weight",
+   "shape": [
+    2,
+    3,
+    4
+   ],
+   "dtype": "float16",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    12,
+    22,
+    23
+   ],
+   "spot_values": [
+    65504.0,
+    1.0000100135803223,
+    2.00006103515625,
+    12.5,
+    22.100000381469727,
+    23.200000762939453
+   ]
+  },
+  {
+   "name": "monodepth_model.monodepth_predictor.decoder.norm.weight",
+   "gguf_name": "decoder.norm.weight",
+   "shape": [
+    16
+   ],
+   "dtype": "float32",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    8,
+    14,
+    15
+   ],
+   "spot_values": [
+    1.0,
+    0.0,
+    2.5,
+    8.00006103515625,
+    14.300000190734863,
+    15.0
+   ]
+  },
+  {
+   "name": "monodepth_model.monodepth_predictor.decoder.norm.bias",
+   "gguf_name": "decoder.norm.bias",
+   "shape": [
+    16
+   ],
+   "dtype": "float32",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    8,
+    14,
+    15
+   ],
+   "spot_values": [
+    -1.0,
+    1.5,
+    2.3333332538604736,
+    1242.5,
+    14.0,
+    16.0
+   ]
+  },
+  {
+   "name": "feature_model.decoder.convs.1.bias",
+   "gguf_name": "feature_model.decoder.convs.1.bias",
+   "shape": [
+    7
+   ],
+   "dtype": "float32",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    3,
+    5,
+    6
+   ],
+   "spot_values": [
+    0.3333333432674408,
+    3.5,
+    -0.5,
+    65507.0,
+    5.00006103515625,
+    1240.5
+   ]
+  },
+  {
+   "name": "prediction_head.weight",
+   "gguf_name": "prediction_head.weight",
+   "shape": [
+    2,
+    4,
+    1,
+    1
+   ],
+   "dtype": "float16",
+   "spot_indices": [
+    0,
+    1,
+    2,
+    4,
+    6,
+    7
+   ],
+   "spot_values": [
+    6.103515625e-05,
+    1235.5,
+    1.9989999532699585,
+    4.099999904632568,
+    6.300000190734863,
+    7.0
+   ]
+  },
+  {
+   "name": "prediction_head.bias",
+   "gguf_name": "prediction_head.bias",
+   "shape": [
+    2
+   ],
+   "dtype": "float32",
+   "spot_indices": [
+    0,
+    1
+   ],
+   "spot_values": [
+    -2.5,
+    65505.0
+   ]
+  }
+ ]
+}

@@ -1,0 +1,26 @@
+{
+  "default": "dev",
+  "titles": [
+    {
+      "name": "dev",
+      "titleId": "PPSA99202",
+      "conceptId": "99202",
+      "contentId": "IV0000-PPSA99202_00-PHOTOSPLATVRDEV0",
+      "titleName": "Photo Splat VR Dev",
+      "previousTitleNames": [
+        "PS5 Splat VR Viewer"
+      ],
+      "dataDir": "/data/ps5-splat-vr",
+      "agentsMayRun": true
+    },
+    {
+      "name": "release",
+      "titleId": "PPSA99770",
+      "conceptId": "99770",
+      "contentId": "IV0000-PPSA99770_00-PHOTOSPLATVR0001",
+      "titleName": "Photo Splat VR",
+      "dataDir": "/data/photo-splat-vr",
+      "agentsMayRun": false
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# Build artifacts: `make` rebuilds them (needs the payload SDK, see README).
+libhmd2.a
+*.o

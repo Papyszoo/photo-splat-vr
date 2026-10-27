@@ -1,0 +1,90 @@
+# W20: two conversions from the real panel, back to back, one per model, in a
+# ui_test_* folder. Same TV/scripted method as browse.txt; real services
+# (ui-test.sh never sets UI_FAKE).
+#
+# convert.txt (W19) was written before the UI redesign and no longer reaches
+# the Convert dialog: its second Cross opens the first scene of "Unsorted"
+# (the folder's focus starts on the first scene, not on "+ Add photos"), so
+# Square/Cross land in the scene view and no job is enqueued. This script is
+# the redesigned flow:
+#   Albums (focus 0 = Unsorted) -> Right Right -> the ui_test_conv folder ->
+#   "+ Add photos" -> Photos (Inbox tab, newest photo first) -> tick one photo
+#   -> Square -> Convert dialog -> SHARP -> Start (job 1 enqueued) -> back to
+#   the folder -> "+ Add photos" -> untick the first photo, tick the second ->
+#   Square -> dialog -> DA2-Small -> Start (job 2 queued behind job 1) ->
+#   Options -> Settings -> Conversions (Queue) -> the queue screen with both
+#   rows -> back to the folder -> progress shots -> the two new scene tiles ->
+#   view the first, R1 for the second -> quit.
+#
+# Preconditions on the console (W20 owns them, cleaned by exact name after):
+#   * scenes/ui_test_conv/ exists and is empty (the album the scenes land in);
+#   * inbox/ui_test_conv.jpg ($SPLAT_DATA_DIR/golden/immichvr/4.jpg) and
+#     inbox/ui_test_conv2.jpg (.../5.jpg), the second uploaded last so it is
+#     the newest Inbox tile (index 0) and the first is index 1;
+#   * state/ui.json remembers "da2" before the run, so the first dialog lists
+#     DA2-Small first and SHARP second (one Down picks SHARP); after that
+#     Start the service remembers SHARP, so the second dialog lists SHARP
+#     first and DA2-Small second (one Down picks DA2);
+#   * a SHARP GGUF under models/ that the manager verifies in place (the
+#     panel's Ready row) and state/models/da2.gguf, the DA2-Small GGUF.
+#
+# Expected klog (viewer.log of the run):
+#   "viewer: jobs: queue .../state/jobs.json", "viewer: jobs: ui_test_conv2
+#   queued/running ... ", a "done" row for each of ui_test_conv2 (SHARP) and
+#   ui_test_conv (DA2), "viewer: scene ui_test_conv: ... splats", "viewer: tv
+#   scene 1/2 ui_test_conv (album ui_test_conv)" then "2/2 ... ui_test_conv2",
+#   "viewer: script done", "viewer: PASS, exit 0".
+#
+# Run: platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/convert2.txt
+0.5   mark convert2-start
+1.0   shot c2-home
+2.0   press Right
+2.8   press Right
+3.6   press Cross
+4.6   shot c2-folder
+5.2   press Cross
+6.2   shot c2-picker
+6.8   press Cross
+7.4   press Square
+8.4   shot c2-dialog
+9.0   press Down
+9.6   press Cross
+10.6  shot c2-queued
+11.6  press Cross
+12.6  shot c2-picker2
+13.2  press Cross
+13.8  press Right
+14.4  press Cross
+15.0  press Square
+16.0  shot c2-dialog2
+16.6  press Down
+17.2  press Cross
+18.2  shot c2-both-queued
+19.2  press Options
+20.2  shot c2-settings
+20.8  press Down
+21.4  press Down
+22.0  press Down
+22.6  press Down
+23.2  press Down
+23.8  press Down
+24.8  shot c2-settings-conversions
+25.4  press Cross
+26.6  shot c2-queue
+27.6  press Circle
+28.6  press Circle
+29.6  shot c2-folder-running
+45.0  shot c2-progress1
+62.0  shot c2-progress2
+100.0 shot c2-folder-done
+101.0 press Left
+101.4 press Left
+101.8 press Left
+102.2 press Left
+102.8 press Right
+103.4 shot c2-done
+104.0 press Cross
+107.0 shot c2-view1
+108.0 press R1
+112.0 shot c2-view2
+114.0 quit

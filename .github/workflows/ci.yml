@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Two configurations: the desktop path on a software Vulkan driver (lavapipe),
+# and the CPU-only path the PS5-less fallbacks and the parity tools need. Both
+# run the same doctest suite. The GPU cases skip themselves when the device does
+# not meet the renderer's requirements (lavapipe's subgroup size is 4, the
+# renderer needs 32 or 64), so the Vulkan job checks compilation, shaders and
+# every CPU case.
+jobs:
+  linux-vulkan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain and Vulkan (lavapipe)
+        run: |
+          # GLFW 3.4 enables both Linux backends; its Wayland backend needs
+          # wayland-scanner, which comes with libwayland-dev.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev \
+            build-essential cmake ninja-build \
+            libvulkan-dev vulkan-tools glslc spirv-headers \
+            mesa-vulkan-drivers \
+            xorg-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols
+
+      - name: Configure
+        run: cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  linux-cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev \
+            build-essential cmake ninja-build
+
+      # No Vulkan headers, no glslc: splat_core, the CLIs and the tests must
+      # build and pass on the CPU backend alone.
+      - name: Configure (no Vulkan)
+        run: cmake -G Ninja -B build-cpu -DCMAKE_BUILD_TYPE=Release -DSPLAT_USE_VULKAN=OFF
+
+      - name: Build (no Vulkan)
+        run: cmake --build build-cpu
+
+      - name: Test (no Vulkan)
+        run: ctest --test-dir build-cpu --output-on-failure
