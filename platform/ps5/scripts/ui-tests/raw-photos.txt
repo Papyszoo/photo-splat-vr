@@ -1,0 +1,26 @@
+# The two real camera files from runs/v0.2-library/raw-samples/, converted on
+# the console (the brief's extra check, no runner case covers RAW).
+#
+# Home (Albums) -> 00_v02_console (focus on its first scene) -> Left
+# ("+ Add photos") -> Cross (Photos, Inbox tab) -> Cross on the first cell,
+# Right, Cross on the second (the two RAW files) -> Square (Convert) -> Cross
+# (Start).
+#
+# Asserted from the klog by the caller: a job line per file and the RAW path it
+# took ("raw preview" / half-size demosaic), no "photo is ..." guard failure.
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+3.0  press Left
+3.6  press Cross
+4.6  press Cross
+5.2  press Right
+5.8  press Cross
+6.6  press Square
+7.6  shot raw-dialog
+8.4  press Cross
+50.0 shot raw-done
+51.0 press Circle
+52.0 press Circle
+53.0 press Circle
+54.0 quit

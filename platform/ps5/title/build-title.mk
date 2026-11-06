@@ -94,6 +94,7 @@ TITLE_EXTRA_LDFLAGS ?=
 # Names the program defines that must not be exported (the viewer's Vulkan
 # entry-point shims: a title exports nothing, and the converter refuses an
 # executable that does). Empty for vk_hello.
+TITLE_DEFSYM_SKIP   ?=
 TITLE_EXTRA_LOCAL   ?=
 # Headers every object depends on (a multi-source program has its own); the
 # single-source vk_hello needs none.
@@ -164,6 +165,19 @@ TITLE_PLATFORM_EXTRA := $(shell for n in localeconv strcasestr mkstemp readlink 
 TITLE_EXTRA_DEFSYMS := $(foreach n,$(TITLE_PLATFORM_EXTRA),--defsym=$(n)=ps5_$(n))
 TITLE_DEFSYMS := $(subst -Wl$(RADV_COMMA)--defsym$(RADV_COMMA),--defsym=,$(RADV_DEFSYMS)) $(TITLE_EXTRA_DEFSYMS)
 
+# A title that *defines* a name radv-link.mk binds through --defsym must drop
+# that --defsym, because --defsym is itself a definition: with both in place lld
+# binds the name (and __wrap_ that name) to the --defsym target and silently
+# ignores the title's own function. The viewer does exactly that for
+# getaddrinfo/freeaddrinfo (its resolver shim, console pass 3 P1), so it lists
+# them here. Empty for every other title.
+ifneq ($(TITLE_DEFSYM_SKIP),)
+# One filter-out with every pattern at once: a $(foreach) around filter-out
+# returns the list once per name (each copy missing a different entry).
+TITLE_DEFSYM_SKIP_PATTERNS := $(addsuffix =%,$(addprefix --defsym=,$(TITLE_DEFSYM_SKIP)))
+TITLE_DEFSYMS := $(filter-out $(TITLE_DEFSYM_SKIP_PATTERNS),$(TITLE_DEFSYMS))
+endif
+
 # Every name this link binds stays local: the title converter refuses an
 # executable that exports symbols, and the SDK's stubs define some of the same
 # names. The C++ allocation operators stay internal too, as the boilerplate's
@@ -192,19 +206,66 @@ $(TITLE_OBJDIR)/app_cpp_runtime.o: $(TITLE_TOOLING)/native/app_cpp_runtime.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(TITLE_CRT_FLAGS) -c -o $@ $<
 
+# Header dependencies. The rule below names the program's own headers
+# (TITLE_HEADERS) and nothing else, so a title source that includes a *core*
+# header used to stay as it was when that header changed: the object kept the
+# old struct layout while the core archive was rebuilt with the new one, and the
+# link put both in one binary. That is what the 0.5.0 dev title shipped - its
+# ps5_jobs.o had sizeof(Job)=208 and sizeof(JobService)=224 while the archive
+# had 232 and 488, so the JobService constructor wrote 264 bytes past the block
+# the object had allocated and the worker thread died in free() (REPORT-CR.md).
+# -MMD -MP writes one .d beside each object listing every header the compiler
+# actually read, and -include reads it back, so make now rebuilds exactly the
+# objects whose headers changed.
+TITLE_DEPFLAGS := -MMD -MP
+TITLE_DEPS     := $(TITLE_OBJS:.o=.d)
+
+# Objects built before this rule existed have no .d beside them, so nothing
+# would ever rebuild them: they are exactly the stale objects the paragraph
+# above describes. One stamp per *program* forces them once, which makes the
+# first build after this rule a full recompile of the program's sources
+# without anyone having to remember `make clean`.
+#
+# The stamp is per program, not per identity: bench and vr_hello build their
+# objects into the same object folder as the viewer (only TITLE_STEM separates
+# them), so one stamp for the folder would leave the other programs' stale
+# objects alone for ever.
+#
+# The stamp must not delete the objects from a prerequisite's recipe: make
+# caches a target's mtime when it starts on that target, so after the recipe
+# removes the .o it still believes the object is up to date and goes straight
+# to the link with a missing file (reproduced with GNU Make 3.81; both an
+# order-only and a normal prerequisite do it). While the stamp is absent the
+# objects are forced through FORCE instead, and the stamp is written only after
+# the objects exist, so a failed compile forces again on the next run.
+TITLE_DEPSTAMP := $(TITLE_OBJDIR)/$(TITLE_STEM)/.header-deps
+ifneq ($(wildcard $(TITLE_DEPSTAMP)),)
+TITLE_DEPFORCE :=
+else
+TITLE_DEPFORCE := FORCE
+endif
+.PHONY: FORCE
+FORCE:
+
 # The program's sources keep their basenames, so two programs in one build
 # tree cannot collide.
 define TITLE_COMPILE_RULE
-$(TITLE_OBJDIR)/$(TITLE_STEM)/$(basename $(notdir $(1))).o: $(1) $(TITLE_HEADERS)
+$(TITLE_OBJDIR)/$(TITLE_STEM)/$(basename $(notdir $(1))).o: $(1) $(TITLE_HEADERS) $(TITLE_DEPFORCE)
 	@mkdir -p $$(@D)
-	$(CXX) $(TITLE_CXXFLAGS) $(TITLE_CPPFLAGS) -c -o $$@ $$<
+	$(CXX) $(TITLE_CXXFLAGS) $(TITLE_CPPFLAGS) $(TITLE_DEPFLAGS) -c -o $$@ $$<
 endef
 $(foreach source,$(TITLE_SOURCES),$(eval $(call TITLE_COMPILE_RULE,$(source))))
+
+$(TITLE_DEPSTAMP): $(TITLE_OBJS)
+	@mkdir -p $(@D)
+	@touch $@
+
+-include $(TITLE_DEPS)
 
 # --- link, convert, sign, package --------------------------------------------
 $(TITLE_PIE): $(TITLE_OBJS) $(TITLE_CRT_OBJS) $(TITLE_MAP) $(RADV_LIB) $(RADV_BUILTINS) \
               $(RADV_SDK)/target/lib/libps5platform.a $(TITLE_AGC_STUBS) \
-              $(TITLE_PIE_LAYOUT)
+              $(TITLE_PIE_LAYOUT) $(TITLE_DEPSTAMP)
 	@mkdir -p $(@D)
 	$(LD) $(TITLE_LDFLAGS) -L $(RADV_SDK)/target/lib -o $@ \
 	    $(TITLE_CRT_OBJS) $(TITLE_OBJS) \
@@ -257,7 +318,9 @@ title-package: $(TITLE_DIR)/eboot.bin $(TITLE_DIR)/sce_sys/param.json \
 	    "$$(stat -f%z $(TITLE_DIR)/eboot.bin 2>/dev/null || stat -c%s $(TITLE_DIR)/eboot.bin)" \
 	    "$$(du -sk $(TITLE_DIR) | awk '{print $$1 * 1024}')"
 
+# .header-deps used to live in the identity folder: remove leftovers of it.
 title-clean:
 	rm -rf $(TITLE_DIR) $(TITLE_OBJDIR)/$(TITLE_STEM) $(TITLE_CRT_OBJS) $(TITLE_PIE) $(TITLE_ELF) $(TITLE_MAP)
+	rm -f $(TITLE_OBJDIR)/.header-deps
 
 .PHONY: title-package title-clean

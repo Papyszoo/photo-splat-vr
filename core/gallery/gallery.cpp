@@ -1,9 +1,15 @@
 #include "gallery/gallery.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <string>
 #include <system_error>
 
 #include "gallery/fs_util.h"
+#include "gallery/visibility.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -11,16 +17,24 @@ namespace {
 // A scene folder is a directory holding scene.psplat; any other directory
 // under the root is an album.
 bool has_scene(const Path& dir) {
-    std::error_code error;
-    return std::filesystem::is_regular_file(dir / "scene.psplat", error) && !error;
+    vfs::FileStat status;
+    return vfs::stat(scene_files(dir).splat, &status).ok() && status.regular;
 }
 
 bool has_thumb(const Path& dir) {
-    std::error_code error;
-    return std::filesystem::is_regular_file(dir / "thumb.jpg", error) && !error;
+    vfs::FileStat status;
+    return vfs::stat(scene_files(dir).thumbnail, &status).ok() && status.regular;
 }
 
 bool hidden_name(const std::string& name) { return !name.empty() && name.front() == '.'; }
+
+// The one refusal every folder mutation on a location shares: the console can
+// read a share, not rearrange it (create/rename/delete would be a second write
+// path with its own conflict rules, and L3 keeps the mutations local).
+Status remote_mutation_refused(const Path& root) {
+    if (!vfs::is_remote(root)) return Status::success();
+    return Status::error(kRemoteMutationRefusal);
+}
 
 // True when the path itself is a symlink, or when nothing can say it is not
 // one (refusing is the safe direction).
@@ -28,32 +42,20 @@ bool hidden_name(const std::string& name) { return !name.empty() && name.front()
 // A title may not read link targets, and on the PS5 it is refused the
 // non-following status as well: symlink_status() (libc++ -> lstat) answers
 // EPERM for every path on /data, measured on the console in scenefix2. So the
-// type the filesystem reported for the entry in its parent is asked first: the
-// directory read (readdir's d_type) carries it, and directory_entry::is_symlink()
-// on that entry uses it without any lstat. symlink_status() stays the fallback
-// for a parent that cannot be listed and for a file system that reports no type
-// for the entry.
+// type the file system reported for the entry in its parent is asked: the
+// directory read (readdir's d_type) carries it (vfs::DirEntry::symlink). A
+// parent that cannot be listed, or an entry it does not show, counts as
+// unreadable and is refused exactly as before.
 bool symlink_or_unreadable(const Path& path) {
     const Path parent = path.parent_path();
     const std::string name = path.filename().string();
-    if (!parent.empty() && !name.empty()) {
-        std::error_code listing_error;
-        std::filesystem::directory_iterator it(
-            parent, std::filesystem::directory_options::skip_permission_denied, listing_error);
-        const std::filesystem::directory_iterator end;
-        while (!listing_error && it != end) {
-            if (it->path().filename().string() == name) {
-                std::error_code entry_error;
-                const bool link = it->is_symlink(entry_error);
-                if (!entry_error) return link;
-                break;  // the entry's type is unknown here: ask the status below
-            }
-            it.increment(listing_error);
-        }
+    if (parent.empty() || name.empty()) return true;
+    std::vector<vfs::DirEntry> entries;
+    if (!vfs::list(parent, &entries).ok()) return true;
+    for (const vfs::DirEntry& entry : entries) {
+        if (entry.name == name) return entry.symlink;
     }
-    std::error_code error;
-    const std::filesystem::file_status status = std::filesystem::symlink_status(path, error);
-    return error || std::filesystem::is_symlink(status);
+    return true;
 }
 
 // The folder an album key names. "" is the loose-scene album at the root;
@@ -69,25 +71,50 @@ Path album_dir(const Path& root, const std::string& album) {
     return root / album;
 }
 
-std::vector<Path> scene_folders(const Path& directory) {
+// The scene folders among one directory listing. Split out so a caller that
+// already listed the directory (list_scenes_checked) does not list it twice.
+std::vector<Path> scene_folders_from(const Path& directory,
+                                     const std::vector<vfs::DirEntry>& entries) {
     std::vector<Path> scenes;
-    std::error_code error;
-    std::filesystem::directory_iterator it(directory,
-                                           std::filesystem::directory_options::skip_permission_denied,
-                                           error);
-    const std::filesystem::directory_iterator end;
-    while (!error && it != end) {
-        std::error_code item_error;
-        const Path path = it->path();
-        if (it->is_directory(item_error) && !item_error && !hidden_name(path.filename().string()) &&
-            has_scene(path)) {
-            scenes.push_back(path);
-        }
-        it.increment(error);
+    for (const vfs::DirEntry& entry : entries) {
+        if (!entry.directory || entry.symlink || hidden_name(entry.name)) continue;
+        const Path path = directory / entry.name;
+        if (has_scene(path)) scenes.push_back(path);
     }
     std::sort(scenes.begin(), scenes.end(), [](const Path& a, const Path& b) {
         return a.filename().string() < b.filename().string();
     });
+    return scenes;
+}
+
+std::vector<Path> scene_folders(const Path& directory) {
+    std::vector<vfs::DirEntry> entries;
+    if (!vfs::list(directory, &entries).ok()) return {};
+    return scene_folders_from(directory, entries);
+}
+
+// The scene entries of one directory listing, policy applied. list_scenes()
+// and list_scenes_checked() differ only in how they obtain `entries` and how
+// they report a listing that refused to run.
+std::vector<SceneEntry> scene_entries_from(const Path& root, const Path& directory,
+                                           const std::vector<vfs::DirEntry>& entries) {
+    std::vector<SceneEntry> scenes;
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
+    const VisibilityKey placement = listing_placement(root, directory);
+    for (const Path& folder : scene_folders_from(directory, entries)) {
+        SceneEntry entry;
+        entry.folder = folder;
+        entry.name = folder.filename().string();
+        entry.album = directory == root ? "" : directory.filename().string();
+        // One meta.json read per scene: it is the entry's display data. The
+        // policy asks about the placement only (stage U1), never the meta.
+        const Result<SceneMeta> meta = read_scene_meta(scene_files(folder).meta);
+        entry.meta_readable = meta.ok();
+        entry.meta = meta.ok() ? meta.value() : SceneMeta{};
+        if (visibility->enabled && !visibility->allows_scene(folder, placement)) continue;
+        entry.has_thumb = has_thumb(folder);
+        scenes.push_back(std::move(entry));
+    }
     return scenes;
 }
 
@@ -104,9 +131,15 @@ void album_stats(const Path& directory, size_t* scene_count, Path* cover) {
     if (!scenes.empty()) *cover = scenes.front();
 }
 
-SceneMeta read_meta_or_default(const Path& folder) {
-    const Result<SceneMeta> meta = read_scene_meta(scene_files(folder).meta);
-    return meta.ok() ? meta.value() : SceneMeta{};
+// Reads one scene's meta.json for the caller's display fields and asks the
+// policy about the placement. `meta` and `readable` are filled either way, so
+// the caller can build the entry from the same read.
+bool scene_visible(const Visibility& state, const VisibilityKey& placement, const Path& folder,
+                   SceneMeta* meta, bool* readable) {
+    const Result<SceneMeta> read = read_scene_meta(scene_files(folder).meta);
+    *readable = read.ok();
+    *meta = read.ok() ? read.value() : SceneMeta{};
+    return state.allows_scene(folder, placement);
 }
 
 bool is_reserved(const std::string& name) { return name == kAllScenesAlbumName; }
@@ -123,7 +156,7 @@ bool valid_album_name(const std::string& name) {
     return true;
 }
 
-std::vector<AlbumEntry> list_albums(const Path& root) {
+std::vector<AlbumEntry> list_albums_all(const Path& root) {
     std::vector<AlbumEntry> albums;
     if (!is_dir(root)) return albums;
 
@@ -132,23 +165,17 @@ std::vector<AlbumEntry> list_albums(const Path& root) {
     loose.name = kAllScenesAlbumName;
     album_stats(root, &loose.scene_count, &loose.cover);
 
-    std::error_code error;
-    std::filesystem::directory_iterator it(root,
-                                          std::filesystem::directory_options::skip_permission_denied,
-                                          error);
-    const std::filesystem::directory_iterator end;
-    while (!error && it != end) {
-        std::error_code item_error;
-        const Path path = it->path();
-        const std::string name = path.filename().string();
-        if (it->is_directory(item_error) && !item_error && !hidden_name(name) && !has_scene(path)) {
-            AlbumEntry album;
-            album.dir = path;
-            album.name = name;
-            album_stats(path, &album.scene_count, &album.cover);
-            albums.push_back(std::move(album));
-        }
-        it.increment(error);
+    std::vector<vfs::DirEntry> entries;
+    if (!vfs::list(root, &entries).ok()) entries.clear();
+    for (const vfs::DirEntry& entry : entries) {
+        if (!entry.directory || entry.symlink || hidden_name(entry.name)) continue;
+        const Path path = root / entry.name;
+        if (has_scene(path)) continue;
+        AlbumEntry album;
+        album.dir = path;
+        album.name = entry.name;
+        album_stats(path, &album.scene_count, &album.cover);
+        albums.push_back(std::move(album));
     }
 
     std::sort(albums.begin(), albums.end(),
@@ -157,21 +184,58 @@ std::vector<AlbumEntry> list_albums(const Path& root) {
     return albums;
 }
 
-std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album) {
-    std::vector<SceneEntry> scenes;
-    const Path directory = album_dir(root, album);
-    if (!is_dir(directory)) return scenes;
+std::vector<AlbumEntry> list_albums(const Path& root) {
+    std::vector<AlbumEntry> albums = list_albums_all(root);
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
+    if (!visibility->enabled) return albums;
 
-    for (const Path& folder : scene_folders(directory)) {
-        SceneEntry entry;
-        entry.folder = folder;
-        entry.name = folder.filename().string();
-        entry.album = directory == root ? "" : directory.filename().string();
-        entry.meta = read_meta_or_default(folder);
-        entry.has_thumb = has_thumb(folder);
-        scenes.push_back(std::move(entry));
+    std::vector<AlbumEntry> visible;
+    visible.reserve(albums.size());
+    for (AlbumEntry& album : albums) {
+        const VisibilityKey placement = listing_placement(root, album.dir);
+        if (!visibility->allows(placement)) continue;
+
+        // The count and the cover are the visible ones: a folder whose scenes
+        // are all hidden is an empty folder with a folder icon, never a tile
+        // showing a hidden picture.
+        std::size_t count = 0;
+        Path first_visible;
+        Path first_thumb;
+        for (const Path& folder : scene_folders(album.dir)) {
+            SceneMeta meta;
+            bool readable = false;
+            if (!scene_visible(*visibility, placement, folder, &meta, &readable)) continue;
+            ++count;
+            if (first_visible.empty()) first_visible = folder;
+            if (first_thumb.empty() && has_thumb(folder)) first_thumb = folder;
+        }
+        album.scene_count = count;
+        album.cover = first_thumb.empty() ? first_visible : first_thumb;
+        visible.push_back(std::move(album));
     }
-    return scenes;
+    return visible;
+}
+
+std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album) {
+    const Path directory = album_dir(root, album);
+    std::vector<vfs::DirEntry> entries;
+    if (!vfs::list(directory, &entries).ok()) return {};
+    return scene_entries_from(root, directory, entries);
+}
+
+Result<std::vector<SceneEntry>> list_scenes_checked(const Path& root, const std::string& album) {
+    const Path directory = album_dir(root, album);
+    vfs::FileStat status;
+    const Status looked = vfs::stat(directory, &status);
+    if (!looked.ok()) return Result<std::vector<SceneEntry>>::failure(looked.message());
+    if (!status.directory) {
+        return Result<std::vector<SceneEntry>>::failure("not a folder: " + directory.string());
+    }
+    std::vector<vfs::DirEntry> entries;
+    const Status listed = vfs::list(directory, &entries);
+    if (!listed.ok()) return Result<std::vector<SceneEntry>>::failure(listed.message());
+    return Result<std::vector<SceneEntry>>::success(
+        scene_entries_from(root, directory, entries));
 }
 
 BootAlbum boot_album(const Path& root, const std::string& preferred) {
@@ -212,7 +276,11 @@ BootAlbum boot_album(const Path& root, const std::string& preferred) {
 BootSceneLoad load_boot_scene(const std::vector<Path>& scene_folders, std::size_t start) {
     BootSceneLoad load;
     load.index = start;
+    // A hidden scene is skipped silently: its name must not reach a log line or
+    // a skipped-scene message (stage H, "A hidden folder is absent everywhere").
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
     for (std::size_t i = start; i < scene_folders.size(); ++i) {
+        if (!visibility->allows_scene_folder(scene_folders[i])) continue;
         const Path scene_file = scene_files(scene_folders[i]).splat;
         Result<LoadedScene> result = read_scene_path(scene_file);
         if (!result.ok()) {
@@ -229,20 +297,22 @@ BootSceneLoad load_boot_scene(const std::vector<Path>& scene_folders, std::size_
 }
 
 Status create_album(const Path& root, const std::string& name) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     if (!valid_album_name(name)) return Status::error("invalid album name: \"" + name + "\"");
     if (is_reserved(name)) return Status::error("album name is reserved: \"" + name + "\"");
 
     const Path dir = root / name;
-    std::error_code error;
-    if (std::filesystem::exists(dir, error) && !error) {
+    vfs::FileStat status;
+    if (vfs::stat(dir, &status).ok() && status.exists) {
         return Status::error("album already exists: " + dir.string());
     }
-    std::filesystem::create_directories(dir, error);
-    if (error) return Status::error("cannot create " + dir.string() + ": " + error.message());
-    return Status::success();
+    return vfs::make_dirs(dir);
 }
 
 Status rename_album(const Path& root, const std::string& from, const std::string& to) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     if (!valid_album_name(from)) return Status::error("invalid album name: \"" + from + "\"");
     if (!valid_album_name(to)) return Status::error("invalid album name: \"" + to + "\"");
     if (is_reserved(to)) return Status::error("album name is reserved: \"" + to + "\"");
@@ -253,19 +323,19 @@ Status rename_album(const Path& root, const std::string& from, const std::string
     if (from == to) return Status::success();
 
     const Path target = root / to;
-    std::error_code error;
-    if (std::filesystem::exists(target, error) && !error) {
+    vfs::FileStat status;
+    if (vfs::stat(target, &status).ok() && status.exists) {
         return Status::error("album already exists: " + target.string());
     }
-    std::filesystem::rename(source, target, error);
-    if (error) {
-        return Status::error("cannot rename " + source.string() + " to " + target.string() + ": " +
-                             error.message());
-    }
-    return Status::success();
+    // The rename goes through the VFS like every other folder write: an adapter
+    // with no replace (and a test's fake file system) has to see it, and a
+    // cross-file-system target must be refused by the same rule everywhere.
+    return vfs::rename_file(source, target);
 }
 
 Status delete_album(const Path& root, const std::string& name) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     if (name.empty()) return Status::error("cannot delete the loose-scene album");
     if (!valid_album_name(name)) return Status::error("invalid album name: \"" + name + "\"");
     if (is_reserved(name)) return Status::error("cannot delete album \"" + name + "\"");
@@ -273,25 +343,30 @@ Status delete_album(const Path& root, const std::string& name) {
     const Path dir = root / name;
     if (!is_dir(dir) || has_scene(dir)) return Status::error("not an album: " + dir.string());
 
-    std::error_code error;
-    std::filesystem::directory_iterator it(dir,
-                                           std::filesystem::directory_options::skip_permission_denied,
-                                           error);
-    const std::filesystem::directory_iterator end;
-    if (!error && it != end) {
-        std::error_code item_error;
-        if (it->is_directory(item_error) && !item_error && has_scene(it->path())) {
-            return Status::error("album holds a scene: " + dir.string());
+    // An album is removable only when it is empty: a stray file or a scene
+    // folder keeps it.
+    std::vector<vfs::DirEntry> entries;
+    if (!vfs::list(dir, &entries).ok()) entries.clear();
+    if (!entries.empty()) {
+        for (const vfs::DirEntry& entry : entries) {
+            if (entry.directory && !entry.symlink && has_scene(dir / entry.name)) {
+                return Status::error("album holds a scene: " + dir.string());
+            }
         }
         return Status::error("album is not empty: " + dir.string());
     }
 
-    std::filesystem::remove(dir, error);
-    if (error) return Status::error("cannot delete " + dir.string() + ": " + error.message());
+    // The directory is empty: rmdir, through the C library so this file needs
+    // no filesystem library (the local adapter owns that).
+    if (std::remove(dir.string().c_str()) != 0) {
+        return Status::error("cannot delete " + dir.string() + ": " + std::strerror(errno));
+    }
     return Status::success();
 }
 
 Status move_scene(const Path& root, const Path& scene_folder, const std::string& to_album) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     if (!is_dir(scene_folder) || !has_scene(scene_folder)) {
         return Status::error("not a scene folder: " + scene_folder.string());
     }
@@ -308,19 +383,18 @@ Status move_scene(const Path& root, const Path& scene_folder, const std::string&
     const Path target = (to_album.empty() ? root : root / to_album) / scene_folder.filename();
     if (target == scene_folder) return Status::success();
 
-    std::error_code error;
-    if (std::filesystem::exists(target, error) && !error) {
+    vfs::FileStat status;
+    if (vfs::stat(target, &status).ok() && status.exists) {
         return Status::error("scene folder already exists: " + target.string());
     }
-    std::filesystem::rename(scene_folder, target, error);
-    if (error) {
-        return Status::error("cannot move " + scene_folder.string() + " to " + target.string() + ": " +
-                             error.message());
-    }
-    return Status::success();
+    return vfs::rename_file(scene_folder, target);
 }
 
 bool scene_location(const Path& root, const Path& scene_folder, std::string& album) {
+    // A location path is not an OS path: normal_absolute() would prepend the
+    // working directory to "smb0:/..." and compare nonsense. Nothing that
+    // rearranges folders works on a location anyway (remote_mutation_refused).
+    if (vfs::is_remote(root) || vfs::is_remote(scene_folder)) return false;
     Path base;
     Path folder;
     if (!normal_absolute(root, base) || !normal_absolute(scene_folder, folder)) return false;
@@ -348,6 +422,8 @@ bool scene_location(const Path& root, const Path& scene_folder, std::string& alb
 }
 
 Status rename_scene(const Path& root, const Path& scene_folder, const std::string& new_name) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     std::string album;
     if (!scene_location(root, scene_folder, album)) {
         return Status::error("not a scene folder: " + scene_folder.string());
@@ -357,24 +433,21 @@ Status rename_scene(const Path& root, const Path& scene_folder, const std::strin
     }
     if (scene_folder.filename() == Path(new_name)) return Status::success();
     const Path target = scene_folder.parent_path() / new_name;
-    std::error_code error;
-    if (std::filesystem::exists(target, error) && !error) {
+    vfs::FileStat status;
+    if (vfs::stat(target, &status).ok() && status.exists) {
         return Status::error("that name already exists: " + new_name);
     }
-    std::filesystem::rename(scene_folder, target, error);
-    if (error) return Status::error("cannot rename " + scene_folder.string() + ": " + error.message());
-    return Status::success();
+    return vfs::rename_file(scene_folder, target);
 }
 
 Status delete_scene(const Path& root, const Path& scene_folder) {
+    const Status remote = remote_mutation_refused(root);
+    if (!remote.ok()) return remote;
     std::string album;
     if (!scene_location(root, scene_folder, album)) {
         return Status::error("not a scene folder: " + scene_folder.string());
     }
-    std::error_code error;
-    std::filesystem::remove_all(scene_folder, error);
-    if (error) return Status::error("cannot delete " + scene_folder.string() + ": " + error.message());
-    return Status::success();
+    return vfs::remove_tree(scene_folder);
 }
 
 std::string default_album_name(std::time_t time, const Path& root) {
@@ -388,11 +461,11 @@ std::string default_album_name(std::time_t time, const Path& root) {
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &local);
     const std::string base(buffer);
 
-    std::error_code error;
-    if (!std::filesystem::exists(root / base, error) || error) return base;
+    vfs::FileStat status;
+    if (!vfs::stat(root / base, &status).ok() || !status.exists) return base;
     for (int suffix = 2; suffix < 1000; ++suffix) {
         const std::string candidate = base + "-" + std::to_string(suffix);
-        if (!std::filesystem::exists(root / candidate, error) || error) return candidate;
+        if (!vfs::stat(root / candidate, &status).ok() || !status.exists) return candidate;
     }
     return base + "-1000";
 }

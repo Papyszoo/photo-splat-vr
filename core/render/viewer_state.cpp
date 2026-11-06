@@ -25,7 +25,16 @@ void ViewerState::set_anchor(float x, float y, float z) {
 }
 
 void ViewerState::set_world_scale(float scale) {
-    world_scale_ = clamp(scale, kMinWorldScale, kMaxWorldScale);
+    world_scale_ = clamp(scale, min_scale_, max_scale_);
+}
+
+void ViewerState::set_world_scale_limits(float min_scale, float max_scale) {
+    if (!std::isfinite(min_scale) || !std::isfinite(max_scale)) return;
+    if (!(min_scale > 0.0f) || !(max_scale >= min_scale)) return;
+    min_scale_ = min_scale;
+    max_scale_ = max_scale;
+    // A narrower range must not leave the current scale outside it.
+    world_scale_ = clamp(world_scale_, min_scale_, max_scale_);
 }
 
 void ViewerState::set_scene_offset(float x, float y, float z) {

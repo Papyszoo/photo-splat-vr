@@ -25,6 +25,11 @@ enum UiAction : uint32_t {
     Secondary = 1u << 8,  // Square
     Tooltips = 1u << 9,   // Triangle
     Menu = 1u << 10,      // Options
+    // The two rotation keys, free on every panel screen and every device: the
+    // left/right stick clicks. Named in the hint bar as L3/R3 (the photo picker
+    // and the Scenes shelf both turn the focused entry 90 degrees).
+    RotateLeft = 1u << 11,   // L3
+    RotateRight = 1u << 12,  // R3
     // Triangle inside the panel opens the focused item's context menu (folder
     // and scene actions); the scene layer still reads the bit as Tooltips.
     Context = Tooltips,
@@ -37,6 +42,9 @@ struct UiInput {
     float px = 0.0f;
     float py = 0.0f;
     bool click = false;
+    // The pointer button is down now (the VR trigger held). `click` is the
+    // edge of the same press; a slider needs the level to follow a drag.
+    bool pointer_down = false;
     double dt = 0.0;
 };
 

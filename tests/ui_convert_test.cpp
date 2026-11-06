@@ -8,17 +8,20 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/path.h"
 #include "common/status.h"
 #include "gallery/gallery.h"
+#include "gallery/visibility.h"
 #include "test_util.h"
 #include "ui/fakes.h"
 #include "ui/screens/convert_dialog.h"
@@ -261,4 +264,52 @@ TEST_CASE("ui_convert says when conversion is not available") {
 
     // The warning line draws without a job service.
     fixture.dialog->draw(fixture.context, fixture.canvas, fixture.context.content);
+}
+
+TEST_CASE("ui_convert a blocked dialog names no folder and holds no preview") {
+    Fixture fixture;
+    // A real photo from the committed fixtures: its preview does decode, so an
+    // empty preview below is the policy's doing.
+    const Path photo = Path(__FILE__).parent_path() / "fixtures" / "photos" / "tiny_source.png";
+    fixture.enter({photo}, "Family B");
+    REQUIRE(fixture.dialog != nullptr);
+    REQUIRE(fixture.dialog->album() == "Family B");
+
+    // No policy: the destination line names the album and the preview arrives.
+    for (int i = 0; i < 200 && !fixture.dialog->preview_ready(); ++i) {
+        fixture.idle();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK_FALSE(fixture.dialog->blocked());
+    CHECK(fixture.dialog->folder_line() == "into Family B");
+    CHECK(fixture.dialog->preview_ready());
+
+    // A passcode is set with "Family B" unticked while this dialog sits under
+    // Settings (the route stage H names): the dialog refuses, and the hidden
+    // album's name and the hidden photo's thumbnail both disappear.
+    splat::VisibilityContext visibility_context;
+    visibility_context.scenes_root = fixture.scenes;
+    visibility_context.inbox = fixture.dir.path() / "inbox";
+    visibility_context.mnt = fixture.dir.path() / "mnt";
+    visibility_context.data = fixture.dir.path() / "data";
+    visibility_context.app_data = fixture.dir.path();
+    splat::Visibility state = splat::Visibility::all_visible(visibility_context);
+    state.enabled = true;
+    state.allowed = {splat::VisibilityKey::other()};
+    splat::VisibilityScope scope{state};
+
+    fixture.idle();
+    REQUIRE(fixture.dialog->blocked());
+    CHECK(fixture.dialog->message() == splat::kNotVisibleText);
+    CHECK(fixture.dialog->folder_line().empty());
+    CHECK_FALSE(fixture.dialog->preview_ready());
+    fixture.dialog->draw(fixture.context, fixture.canvas, fixture.context.content);
+
+    // Cross refuses and queues nothing.
+    fixture.idle();
+    fixture.update(press(splat::Select));
+    CHECK(fixture.jobs.snapshot().empty());
+    CHECK(fixture.stack.top_id() == splat::ScreenId::ConvertDialog);
+    REQUIRE_FALSE(fixture.toasts.empty());
+    CHECK(fixture.toasts.back() == splat::kNotVisibleText);
 }

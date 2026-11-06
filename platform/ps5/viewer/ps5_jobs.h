@@ -68,10 +68,14 @@ struct JobSetup {
 // GGUF the converter loads. `legacy_models_dir` is the fixed-path folder the
 // shared legacy lookup reads (core/ui/model_service.h).
 //
-// Null with a "viewer: jobs: ..." log line only when the queue file cannot be
-// read. A backend with no model file still gets the queue: its job fails on
-// start with the paths that were looked in (each job resolves its own backend's
-// file), instead of hiding the whole queue screen.
+// Never null: a queue file that cannot be read, parsed or believed (truncated,
+// an implausible row count or size) is kept beside itself as
+// "jobs.json.rejected", one "viewer: jobs: ..." line names the reason, and the
+// queue starts empty (JobQueue::open_or_empty). The title must boot with a
+// usable panel whatever the last session left behind. A backend with no model
+// file still gets the queue: its job fails on start with the paths that were
+// looked in (each job resolves its own backend's file), instead of hiding the
+// whole queue screen.
 std::unique_ptr<JobSetup> build_job_setup(const splat::Path& state_dir,
                                           const splat::Path& scenes_dir,
                                           const splat::Path& legacy_models_dir,

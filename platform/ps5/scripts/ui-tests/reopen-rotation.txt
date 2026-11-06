@@ -1,0 +1,17 @@
+# The relaunch half of the rotation check: the scene turned by rotate-local.txt
+# is opened again after a fresh launch and must still open. There is no stored
+# viewer rotation any more (DECISIONS.md, "Change 2026-11-05"); the turn lives in
+# the scene's own files, so the check is that the run reaches its own end and
+# logs a scene, not a yaw number.
+#
+# console-run.sh runs rotate-local.txt first (a photo turn and a scene turn),
+# then this script. Entering the album puts the focus on its first scene, so
+# Right + Cross opens it.
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+3.0  press Cross
+7.0  shot reopened-scene
+8.0  press Circle
+9.0  press Circle
+10.0 quit

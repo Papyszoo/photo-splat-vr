@@ -115,6 +115,13 @@ public:
         bool block_load = false;
         bool load_started = false;
         bool load_released = false;
+        // Hold before load() logs anything, so a test can take the gate from
+        // Idle to Paused first. Without this the worker can be scheduled before
+        // the test thread's first poll(), and "load" legitimately appears before
+        // the pause hook even though the two threads are ordered correctly.
+        bool block_before_load = false;
+        bool before_load_started = false;
+        bool before_load_released = false;
     };
 
     LoggingReconstructor(std::shared_ptr<EventLog> log, std::shared_ptr<Control> control)
@@ -123,6 +130,15 @@ public:
     splat::BackendInfo info() const override { return {"fake", "test-only", 0}; }
 
     splat::Status load(const splat::Path&) override {
+        {
+            std::unique_lock<std::mutex> lock(control_->mutex);
+            control_->before_load_started = true;
+            control_->cv.notify_all();
+            if (control_->block_before_load) {
+                control_->cv.wait_for(lock, 15s,
+                                      [this] { return control_->before_load_released; });
+            }
+        }
         log_->add("load");
         {
             std::lock_guard<std::mutex> lock(control_->mutex);
@@ -170,6 +186,15 @@ void release_load(const std::shared_ptr<LoggingReconstructor::Control>& control)
     {
         std::lock_guard<std::mutex> lock(control->mutex);
         control->load_released = true;
+    }
+    control->cv.notify_all();
+}
+
+// Lets a fake load() that was held before it logged "load" finish.
+void release_before_load(const std::shared_ptr<LoggingReconstructor::Control>& control) {
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        control->before_load_released = true;
     }
     control->cv.notify_all();
 }
@@ -351,12 +376,23 @@ TEST_CASE("ps5_jobs: the release hook runs between pause and the job") {
     // order must stay pause -> release -> job ... restore -> resume.
     Fixture fixture;
     fixture.gate = ConvertGate(ConvertGate::Hooks{[&] { fixture.log->add("pause"); },
-                                                  [&] { fixture.log->add("release"); },
-                                                  [&] { fixture.log->add("restore"); },
-                                                  [&] { fixture.log->add("resume"); }});
+                                                      [&] { fixture.log->add("release"); },
+                                                      [&] { fixture.log->add("restore"); },
+                                                      [&] { fixture.log->add("resume"); }});
     write_test_jpeg(fixture.photo("variant.jpg"));
+    fixture.control->block_before_load = true;
 
     REQUIRE(fixture.service->enqueue({fixture.photo("variant.jpg")}, "fake", "").ok());
+    // Take the gate to Paused before the worker logs its load. The two threads
+    // are otherwise free to run in either order before the first poll(); the
+    // product order under test is the hook order once the gate has followed the
+    // job, not which thread the scheduler wakes first.
+    REQUIRE(wait_until([&] {
+        std::lock_guard<std::mutex> lock(fixture.control->mutex);
+        return fixture.control->before_load_started;
+    }));
+    CHECK(fixture.frame() == ConvertGatePhase::Paused);
+    release_before_load(fixture.control);
     REQUIRE(fixture.run_until_idle());
 
     CHECK(fixture.log->joined() == "pause release load run unload restore resume");

@@ -23,6 +23,7 @@
 #include "ui/screen.h"
 #include "ui/thumb_cache.h"
 #include "ui/widgets.h"
+#include "vfs/listing.h"
 
 namespace splat {
 
@@ -64,7 +65,18 @@ private:
     };
     enum class Action { Rename, Delete };
 
-    void reload(UiContext& ctx);
+    // What one listing builds off the UI thread: the tiles, the empty state and
+    // the suggested folder name. Published through AsyncListing::payload.
+    struct Listing {
+        std::vector<Item> items;
+        bool empty_state = false;
+        std::string default_name;
+        // The visible scene count across every visible folder, for the log line.
+        std::size_t scenes_total = 0;
+    };
+
+    void request_listing(UiContext& ctx);
+    void apply_listing(UiContext& ctx);
     void build_cells();
     void refresh_covers(UiContext& ctx);
     bool open_menu();
@@ -75,6 +87,9 @@ private:
     PopupMenu menu_;
     std::vector<Action> menu_actions_;
     ThumbCache thumbs_;
+    // The folder listing runs on a worker for a network location and inline for
+    // a local root, so a local screen is ready in the same call as before.
+    vfs::AsyncListing listing_;
     std::vector<Item> items_;
     // One owned cover per item, empty until it has loaded (the grid draws the
     // placeholder meanwhile). Owned copies keep the pointers in GridCell
@@ -83,6 +98,9 @@ private:
     std::vector<char> cover_ready_;
     bool empty_state_ = false;
     std::string default_name_;
+    // Why the last listing failed ("" when it worked), drawn instead of the
+    // empty state.
+    std::string error_;
     std::string focus_name_;  // restore the focused folder when the screen is revealed again
 };
 

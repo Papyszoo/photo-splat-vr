@@ -10,14 +10,62 @@ The SHARP backend is an independent reimplementation of the
 written from the paper and the reference code's observable behaviour. No Apple
 code and no model weights are part of this repository.
 
-v0.1 does what the project set out to do: photos are converted on the console
-and the resulting scenes display in VR and on the TV. DA2-Small ships as an
-alternative, with approximate scene size.
+v0.5 adds the library features on top of that core: photos in the common
+camera and web formats, splat import, rotate left or right on any photo or
+scene entry, and network libraries over SMB and NFS. v0.1 does what the project
+set out to do: photos are converted on the console and the resulting scenes
+display in VR and on the TV. DA2-Small ships as an alternative, with approximate
+scene size.
 
 - Repository: <https://github.com/Papyszoo/photo-splat-vr>
 - Specification: [`docs/spec.md`](docs/spec.md)
 - Decisions: [`docs/PLAN.md`](docs/PLAN.md)
 - Known issues: [`docs/BACKLOG.md`](docs/BACKLOG.md)
+
+## What is new in 0.5
+
+- **More photo formats.** WebP, TIFF, HEIC/HEIF, AVIF, BMP, GIF (first frame),
+  TGA and camera RAW (DNG, CR2, CR3, NEF, ARW, RAF, ORF, RW2, PEF, SRW) convert
+  like JPEG and PNG. EXIF orientation is applied to the pixels, the thumbnail
+  and the intrinsics, so a sideways phone photo becomes an upright scene.
+- **Rotate a file entry.** Focus a photo or a scene and press **L3** (left) or
+  **R3** (right) to turn it 90 degrees. The rotated version overrides the
+  previous one: a JPEG or baseline TIFF has its Orientation tag rewritten, a
+  scene has its own files rewritten, and a format the app cannot write keeps its
+  source and stores the turn for the conversion. The viewer has no rotation to
+  change or save.
+- **Import splats.** `.ply`, `.splat`, `.spz` and SuperSplat `.compressed.ply`
+  files become normal scenes without a photo or a model. A file above the
+  renderer's budget is thinned to 2,000,000 splats with a notice, never refused.
+- **Network libraries.** An SMB2/SMB3 share or an NFSv3/NFSv4 export can hold
+  photos, scenes, or both. A conversion saved to a share is built locally,
+  uploaded, and the local copy is deleted; a failed upload keeps it and names it.
+- **Visible folders.** One passcode hides the scene folders (albums and network
+  scene libraries) a visitor may not see; the photo picker stays open.
+- **Thumbnail size.** One Settings slider sizes every thumbnail grid.
+
+## Formats
+
+The photo extensions and decoders are listed in
+[`docs/formats/photo-formats.md`](docs/formats/photo-formats.md); the splat
+readers, their guards and the thinning rule are in
+[`docs/formats/splat-formats.md`](docs/formats/splat-formats.md). Those two
+tables are the overview; this page does not repeat them.
+
+## Network libraries
+
+`Settings > Network locations` adds an SMB share first (Windows, macOS and most
+NAS boxes speak it) or an NFS export. The console's title has no name resolver,
+so a location names its server by **IP address**. A location can be a photo
+source (a tab in the picker), a splat library (scenes in the folder grid), or
+both. Scenes on a share open where they lie, without a copy on the console.
+
+> **Credentials are stored in plain text.** The password is written to
+> `state/locations.json` on the console (`/data/photo-splat-vr/state/` for the
+> release install). Anyone with FTP or file access can read it, it is not
+> encrypted at rest, and it travels over the network in clear text unless SMB3
+> encryption is on. Use a dedicated account that can only read the folder, and
+> enable **Encrypt** when the server supports it.
 
 ## Requirements
 
@@ -93,18 +141,22 @@ picks the model offered first when you convert; SHARP is used when it is ready.
 
 ### Photos
 
-Photos can come from four sources, all inside the app:
+Photos can come from five sources, all inside the app:
 
-- **Inbox** — upload JPEG or PNG files from a phone or PC to
-  `/data/ps5-splat-vr/inbox/` over FTP. This is the simplest path and the one
-  the app watches.
+- **Inbox** — upload photos from a phone or PC to
+  `/data/ps5-splat-vr/inbox/` over FTP. JPEG, PNG, WebP, TIFF, HEIC/HEIF, AVIF,
+  BMP, GIF, TGA and camera RAW are accepted; the app watches this folder.
 - **Console** — browse the folders the title can see under `/data` and on
-  mounted USB volumes, and copy photos into the Inbox.
+  mounted USB volumes, and copy photos into the Inbox. Splat files
+  (`.ply`, `.splat`, `.spz`, `.compressed.ply`) are listed here and in the Inbox
+  and USB tabs, and are imported with **Cross**.
 - **USB** — one tab per stick mounted under `/mnt` (ShadowMountPlus aliases each
   mounted volume for the title).
+- **Network** — one tab per SMB or NFS location marked as a photo source.
+  See [Network libraries](#network-libraries).
 - **Captures** — PS5 screenshots. The app starts its bundled helper payload
   itself. This source needs a payload loader (elfldr) on the console's loopback;
-  without one, the other three sources still work. HDR `.jxr` captures are
+  without one, the other four sources still work. HDR `.jxr` captures are
   listed as unsupported; set screenshots to SDR.
 
 ### Convert and view
@@ -112,7 +164,9 @@ Photos can come from four sources, all inside the app:
 Open or create a folder in **Scenes**, press **+** in the folder, pick photos,
 then choose a model. Each photo becomes a scene tile with its own progress. A
 finished scene opens in the headset (or on the TV) and stays world-locked; move
-with the sticks, or grab it with a Sense controller.
+with the sticks, or grab it with a Sense controller. Press **L3/R3** on a photo
+before converting, or on a finished scene, to turn it 90 degrees about the
+viewing axis; the turned version replaces the old one.
 
 ## Controls
 
@@ -128,17 +182,54 @@ R1, Options, Cross/Circle, R3.
 | Walk (forward/back, strafe) | **left stick** | left controller's **stick** |
 | Rise/sink, turn right/left | **right stick** | right controller's **stick** |
 | Shrink / grow the scene | **L2** / **R2** | left **L2** / right **R2** |
-| Grab (move/rotate the scene) | — | **L1 hold** (left) / **R1 hold** (right); both grips scale between the hands |
+| Grab (move/turn the scene) | — | **L1 hold** (left) / **R1 hold** (right); both grips scale between the hands |
+| Rotate a photo or scene entry | **L3** / **R3** | left **L3** / right **R3** |
 | Toggle control tooltips | **Triangle** | **Triangle** |
 | Quit | **Settings → Quit** | **Settings → Quit** |
 
 In the panel UI: d-pad or left stick moves the focus, **Cross** selects,
 **Circle** goes back, **Square** is the secondary action (select, delete,
-cancel), **L1/R1** page through tabs. With the Sense controllers, point with the
-right controller and press **R2** to click.
+cancel), **L1/R1** page through tabs, and **L3/R3** turn the focused photo or
+scene entry. With the Sense controllers, point with the right controller and
+press **R2** to click.
 
 Settings holds comfort options (move speed, turn speed, scale pivot, edge
-softness, blending) and the Models and Conversions screens.
+softness, blending), the **Thumbnail size** slider, and the Models, Conversions,
+Network locations and Visible folders screens.
+
+### Visible folders
+
+If someone visits, you can hide **scene folders** you do not want them to
+browse. Open **Settings → Visible folders**, set a passcode (4 to 32 characters,
+typed with the controller), and tick the albums, **Unsorted**, **Other scenes**
+and network locations that are scene libraries. Everything below a tick is
+visible; everything else is gone from the shelf — albums, scenes, thumbnails,
+the queue and the last opened scene — in VR and on the TV. A folder that appears
+later stays hidden until you tick it.
+
+This list covers scenes only. The **photo picker is not filtered**: with the
+passcode on, a visitor can still open + → Photos and browse the Inbox, the
+console's folders, USB sticks, captures and every photo on them. Hiding photos
+is not what this passcode does.
+
+This hides scene folders in this app and does not encrypt them: anyone with the
+share, FTP or another app can still open the files.
+
+Put each person or family in its own top-level folder or its own network
+location; a tick publishes a whole subtree. The passcode is stored as a salted
+hash, never as text. If you forget it, delete
+`/data/ps5-splat-vr/state/visible-folders.json` from a PC or FTP client and
+relaunch: every scene folder is visible again. The long form, including the exact
+rules and the limitations, is in [docs/visible-folders.md](docs/visible-folders.md).
+
+### Network locations
+
+**Settings → Network locations** adds, edits, tests and removes shares, with or
+without a passcode. The photo picker lists every location that is a photo
+source as a tab, and its last tab, **+ Add network location**, opens the same
+editor with "Photos tab" already on, so a share can be added from where the
+photos are looked for and its tab is there when the editor returns. See
+[docs/network-locations.md](docs/network-locations.md).
 
 ## Build from source
 

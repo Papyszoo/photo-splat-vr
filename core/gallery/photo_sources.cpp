@@ -1,11 +1,14 @@
 #include "gallery/photo_sources.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
-#include <filesystem>
 #include <iterator>
-#include <system_error>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "splat_import/splat_format.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -32,27 +35,17 @@ int numbered_index(const std::string& name, const std::string& prefix) {
     return value;
 }
 
-// std::filesystem::last_write_time has its own clock in C++17; anchor it once
-// to the system clock so PhotoEntry::mtime is a Unix timestamp.
-int64_t file_mtime_seconds(const Path& path) {
-    std::error_code error;
-    const auto written = std::filesystem::last_write_time(path, error);
-    if (error) return 0;
-    static const auto offset =
-        std::chrono::system_clock::now().time_since_epoch() -
-        std::chrono::duration_cast<std::chrono::system_clock::duration>(
-            std::filesystem::file_time_type::clock::now().time_since_epoch());
-    const auto since_epoch =
-        std::chrono::duration_cast<std::chrono::system_clock::duration>(written.time_since_epoch()) +
-        offset;
-    return std::chrono::duration_cast<std::chrono::seconds>(since_epoch).count();
+// One level of a directory; an unreadable directory is an empty listing, which
+// is what every caller here treats as "nothing to show".
+std::vector<vfs::DirEntry> entries_of(const Path& directory) {
+    std::vector<vfs::DirEntry> entries;
+    (void)vfs::list(directory, &entries);
+    return entries;
 }
 
 bool listable(const Path& directory) {
-    std::error_code error;
-    const std::filesystem::directory_iterator it(
-        directory, std::filesystem::directory_options::skip_permission_denied, error);
-    return !error;
+    std::vector<vfs::DirEntry> entries;
+    return vfs::list(directory, &entries).ok();
 }
 
 struct Numbered {
@@ -63,30 +56,85 @@ struct Numbered {
 // The listable `<prefix>N` directories under mnt, ascending by N.
 std::vector<Numbered> numbered_dirs(const Path& mnt, const std::string& prefix) {
     std::vector<Numbered> found;
-    std::error_code error;
-    std::filesystem::directory_iterator it(
-        mnt, std::filesystem::directory_options::skip_permission_denied, error);
-    const std::filesystem::directory_iterator end;
-    while (!error && it != end) {
-        std::error_code item_error;
-        const Path path = it->path();
-        const int index = numbered_index(path.filename().string(), prefix);
-        if (index >= 0 && it->is_directory(item_error) && !item_error && listable(path)) {
-            found.push_back({index, path});
-        }
-        it.increment(error);
+    for (const vfs::DirEntry& entry : entries_of(mnt)) {
+        if (!entry.directory || entry.symlink) continue;
+        const int index = numbered_index(entry.name, prefix);
+        if (index < 0) continue;
+        const Path path = mnt / entry.name;
+        if (listable(path)) found.push_back({index, path});
     }
     std::sort(found.begin(), found.end(),
               [](const Numbered& a, const Numbered& b) { return a.index < b.index; });
     return found;
 }
 
-}  // namespace
-
-bool is_photo_file(const Path& path) {
-    const std::string extension = lowercase(path.extension().string());
-    return extension == ".jpg" || extension == ".jpeg" || extension == ".png";
+void add_file_entry(const Path& path, const vfs::DirEntry& entry, bool splat,
+                    std::vector<PhotoEntry>* out) {
+    PhotoEntry photo;
+    photo.path = path;
+    photo.name = entry.name;
+    photo.size = entry.size;
+    photo.mtime = entry.mtime;
+    photo.splat = splat;
+    out->push_back(std::move(photo));
 }
+
+void walk_photos(const Path& directory, int level, bool include_splats,
+                 std::vector<PhotoEntry>* out);
+
+// Files at most three levels below `source`: the recursion rule of the old
+// recursive scan, rebuilt on the VFS (a location cannot be walked by the C++
+// filesystem library at all). A directory at level 3 is listed but not entered,
+// so a file at level 3 is the deepest one collected.
+void collect_photos(const Path& directory, const std::vector<vfs::DirEntry>& entries, int level,
+                    bool include_splats, std::vector<PhotoEntry>* out) {
+    for (const vfs::DirEntry& entry : entries) {
+        const Path path = directory / entry.name;
+        if (entry.symlink) continue;
+        // A dot name is not a photo. macOS File Sharing (the user's own network
+        // drive) writes ".DS_Store" and one "._<name>" AppleDouble per file into
+        // every folder it serves, and "._IMG_0001.jpg" ends in .jpg: shown as a
+        // tile, it would be the first entry in a folder and could never open.
+        // list_folder() (the console browser) already skips them.
+        if (entry.name.empty() || entry.name[0] == '.') continue;
+        if (entry.directory) {
+            if (level < kMaxDepth) walk_photos(path, level + 1, include_splats, out);
+            continue;
+        }
+        if (is_photo_file(path)) {
+            add_file_entry(path, entry, false, out);
+        } else if (include_splats && is_splat_file(path)) {
+            add_file_entry(path, entry, true, out);
+        }
+    }
+}
+
+// The unchecked walk used for sub-directories: a folder that refuses to list
+// is skipped, which is what list_photos() has always promised.
+void walk_photos(const Path& directory, int level, bool include_splats,
+                 std::vector<PhotoEntry>* out) {
+    if (out->size() >= kMaxPhotos * 4) return;  // runaway guard only; sorted below
+    collect_photos(directory, entries_of(directory), level, include_splats, out);
+}
+
+void walk_splats(const Path& directory, int level, int max_depth, std::size_t max_files,
+                 std::vector<Path>* out) {
+    if (out->size() >= max_files) return;
+    for (const vfs::DirEntry& entry : entries_of(directory)) {
+        if (out->size() >= max_files) return;
+        if (entry.symlink) continue;
+        if (entry.name.empty() || entry.name[0] == '.') continue;  // .DS_Store, ._*
+
+        const Path path = directory / entry.name;
+        if (entry.directory) {
+            if (level < max_depth) walk_splats(path, level + 1, max_depth, max_files, out);
+        } else if (is_splat_file(path)) {
+            out->push_back(path);
+        }
+    }
+}
+
+}  // namespace
 
 std::vector<PhotoSource> discover_sources(const SourceRoots& roots) {
     std::vector<PhotoSource> sources;
@@ -99,46 +147,41 @@ std::vector<PhotoSource> discover_sources(const SourceRoots& roots) {
     return sources;
 }
 
-std::vector<PhotoEntry> list_photos(const PhotoSource& source) {
-    std::vector<PhotoEntry> photos;
-    std::error_code error;
-    if (!std::filesystem::is_directory(source.dir, error) || error) return photos;
-
-    std::filesystem::recursive_directory_iterator it(
-        source.dir, std::filesystem::directory_options::skip_permission_denied, error);
-    const std::filesystem::recursive_directory_iterator end;
-    while (!error && it != end) {
-        std::error_code item_error;
-        const Path path = it->path();
-        if (it->is_directory(item_error)) {
-            // Files up to three levels below the source are listed; do not
-            // descend into a directory that would put them deeper.
-            if (!item_error && it.depth() >= kMaxDepth) it.disable_recursion_pending();
-        } else if (!item_error && it->is_regular_file(item_error) && is_photo_file(path)) {
-            PhotoEntry entry;
-            entry.path = path;
-            entry.name = path.filename().string();
-            std::error_code size_error;
-            const uintmax_t size = std::filesystem::file_size(path, size_error);
-            entry.size = size_error ? 0 : static_cast<uint64_t>(size);
-            entry.mtime = file_mtime_seconds(path);
-            photos.push_back(std::move(entry));
-        }
-        it.increment(error);
+Result<std::vector<PhotoEntry>> list_photos_checked(const PhotoSource& source,
+                                                    bool include_splats) {
+    vfs::FileStat status;
+    const Status looked = vfs::stat(source.dir, &status);
+    if (!looked.ok()) return Result<std::vector<PhotoEntry>>::failure(looked.message());
+    if (!status.directory) {
+        return Result<std::vector<PhotoEntry>>::failure("not a folder: " + source.dir.string());
     }
+    // The top level is listed here, not through the silent walk: an offline or
+    // wrong share must reach the screen as its error, not as "no photos".
+    std::vector<vfs::DirEntry> entries;
+    const Status listed = vfs::list(source.dir, &entries);
+    if (!listed.ok()) return Result<std::vector<PhotoEntry>>::failure(listed.message());
+
+    std::vector<PhotoEntry> photos;
+    collect_photos(source.dir, entries, 0, include_splats, &photos);
 
     std::sort(photos.begin(), photos.end(), [](const PhotoEntry& a, const PhotoEntry& b) {
         if (a.mtime != b.mtime) return a.mtime > b.mtime;
         return a.path.string() < b.path.string();
     });
     if (photos.size() > kMaxPhotos) photos.resize(kMaxPhotos);
-    return photos;
+    return Result<std::vector<PhotoEntry>>::success(std::move(photos));
+}
+
+std::vector<PhotoEntry> list_photos(const PhotoSource& source, bool include_splats) {
+    Result<std::vector<PhotoEntry>> photos = list_photos_checked(source, include_splats);
+    if (!photos.ok()) return {};
+    return std::move(photos.value());
 }
 
 std::vector<PhotoSource> console_roots(const SourceRoots& roots) {
     std::vector<PhotoSource> out;
-    std::error_code error;
-    if (!roots.data.empty() && std::filesystem::is_directory(roots.data, error) && !error &&
+    vfs::FileStat status;
+    if (!roots.data.empty() && vfs::stat(roots.data, &status).ok() && status.directory &&
         listable(roots.data)) {
         out.push_back(PhotoSource{"data", roots.data.string(), roots.data, false});
     }
@@ -152,29 +195,28 @@ std::vector<PhotoSource> console_roots(const SourceRoots& roots) {
 std::vector<FolderEntry> list_folder(const Path& dir) {
     std::vector<FolderEntry> folders;
     std::vector<FolderEntry> photos;
-    std::error_code error;
-    std::filesystem::directory_iterator it(
-        dir, std::filesystem::directory_options::skip_permission_denied, error);
-    const std::filesystem::directory_iterator end;
-    while (!error && it != end && folders.size() + photos.size() < kMaxPhotos) {
-        std::error_code item_error;
-        const Path path = it->path();
+    std::vector<FolderEntry> splats;
+    const auto listed = [&] {
+        return folders.size() + photos.size() + splats.size() < kMaxPhotos;
+    };
+    for (const vfs::DirEntry& item : entries_of(dir)) {
+        if (!listed()) break;
+        if (item.name.empty() || item.name[0] == '.') continue;
         FolderEntry entry;
-        entry.path = path;
-        entry.name = path.filename().string();
-        if (!entry.name.empty() && entry.name[0] != '.') {
-            if (it->is_directory(item_error) && !item_error) {
-                entry.folder = true;
-                folders.push_back(std::move(entry));
-            } else if (!item_error && it->is_regular_file(item_error) && !item_error &&
-                       is_photo_file(path)) {
-                std::error_code size_error;
-                const uintmax_t size = std::filesystem::file_size(path, size_error);
-                entry.size = size_error ? 0 : static_cast<uint64_t>(size);
-                photos.push_back(std::move(entry));
+        entry.path = dir / item.name;
+        entry.name = item.name;
+        if (item.directory && !item.symlink) {
+            entry.folder = true;
+            folders.push_back(std::move(entry));
+        } else if (!item.directory && !item.symlink) {
+            const bool photo = is_photo_file(entry.path);
+            const bool splat = !photo && is_splat_file(entry.path);
+            if (photo || splat) {
+                entry.size = item.size;
+                entry.splat = splat;
+                (splat ? splats : photos).push_back(std::move(entry));
             }
         }
-        it.increment(error);
     }
     const auto by_name = [](const FolderEntry& a, const FolderEntry& b) {
         const std::string left = lowercase(a.name);
@@ -183,9 +225,26 @@ std::vector<FolderEntry> list_folder(const Path& dir) {
     };
     std::sort(folders.begin(), folders.end(), by_name);
     std::sort(photos.begin(), photos.end(), by_name);
-    folders.insert(folders.end(), std::make_move_iterator(photos.begin()),
-                   std::make_move_iterator(photos.end()));
-    return folders;
+    std::sort(splats.begin(), splats.end(), by_name);
+    std::vector<FolderEntry> out;
+    out.reserve(folders.size() + photos.size() + splats.size());
+    for (std::vector<FolderEntry>* group : {&folders, &photos, &splats}) {
+        out.insert(out.end(), std::make_move_iterator(group->begin()),
+                   std::make_move_iterator(group->end()));
+    }
+    return out;
+}
+
+std::vector<Path> list_splat_files(const Path& dir, int max_depth, std::size_t max_files) {
+    std::vector<Path> splats;
+    vfs::FileStat status;
+    if (!vfs::stat(dir, &status).ok() || !status.directory) return splats;
+
+    walk_splats(dir, 0, max_depth, max_files, &splats);
+    std::sort(splats.begin(), splats.end(),
+              [](const Path& a, const Path& b) { return a.string() < b.string(); });
+    if (splats.size() > max_files) splats.resize(max_files);
+    return splats;
 }
 
 }  // namespace splat

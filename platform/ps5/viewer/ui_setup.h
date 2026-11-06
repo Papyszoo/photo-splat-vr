@@ -26,9 +26,11 @@
 #include "ui/app.h"
 #include "ui/capture_service.h"
 #include "ui/fakes.h"
+#include "ui/location_service.h"
 #include "ui/model_service.h"
 #include "ui/services.h"
 #include "ui/ui_state.h"
+#include "vfs/location.h"
 
 #include "ps5_jobs.h"
 #include "ui_host.h"
@@ -129,6 +131,7 @@ struct UiRuntime {
     std::unique_ptr<splat::FakeJobService> fake_jobs;
     std::unique_ptr<splat::FakeModelService> fake_models;
     std::unique_ptr<splat::FakeCaptureService> fake_captures;
+    std::unique_ptr<splat::FakeLocationService> fake_locations;
     // The system keyboard hook (VR9): "not available" for now, so the panel
     // keyboard is the fallback. A console job swaps this for an sceImeDialog
     // adapter; nothing else in the runtime changes.
@@ -147,6 +150,11 @@ struct UiRuntime {
     // launcher pushes /app0/helper/splat-helper.elf to the payload loader;
     // services.captures points into it.
     std::unique_ptr<splat::CaptureService> captures;
+    // L3: the network locations the user configured (<state>/locations.json).
+    // The service owns the store, mounts on its worker at construction and is
+    // what the Locations screen edits. Null with UI_FAKE=1 or when the file
+    // could not be read (the reason is logged).
+    std::unique_ptr<splat::LocationService> location_service;
     std::unique_ptr<splat::UiApp> app;
     std::unique_ptr<UiHost> host;
 

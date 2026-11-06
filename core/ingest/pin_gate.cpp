@@ -5,46 +5,16 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__linux__)
-#include <sys/random.h>
-#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || \
-    defined(__OpenBSD__) || defined(__NetBSD__)
-#include <stdlib.h>  // arc4random_buf
-#endif
+#include "common/random_bytes.h"
 
 namespace splat {
 namespace {
 
-// The system CSPRNG: arc4random on macOS/FreeBSD (and so the PS5 payload
-// build), getrandom on Linux with /dev/urandom as the fallback. A failure is
-// fatal on purpose: a PIN or session token from a weak source would silently
-// undo the lockout and the cookie.
-void secure_random(void* out, size_t bytes) {
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || \
-    defined(__OpenBSD__) || defined(__NetBSD__)
-    arc4random_buf(out, bytes);
-    return;
-#elif defined(__linux__)
-    auto* p = static_cast<uint8_t*>(out);
-    size_t got = 0;
-    while (got < bytes) {
-        const ssize_t n = ::getrandom(p + got, bytes - got, 0);
-        if (n > 0) {
-            got += static_cast<size_t>(n);
-        } else if (n < 0 && errno == EINTR) {
-            continue;
-        } else {
-            break;
-        }
-    }
-    if (got == bytes) return;
-#endif
-    FILE* f = std::fopen("/dev/urandom", "rb");
-    if (f == nullptr) std::abort();
-    const size_t read = std::fread(out, 1, bytes, f);
-    std::fclose(f);
-    if (read != bytes) std::abort();
-}
+// The system CSPRNG lives in core/common/random_bytes.cpp: the visible-folders
+// passcode salt needs the same one, and a second copy would be a second place
+// to get a fallback wrong.
+void secure_random(void* out, size_t bytes) { secure_random_bytes(out, bytes); }
+
 
 // One uniform decimal digit in [0, 9] by rejection sampling (250..255 dropped)
 // so no digit is more likely than another.

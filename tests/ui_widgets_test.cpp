@@ -24,6 +24,34 @@ splat::UiInput press(uint32_t action) {
     return input;
 }
 
+splat::Rgba canvas_pixel(const splat::UiCanvas& canvas, int x, int y) {
+    const uint8_t* pixel =
+        canvas.pixels().data() + (static_cast<size_t>(y) * canvas.width() + x) * 4;
+    return splat::Rgba{pixel[0], pixel[1], pixel[2], pixel[3]};
+}
+
+splat::UiImage quadrant_image() {
+    // 40x20: red top-left, green top-right, blue bottom-left, white bottom-right.
+    splat::UiImage image;
+    image.resize(40, 20);
+    for (uint32_t y = 0; y < 20; ++y) {
+        for (uint32_t x = 0; x < 40; ++x) {
+            const bool right = x >= 20;
+            const bool bottom = y >= 10;
+            const splat::Rgba color = bottom ? (right ? splat::Rgba{255, 255, 255, 255}
+                                                      : splat::Rgba{0, 0, 255, 255})
+                                             : (right ? splat::Rgba{0, 255, 0, 255}
+                                                      : splat::Rgba{255, 0, 0, 255});
+            uint8_t* pixel = image.pixel(x, y);
+            pixel[0] = color.r;
+            pixel[1] = color.g;
+            pixel[2] = color.b;
+            pixel[3] = color.a;
+        }
+    }
+    return image;
+}
+
 splat::UiInput pointer(float x, float y, bool click) {
     splat::UiInput input;
     input.pointer_valid = true;
@@ -103,6 +131,152 @@ TEST_CASE("ui_widgets list pointer hovers and clicks") {
     // Cross activates the focused row.
     list.update(press(splat::Select), area, theme);
     CHECK(list.activated());
+}
+
+TEST_CASE("ui_widgets list stick frame ignores a hovering pointer") {
+    const splat::UiTheme theme = splat::default_theme();
+    const splat::Rect area{0, 0, 400, 5 * theme.row_height};  // five visible rows
+    const float third_row = static_cast<float>(area.y + 3 * theme.row_height + 6);
+
+    splat::ListView list;
+    list.set_rows(rows(6));
+
+    // U3: Down and a ray over row 3 in the same frame. The stick's step wins:
+    // the pointer block is skipped, so the hover cannot undo it, and a click
+    // that arrives with the direction is not an activation.
+    splat::UiInput input = pointer(30.0f, third_row, true);
+    input.pressed = splat::Down;
+    input.held = splat::Down;
+    list.update(input, area, theme);
+    CHECK(list.focus() == 1);
+    CHECK_FALSE(list.activated());
+
+    // The next frame without a direction press lets the pointer hover again.
+    list.update(pointer(30.0f, third_row, false), area, theme);
+    CHECK(list.focus() == 3);
+}
+
+TEST_CASE("ui_widgets grid direction frame ignores a hovering pointer") {
+    const splat::UiTheme theme = splat::default_theme();
+    // 192 px cells with a 16 px gap: two columns, and this area shows five rows.
+    const splat::Rect area{0, 0, 400, 5 * (160 + 16)};
+
+    splat::GridView grid;
+    grid.set_cells(std::vector<splat::GridCell>(10));
+    CHECK(grid.columns(area) == 2);
+    CHECK(grid.visible_rows(area) == 5);
+    const splat::Rect cell8 = grid.cell_rect(8, area);  // row 4, first column
+    const float px = static_cast<float>(cell8.x + 4);
+    const float py = static_cast<float>(cell8.y + 4);
+
+    // Down with the ray over cell 8: the stick's step down one row wins.
+    splat::UiInput input = pointer(px, py, true);
+    input.pressed = splat::Down;
+    input.held = splat::Down;
+    grid.update(input, area, theme);
+    CHECK(grid.focus() == 2);
+    CHECK_FALSE(grid.activated());
+
+    // A later frame without a direction press lets the pointer hover again.
+    grid.update(pointer(px, py, false), area, theme);
+    CHECK(grid.focus() == 8);
+}
+
+TEST_CASE("ui_widgets list scrolls with the stick while the pointer sits on a visible row") {
+    const splat::UiTheme theme = splat::default_theme();
+    const splat::Rect area{0, 0, 400, 3 * theme.row_height};  // three visible rows
+    // The ray sits on the third (bottom visible) row, inside the list area: the
+    // pointer block would run on every frame without the U3 belt and pull the
+    // focus straight back to this row, so the stick could never scroll.
+    const float third_row = static_cast<float>(area.y + 2 * theme.row_height + 6);
+
+    splat::ListView list;
+    list.set_rows(rows(5));
+    CHECK(area.contains(30.0f, third_row));
+
+    // Five rows, the ray parked on a row the stick is walking away from, three
+    // Down presses: the focus walks 0 -> 1 -> 2 -> 3 and the list scrolls by
+    // one. The pointer never pulls the focus back to its own row.
+    for (int step = 1; step <= 3; ++step) {
+        splat::UiInput input = pointer(30.0f, third_row, true);
+        input.pressed = splat::Down;
+        input.held = splat::Down;
+        list.update(input, area, theme);
+        CHECK(list.focus() == step);
+        CHECK(list.scroll() == (step < 3 ? 0 : 1));
+        CHECK_FALSE(list.activated());
+    }
+    CHECK(list.focus() == 3);
+    CHECK(list.scroll() == 1);
+}
+
+TEST_CASE("ui_widgets list scrolls with the pointer inside the window") {
+    // The same proof with the ray inside the list area and over a row the
+    // stick is walking away from: without the U3 belt every frame would pull
+    // the focus back to the row under the ray and the list could never scroll.
+    const splat::UiTheme theme = splat::default_theme();
+    const splat::Rect area{0, 0, 400, 3 * theme.row_height};  // three visible rows
+    const float first_row = static_cast<float>(area.y + 6);
+
+    splat::ListView list;
+    list.set_rows(rows(5));
+
+    for (int step = 1; step <= 3; ++step) {
+        splat::UiInput input = pointer(30.0f, first_row, true);
+        input.pressed = splat::Down;
+        input.held = splat::Down;
+        list.update(input, area, theme);
+        CHECK(list.focus() == step);
+        CHECK_FALSE(list.activated());
+    }
+    CHECK(list.focus() == 3);
+    CHECK(list.scroll() == 1);
+}
+
+TEST_CASE("ui_widgets grid scrolls with the stick while the pointer sits on a cell") {
+    const splat::UiTheme theme = splat::default_theme();
+    const splat::Rect area{0, 0, 400, 2 * (160 + 16)};  // two visible rows
+
+    splat::GridView grid;
+    grid.set_cells(std::vector<splat::GridCell>(10));
+    CHECK(grid.columns(area) == 2);
+    CHECK(grid.visible_rows(area) == 2);
+    // The ray sits over the second row's right cell (index 3).
+    const splat::Rect cell3 = grid.cell_rect(3, area);
+    const float px = static_cast<float>(cell3.x + 4);
+    const float py = static_cast<float>(cell3.y + 4);
+
+    for (int step = 1; step <= 3; ++step) {
+        splat::UiInput input = pointer(px, py, true);
+        input.pressed = splat::Down;
+        input.held = splat::Down;
+        grid.update(input, area, theme);
+        CHECK(grid.focus() == 2 * step);
+        CHECK_FALSE(grid.activated());
+    }
+    // Focus 6 is in row 3, so rows 2 and 3 are shown; the ray over index 3 (in
+    // view at the start) did not hold the scroll back.
+    CHECK(grid.focus() == 6);
+    CHECK(grid.scroll_row() == 2);
+}
+
+TEST_CASE("ui_widgets pointer without pointer_valid moves nothing") {
+    // What the host sends while the pointer is disarmed (U3): px/py may linger,
+    // but pointer_valid is false, and both the hover block and the cursor
+    // (platform/ps5/viewer/ui_host.cpp draw_cursor) key on it.
+    const splat::UiTheme theme = splat::default_theme();
+    const splat::Rect area{0, 0, 400, 5 * theme.row_height};
+
+    splat::ListView list;
+    list.set_rows(rows(5));
+    splat::UiInput input;
+    input.pointer_valid = false;
+    input.px = 30.0f;
+    input.py = static_cast<float>(area.y + 4 * theme.row_height + 6);
+    input.click = true;
+    list.update(input, area, theme);
+    CHECK(list.focus() == 0);
+    CHECK_FALSE(list.activated());
 }
 
 TEST_CASE("ui_widgets list rows clamp when the data shrinks") {
@@ -336,6 +510,65 @@ TEST_CASE("ui_widgets grid draws every tile state") {
     CHECK(grid.focus() == 3);
     CHECK(grid.cell(5) == nullptr);
     CHECK(grid.cell(-1) == nullptr);
+}
+
+TEST_CASE("ui_widgets grid draws a turned thumbnail inside its tile") {
+    const splat::UiTheme theme = splat::default_theme();
+    splat::UiImage thumb = quadrant_image();
+    splat::GridView grid;
+    grid.cell_width = 200;
+    grid.cell_height = 220;
+    grid.caption_lines = 1;
+    std::vector<splat::GridCell> cells(2);
+    cells[0].caption = "first";
+    cells[1].caption = "turned";
+    cells[1].thumb = &thumb;
+    cells[1].turn_quarters = 1;   // Square once in the photo picker
+    grid.set_cells(cells);
+    grid.set_focus(0);            // the turned tile is unfocused, so no 5 % grow
+
+    splat::UiCanvas canvas(520, 260);
+    canvas.clear(theme.background);
+    const splat::Rect area{0, 0, 520, 260};
+    grid.draw(canvas, area, theme);
+
+    // The tile's image box and the fitted 20x40 turned image inside it (a
+    // quarter turn swaps 40x20 to 20x40; contain keeps the aspect).
+    const splat::Rect box = grid.cell_rect(1, area);
+    const splat::Rect image = grid.image_rect(box, theme);
+    const float scale = std::min(static_cast<float>(image.w) / 20.0f,
+                                 static_cast<float>(image.h) / 40.0f);
+    const int draw_w = static_cast<int>(std::lround(20.0f * scale));
+    const int draw_h = static_cast<int>(std::lround(40.0f * scale));
+    const int left = image.x + (image.w - draw_w) / 2;
+    const int top = image.y + (image.h - draw_h) / 2;
+    REQUIRE(draw_w > 6);
+    REQUIRE(draw_h > 6);
+
+    // Source bottom-left (blue) is now top-left; source top-left (red) is now
+    // top-right. A tile that ignored the turn would show red at the top-left.
+    const splat::Rgba top_left = canvas_pixel(canvas, left + 2, top + 2);
+    const splat::Rgba top_right = canvas_pixel(canvas, left + draw_w - 3, top + 2);
+    CHECK(top_left.b > 200);
+    CHECK(top_left.r < 60);
+    CHECK(top_right.r > 200);
+    CHECK(top_right.g < 60);
+
+    // The letterbox at the sides is the theme's backdrop (dimmed with the
+    // unfocused tile), not a stretched photo: the turned frame keeps the 1:2
+    // aspect.
+    const splat::Rgba letterbox = canvas_pixel(canvas, image.x + 1, image.y + image.h / 2);
+    CHECK(letterbox.r < 30);
+    CHECK(letterbox.b < 60);
+
+    // Zero turns is the old cover path: the tile is filled edge to edge (no
+    // letterbox) and the sampled colour is the photo, not the backdrop.
+    grid.cell(1)->turn_quarters = 0;
+    splat::UiCanvas plain(520, 260);
+    plain.clear(theme.background);
+    grid.draw(plain, area, theme);
+    const splat::Rgba plain_left = canvas_pixel(plain, image.x + 2, image.y + image.h / 4);
+    CHECK(plain_left.r > 150);
 }
 
 TEST_CASE("ui_widgets popup menu chooses and closes") {

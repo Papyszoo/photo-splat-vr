@@ -1,0 +1,17 @@
+# The network probe: no scene, no navigation, no model.
+#
+# console-run.sh pushes the locations file and starts the Mac's servers before
+# the run; the viewer mounts every configured location on its own worker thread
+# during the first frames, so the only thing this script has to do is stay alive
+# long enough for both mounts to answer (and, for a dead one, to time out) and
+# then quit through the panel. Everything asserted is a "viewer: location <id>
+# ready" line and the server's own log.
+#
+# Used by net_probe (SMB and NFS by IP) and net_preflight (one SMB share before
+# the rest of the pass runs). Times are seconds from the first UI frame.
+0.5  mark home
+1.0  shot home
+2.0  press Right
+2.6  press Left
+18.0 shot settled
+20.0 quit

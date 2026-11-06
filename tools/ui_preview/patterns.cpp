@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -22,6 +23,7 @@
 
 #include "common/image.h"
 #include "common/path.h"
+#include "gallery/photo_turns.h"
 #include "jobs/image_io.h"
 #include "scene/scene_folder.h"
 #include "scene/splat_scene.h"
@@ -30,6 +32,7 @@
 #include "ui/screens/registry.h"
 #include "test_pattern.h"
 #include "ui/ui_input.h"
+#include "ui/ui_state.h"
 
 namespace splat {
 namespace ui_preview {
@@ -214,6 +217,21 @@ public:
                                 variant++);
         }
         if ((content & kPhotos) != 0) {
+            // Two entries that show what a tile does with a picture that is not
+            // landscape: a portrait photo, and a photo turned by the rotate
+            // feature. The turn takes the saved route (allow_rewrite false), so
+            // the picker draws the whole turned frame, which a rewrite into the
+            // file would hide. They sort to the front of the listing, so both
+            // are on screen at every thumbnail size.
+            const Path portrait = inbox() / "IMG_2038_portrait.jpg";
+            write_file(portrait, landscape_jpeg(240, 320, 60));
+            const Path turned = inbox() / "IMG_2039_turned.jpg";
+            write_file(turned, landscape_jpeg(320, 240, 61));
+            const Result<PhotoTurnResult> turn =
+                rotate_photo_file(turned, 1, PhotoTurnStore(state()), false);
+            if (!turn.ok()) std::fprintf(stderr, "ui_preview: cannot turn %s: %s\n",
+                                         turned.c_str(), turn.message().c_str());
+
             const char* inbox_names[] = {"IMG_2041.jpg", "IMG_2042.jpg", "IMG_2047.jpg",
                                          "IMG_2050.jpg", "IMG_2051.jpg", "IMG_2063.jpg",
                                          "IMG_2064.jpg", "IMG_2070.jpg", "IMG_2071.jpg"};
@@ -257,14 +275,19 @@ struct Preview {
     FakeJobService jobs;
     FakeModelService models;
     FakeCaptureService captures;
+    // The panel's persistent state; a preview that needs a setting (the
+    // thumbnail size, stage T) sets it here before the first frame.
+    UiState state;
     UiServices services;
     UiApp app;
 
-    explicit Preview(unsigned content, bool with_captures = false, float theme_scale = 1.0f)
+    explicit Preview(unsigned content, bool with_captures = false, float theme_scale = 1.0f,
+                     int thumbnail_size = kThumbnailSizeDefault)
         : tree(content), captures(tree.inbox()),
           app(services_for(*this, with_captures),
               theme_scale == 1.0f ? default_theme()
                                   : scaled_theme(default_theme(), theme_scale)) {
+        state.thumbnail_size = thumbnail_size;
         register_default_screens(app.registry());
         app.start();
     }
@@ -278,6 +301,7 @@ struct Preview {
         self.services.jobs = &self.jobs;
         self.services.models = &self.models;
         self.services.captures = with_captures ? &self.captures : nullptr;
+        self.services.state = &self.state;
         return self.services;
     }
 
@@ -349,12 +373,18 @@ void draw_home_converting(UiCanvas& canvas) {
     preview.pump(canvas);
 }
 
-void draw_folder(UiCanvas& canvas) {
-    Preview preview(kLibrary);
+void draw_folder_at(UiCanvas& canvas, int thumbnail_size) {
+    Preview preview(kLibrary, false, 1.0f, thumbnail_size);
     preview.open_folder(kTrip);
     preview.tap(Right);  // second scene
     preview.pump(canvas);
 }
+
+void draw_folder(UiCanvas& canvas) { draw_folder_at(canvas, kThumbnailSizeDefault); }
+
+void draw_folder_smallest(UiCanvas& canvas) { draw_folder_at(canvas, 0); }
+
+void draw_folder_largest(UiCanvas& canvas) { draw_folder_at(canvas, 4); }
 
 void draw_folder_empty(UiCanvas& canvas) {
     Preview preview(kLibrary);
@@ -402,8 +432,8 @@ void draw_folder_converting(UiCanvas& canvas) {
     preview.pump(canvas);
 }
 
-void draw_photos(UiCanvas& canvas) {
-    Preview preview(kLibrary | kPhotos, true);
+void draw_photos_at(UiCanvas& canvas, int thumbnail_size) {
+    Preview preview(kLibrary | kPhotos, true, 1.0f, thumbnail_size);
     preview.open_folder(kTrip);
     preview.tap(Left);    // the "+" tile
     preview.tap(Select);  // the picker
@@ -413,6 +443,12 @@ void draw_photos(UiCanvas& canvas) {
     preview.tap(Select);  // third photo
     preview.pump(canvas);
 }
+
+void draw_photos(UiCanvas& canvas) { draw_photos_at(canvas, kThumbnailSizeDefault); }
+
+void draw_photos_smallest(UiCanvas& canvas) { draw_photos_at(canvas, 0); }
+
+void draw_photos_largest(UiCanvas& canvas) { draw_photos_at(canvas, 4); }
 
 void draw_photos_console(UiCanvas& canvas) {
     Preview preview(kLibrary | kPhotos);
@@ -575,6 +611,8 @@ const Registry& registry() {
         {"home-menu", {tv_w, tv_h, 1.0f, draw_home_menu}},
         {"home-converting", {tv_w, tv_h, 1.0f, draw_home_converting}},
         {"folder", {tv_w, tv_h, 1.0f, draw_folder}},
+        {"folder-smallest", {tv_w, tv_h, 1.0f, draw_folder_smallest}},
+        {"folder-largest", {tv_w, tv_h, 1.0f, draw_folder_largest}},
         {"folder-empty", {tv_w, tv_h, 1.0f, draw_folder_empty}},
         {"folder-many", {tv_w, tv_h, 1.0f, draw_folder_many}},
         {"folder-long-names", {tv_w, tv_h, 1.0f, draw_folder_long_names}},
@@ -582,6 +620,8 @@ const Registry& registry() {
         {"folder-delete", {tv_w, tv_h, 1.0f, draw_folder_delete}},
         {"folder-converting", {tv_w, tv_h, 1.0f, draw_folder_converting}},
         {"photos", {tv_w, tv_h, 1.0f, draw_photos}},
+        {"photos-smallest", {tv_w, tv_h, 1.0f, draw_photos_smallest}},
+        {"photos-largest", {tv_w, tv_h, 1.0f, draw_photos_largest}},
         {"photos-console", {tv_w, tv_h, 1.0f, draw_photos_console}},
         {"photos-console-folder", {tv_w, tv_h, 1.0f, draw_photos_console_folder}},
         {"photos-empty", {tv_w, tv_h, 1.0f, draw_photos_empty}},

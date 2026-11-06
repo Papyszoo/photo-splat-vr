@@ -537,9 +537,16 @@ Status AppMode::start() {
     }
     log_transition("app.start", "data=" + data_dir_.string() + " log=" + log_path_.string());
 
-    Result<JobQueue> queue = JobQueue::open(state_dir() / "queue.json");
-    if (!queue.ok()) return Status::error(queue.message());
-    queue_ = std::make_unique<JobQueue>(queue.take());
+    // The same rule as the PS5 boot path: a queue file that cannot be read,
+    // parsed or believed must not keep the host from starting. The console
+    // already boots past such a file; the dev host that checks the console must
+    // not stop on it. open_or_empty keeps the bytes aside and logs why.
+    std::string queue_notice;
+    JobQueue opened_queue = JobQueue::open_or_empty(state_dir() / "queue.json", &queue_notice);
+    if (!queue_notice.empty()) {
+        log_transition("app.queue", "error=" + queue_notice + "; starting with an empty queue");
+    }
+    queue_ = std::make_unique<JobQueue>(std::move(opened_queue));
 
     ModelManagerOptions model_options;
     model_options.state_dir = state_dir();

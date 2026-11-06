@@ -138,6 +138,13 @@ public:
     // swap. No-op when nothing is staged.
     Status commit_staged_scene();
     void discard_staged_scene();
+    // Stops drawing the current scene: the frame keeps its backdrop and the
+    // overlay (the panel) but no splat. Used when the visible-folders policy
+    // hides the scene the viewer is holding (stage H) - a hidden scene must not
+    // stay on screen behind the panel. The GPU buffers and the descriptor set
+    // are left alone on purpose: they are freed by the next commit_staged_scene()
+    // and no descriptor ever names a freed buffer.
+    void clear_scene();
 
     uint64_t scene_generation() const { return scene_generation_; }
     uint32_t scene_count() const { return count_; }
@@ -169,6 +176,11 @@ public:
 
     const PassTimings& timings() const { return timings_; }
     uint32_t last_visible_count() const { return last_visible_count_; }
+    // The splat indices in the last frame's sorted (far to near) draw order,
+    // including the culled ones at the tail. For the sort test: the order, not
+    // the keys, is what the GPU radix sort must match. Empty before the first
+    // render.
+    std::vector<uint32_t> last_draw_order() const;
     uint32_t eye_width() const { return options_.eye_width; }
     uint32_t eye_height() const { return options_.eye_height; }
     bool stereo() const { return options_.stereo; }

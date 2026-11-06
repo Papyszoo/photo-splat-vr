@@ -30,13 +30,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <string>
 #include <utility>
 
 #include "model/converter.h"
 #include "model/da2_profile.h"
+#include "net_init.h"
 #include "title_common.h"
 #include "ui/screens/registry.h"
+#include "ui/visibility_setup.h"
+#include "vfs/io.h"
 
 namespace viewer {
 namespace {
@@ -189,6 +194,11 @@ UiRuntime make_ui_runtime(const Options& options) {
     // A screen's log line is a klog line: the title has no stdout reader
     // (W23's Photos prints `ui: sources ...` per refresh through this sink).
     runtime.services.log = [](const std::string& text) { viewer::line("%s", text.c_str()); };
+    // Stage H: the visible-folders policy is installed here, before anything
+    // lists a folder and before the conversion chain below starts its worker -
+    // a job resumed at boot writes its scene's provenance immediately, and it
+    // must read the owner's saved list rather than the all-visible default.
+    splat::install_visibility(runtime.services.paths, runtime.services.log);
     // UI_FAKE=1 uses the deterministic fakes a test and a fake-mode console run
     // need. Otherwise the real models chain (W21) is built here - the C1
     // manager over state/, the streaming converter and the sceHttp fetcher,
@@ -210,10 +220,12 @@ UiRuntime make_ui_runtime(const Options& options) {
             std::make_unique<splat::FakeCaptureService>(runtime.services.paths.inbox);
         runtime.fake_ui_state =
             std::make_unique<splat::UiState>(splat::load_ui_state(runtime.services.paths.state));
+        runtime.fake_locations = std::make_unique<splat::FakeLocationService>();
         runtime.services.state = runtime.fake_ui_state.get();
         runtime.services.jobs = runtime.fake_jobs.get();
         runtime.services.models = runtime.fake_models.get();
         runtime.services.captures = runtime.fake_captures.get();
+        runtime.services.locations = runtime.fake_locations.get();
     } else {
         runtime.model_setup = build_model_setup(data_path("state"),
                                                 data_path("models"), true);
@@ -221,11 +233,61 @@ UiRuntime make_ui_runtime(const Options& options) {
         // The same ui.json the model service writes selected_model through:
         // Settings' comfort/display rows and the VR loop share this object.
         runtime.services.state = &runtime.model_setup->ui_state;
+
+        // L3: the network locations. The service owns the store, registers one
+        // adapter per location at construction (no connect) and proves them on
+        // its worker, so a library path (smb0:/scenes) resolves as soon as the
+        // panel opens. It is built *before* the conversion chain: the queue's
+        // worker starts in JobService's constructor, and a job resumed from the
+        // last session uploads into its destination immediately - with the
+        // location adapters not yet registered, that job failed with "unknown
+        // location \"smb0\"" in the console pass. sceNetInit() runs only when
+        // there is something to mount.
+        const Path locations_file = splat::Path(data_path("state")) / "locations.json";
+        splat::Result<splat::vfs::LocationStore> opened =
+            splat::vfs::LocationStore::open(locations_file);
+        if (!opened.ok()) {
+            line("viewer: locations: %s", opened.message().c_str());
+        } else {
+            if (!opened.value().locations().empty()) {
+                // Always logged, success included: the line says whether
+                // sceNetInit came up and whether a host name can be resolved,
+                // which is the diagnosis six mounts in the console pass lacked.
+                line("viewer: net: %s", ensure_net_init().c_str());
+            }
+            // One line per location per state change ("ready", "offline: ..."),
+            // the same string the Locations screen shows: an unattended console
+            // run asserts A3.1/A3.2's "Test = ready" here instead of reading a
+            // screenshot. The service does not exist yet while its constructor
+            // runs, so the callback reaches it through a slot filled right
+            // after.
+            auto service_slot = std::make_shared<const splat::ILocationService*>(nullptr);
+            auto last_states = std::make_shared<std::map<std::string, std::string>>();
+            runtime.location_service = std::make_unique<splat::LocationService>(
+                opened.take(), splat::vfs::file_systems(), [service_slot, last_states] {
+                    if (*service_slot == nullptr) return;
+                    for (const splat::LocationView& location : (*service_slot)->list()) {
+                        std::string& known = (*last_states)[location.id];
+                        if (known == location.state) continue;
+                        known = location.state;
+                        line("viewer: location %s %s", location.id.c_str(),
+                             location.state.c_str());
+                    }
+                });
+            *service_slot = runtime.location_service.get();
+
+            runtime.services.locations = runtime.location_service.get();
+            for (const splat::LocationView& location : runtime.services.locations->list()) {
+                line("viewer: location %s %s %s", location.id.c_str(),
+                     location.protocol.c_str(), location.name.c_str());
+            }
+        }
+
         // W19: the conversion chain over the same state directory. It is built
-        // after the models chain (its GGUF choice comes from there) and, through
-        // this function, after the renderer - the order W18 measured: the
-        // renderer's VkDevice first, ggml-vulkan's own device later, on the
-        // runner's worker thread.
+        // after the models chain (its GGUF choice comes from there), after the
+        // locations (see above) and, through this function, after the
+        // renderer - the order W18 measured: the renderer's VkDevice first,
+        // ggml-vulkan's own device later, on the runner's worker thread.
         runtime.jobs = build_job_setup(splat::Path(data_path("state")),
                                        splat::Path(options.scenes_dir),
                                        splat::Path(data_path("models")),

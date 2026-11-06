@@ -1,0 +1,47 @@
+# Stage T: the "Thumbnail size" slider in Settings, through the pad only.
+#
+# Opens Settings (Options), walks five rows down to Display > Thumbnail size,
+# pins the slider to the smallest step (six Lefts; clamped, so it works from
+# whatever the previous ui.json held), then steps up to the largest, back down
+# to the smallest and to the default, and opens the first home folder. The log
+# lines the checker asserts are "ui: thumbnail size: <name> (N per row)", one
+# per change (every screen draws the same columns at a step: 9, 8, 7, 6, 5);
+# the saved state (ui.json "thumbnail_size": 2) is read over FTP after the run.
+#
+# Run through the checker with no manual reading:
+#   PS5_HOST=<dev console ip> platform/ps5/scripts/ui-tests/thumbnail-size-check.sh
+#
+# Settings starts on Scale around (the first real row); Thumbnail size is the
+# sixth selectable row, so five Downs.
+0.5  mark thumbnail-start
+1.0  shot thumbnail-home
+1.5  press Options
+2.3  press Down
+2.9  press Down
+3.5  press Down
+4.1  press Down
+4.7  press Down
+5.1  press Left
+5.5  press Left
+5.9  press Left
+6.3  press Left
+6.7  press Left
+7.1  press Left
+7.7  shot thumbnail-row
+8.2  press Right
+8.8  press Right
+9.4  press Right
+10.0 press Right
+10.8 shot thumbnail-largest
+11.4 press Left
+12.0 press Left
+12.6 press Left
+13.2 press Left
+14.0 shot thumbnail-smallest
+14.6 press Right
+15.2 press Right
+16.0 shot thumbnail-default
+16.7 press Circle
+17.4 press Cross
+18.6 shot thumbnail-folder
+19.4 quit

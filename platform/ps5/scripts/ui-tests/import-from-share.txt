@@ -1,0 +1,40 @@
+# The "not covered" extra: a splat imported *from* the share, with no copy first.
+#
+# console-run.sh starts the SMB server, pushes state/locations.json, and puts one
+# .splat file (0-tiny.splat) in the location's folder. The file is the newest in
+# that folder, and the Photos tab sorts by mtime, so it is the first cell.
+#
+# Home -> Options -> 7x Down -> Cross (Locations) -> Cross (the library root) ->
+# Cross on "+ Add photos" (Photos opens on the Inbox tab) -> R1 three times to
+# the location's own tab (Inbox, Console, USB, <location>, Captures) -> Cross on
+# the first cell: the .splat imports, and because the library root is remote the
+# finished scene is uploaded back to the share.
+#
+# Asserted by console-run.sh:
+#   viewer: jobs: 0-tiny.splat done: imported N splats
+#   a new scene folder with meta.json's "origin" on the Mac share
+0.5  mark home
+0.8  press Options
+1.6  press Down
+1.95 press Down
+2.30 press Down
+2.65 press Down
+3.00 press Down
+3.35 press Down
+3.70 press Down
+4.05 press Down
+4.20 press Cross
+5.0  shot locations
+5.6  press Cross
+7.0  shot library
+7.6  press Cross
+9.0  press R1
+10.0 press R1
+11.0 press R1
+14.0 shot share-photos
+15.0 press Cross
+40.0 shot imported
+41.0 press Circle
+42.0 press Circle
+43.0 press Circle
+44.0 quit

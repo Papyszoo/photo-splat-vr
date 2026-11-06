@@ -32,6 +32,11 @@
 
 namespace splat {
 
+// The content rectangle UiApp hands every screen: the canvas minus the title
+// band and the button-prompt bar, both scaled by the theme. A free function so
+// the tests measure the app's real area instead of a copy of its constants.
+Rect panel_content_rect(const UiTheme& theme, uint32_t canvas_width, uint32_t canvas_height);
+
 class UiApp : public IPanelContent {
 public:
     explicit UiApp(UiServices& services, UiTheme theme = default_theme());
@@ -84,6 +89,11 @@ private:
     void tick_services(double dt);
     void update_toast(double dt);
     void handle_navigation(const UiInput& input, UiInput& local);
+    // One klog line per screen change and per toast: an unattended console run
+    // reads where the panel went and what it said from these, never from a
+    // screenshot (Accessibility: the same reason job results are logged).
+    void log_screen_change();
+    void log_toast_change();
     void draw_backdrop(UiCanvas& canvas);
     void draw_title(UiCanvas& canvas);
     void draw_hint_bar(UiCanvas& canvas);
@@ -101,6 +111,10 @@ private:
 
     std::string toast_text_;
     double toast_seconds_ = 0.0;
+    // The screen and the toast text last written to the log, so a change is
+    // announced once and only once.
+    std::optional<ScreenId> logged_screen_;
+    std::string logged_toast_;
     bool tooltips_ = true;
     bool scene_loaded_ = false;
     bool dirty_ = true;

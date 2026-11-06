@@ -2,24 +2,17 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <string>
 #include <vector>
 
 #include "common/half.h"
 #include "scene/byte_order.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
 
 constexpr std::array<uint8_t, 8> kMagic{{'P', 'S', 'P', 'L', 'A', 'T', '\0', '\0'}};
-
-void store_half(uint8_t* p, float value) {
-    const uint16_t half = float_to_half(value);
-    p[0] = static_cast<uint8_t>(half & 0xffu);
-    p[1] = static_cast<uint8_t>(half >> 8);
-}
 
 float load_half(const uint8_t* p) {
     return half_to_float(static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8)));
@@ -43,19 +36,10 @@ std::array<uint8_t, kPsplatHeaderSize> make_header(const SplatScene& scene, cons
     return header;
 }
 
-template <typename Container>
-void write_half_array(std::ostream& out, const Container& values) {
-    std::array<uint8_t, 4096> buffer{};
-    size_t used = 0;
-    for (float value : values) {
-        if (used + 2 > buffer.size()) {
-            out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(used));
-            used = 0;
-        }
-        store_half(buffer.data() + used, value);
-        used += 2;
-    }
-    if (used > 0) out.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(used));
+void append_half(std::vector<uint8_t>* bytes, float value) {
+    const uint16_t half = float_to_half(value);
+    bytes->push_back(static_cast<uint8_t>(half & 0xffu));
+    bytes->push_back(static_cast<uint8_t>(half >> 8));
 }
 
 }  // namespace
@@ -65,19 +49,19 @@ Status write_psplat(const Path& path, const SplatScene& scene, float focal_px,
     if (!scene.consistent()) return Status::error(".psplat scene arrays have inconsistent sizes");
     if (scene.count() > 0xffffffffu) return Status::error(".psplat count exceeds uint32");
 
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return Status::error("cannot open " + path.string() + " for writing");
-
+    // One buffer, then the VFS write: the .psplat writer is the same code for a
+    // local folder and a folder on a network location (L3's upload).
+    std::vector<uint8_t> bytes;
+    bytes.reserve(psplat_file_size(scene.count()));
     const auto header = make_header(scene, scene.bounds(), focal_px, image_width, image_height);
-    out.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
-    write_half_array(out, scene.position);
-    write_half_array(out, scene.log_scale);
-    write_half_array(out, scene.rotation);
-    write_half_array(out, scene.sh_dc);
-    write_half_array(out, scene.opacity_logit);
+    bytes.insert(bytes.end(), header.begin(), header.end());
+    for (const float value : scene.position) append_half(&bytes, value);
+    for (const float value : scene.log_scale) append_half(&bytes, value);
+    for (const float value : scene.rotation) append_half(&bytes, value);
+    for (const float value : scene.sh_dc) append_half(&bytes, value);
+    for (const float value : scene.opacity_logit) append_half(&bytes, value);
 
-    if (!out) return Status::error("failed while writing " + path.string());
-    return Status::success();
+    return vfs::write_file(path, bytes);
 }
 
 Result<SplatScene> read_psplat(const uint8_t* data, size_t size, PsplatInfo* info) {
@@ -140,10 +124,9 @@ Result<SplatScene> read_psplat(const uint8_t* data, size_t size, PsplatInfo* inf
 }
 
 Result<SplatScene> read_psplat(const Path& path, PsplatInfo* info) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return Result<SplatScene>::failure("cannot open " + path.string());
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    return read_psplat(bytes.data(), bytes.size(), info);
+    const Result<std::vector<uint8_t>> bytes = vfs::read_file(path);
+    if (!bytes.ok()) return Result<SplatScene>::failure("cannot open " + path.string());
+    return read_psplat(bytes.value().data(), bytes.value().size(), info);
 }
 
 }  // namespace splat

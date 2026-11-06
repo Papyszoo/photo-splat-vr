@@ -9,8 +9,10 @@ namespace splat {
 
 // Imports a binary little-endian 3DGS .ply (SH degree 0). Extra vertex
 // properties such as f_rest_* are ignored, as are extra elements (intrinsic,
-// extrinsic, ...).
-Status import_ply(const Path& path, SplatScene& scene);
+// extrinsic, ...). `max_splats` refuses a header that declares more vertices
+// than that before the vertex block is read (0 = no limit), which is how the
+// splat importer applies its source-count guard without a second header parser.
+Status import_ply(const Path& path, SplatScene& scene, uint32_t max_splats = 0);
 
 // Writes the 14 standard vertex properties in SHARP's order:
 // x y z f_dc_0..2 opacity scale_0..2 rot_0..3 (all float32, little-endian).

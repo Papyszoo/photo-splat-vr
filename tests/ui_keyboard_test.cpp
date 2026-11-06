@@ -279,6 +279,46 @@ TEST_CASE("ui_keyboard OK calls create_album and rename_album on the temp tree")
     CHECK(fixture.toasts.back().find("Renamed folder to new") != std::string::npos);
 }
 
+TEST_CASE("ui_keyboard free text takes a title and a minimum length") {
+    Fixture fixture;
+    // The passcode's shape: a titled, masked field that refuses fewer than four
+    // characters. The location editor's own free text keeps the old behaviour.
+    splat::ScreenArgs args;
+    args.a = "free-text";
+    args.masked = true;
+    args.max_length = 32;
+    args.min_length = 4;
+    args.title = "Set a passcode";
+    std::string typed;
+    args.on_text = [&typed](const std::string& text) { typed = text; };
+    REQUIRE(fixture.stack.push(splat::ScreenId::Keyboard, args));
+    REQUIRE(fixture.keyboard != nullptr);
+    CHECK(fixture.keyboard->title() == "Set a passcode");
+    CHECK(fixture.keyboard->masked());
+    CHECK(fixture.keyboard->free_text());
+    CHECK(fixture.keyboard->validity_text() == "Type a value");
+
+    fixture.type("12");
+    CHECK(fixture.keyboard->validity_text() == "At least 4 characters");
+    CHECK_FALSE(fixture.keyboard->valid());
+    fixture.press_ok();                       // OK is disabled below the minimum
+    CHECK(fixture.stack.top_id() == splat::ScreenId::Keyboard);
+    CHECK(typed.empty());
+
+    fixture.type("34");
+    CHECK(fixture.keyboard->valid());
+    CHECK(fixture.keyboard->drawn_text() == "****");  // one '*' per character
+    fixture.press_ok();
+    CHECK(typed == "1234");
+    CHECK(fixture.stack.top_id() != splat::ScreenId::Keyboard);  // it popped itself
+
+    // The default title and the default minimum are the location editor's.
+    fixture.enter("free-text", "nas.local");
+    CHECK(fixture.keyboard->title() == "Type a value");
+    CHECK(fixture.keyboard->valid());
+    CHECK_FALSE(fixture.keyboard->masked());
+}
+
 TEST_CASE("ui_keyboard layout has no null key and every key types a real character") {
     Fixture fixture;
     fixture.enter("new-album", "");

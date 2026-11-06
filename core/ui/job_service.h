@@ -35,6 +35,14 @@
 
 namespace splat {
 
+// The visible-folders rule for one job row, shared by JobService, FakeJobService
+// and the Queue screen so the three cannot disagree: a row is shown only when
+// the album/location it writes to is ticked. The photo's source folder no
+// longer hides anything (stage U1: the picker and photo folders are open).
+bool job_visible(const JobView& job);
+// The destination half alone, for an enqueue that has not built a row yet.
+bool destination_visible(const std::string& album, const Path& output_root);
+
 class JobService : public IJobService {
 public:
     // `queue` and `runner` must outlive the service. The runner must not be
@@ -48,8 +56,20 @@ public:
 
     // One conversion per photo into `album`. Fails when nothing was queued
     // (all photos already active, or an unreadable state file).
-    Status enqueue(const std::vector<Path>& photos, const std::string& backend,
-                   const std::string& album) override;
+    Status enqueue(const std::vector<PhotoPick>& photos, const std::string& backend,
+                   const std::string& album, const Path& output_root = Path()) override;
+    // One import per splat file. Like enqueue(), failures are reported here only
+    // when nothing at all was queued; an unreadable file fails as its job runs.
+    // `queued` receives the number of files that joined the queue (duplicates of
+    // a queued/running file are skipped).
+    Status enqueue_import(const std::vector<Path>& splats, const std::string& album,
+                          std::size_t* queued = nullptr, const Path& output_root = Path(),
+                          const std::string& source_folder = {}) override;
+    // One turn per scene folder. Fails when the folder is already being turned
+    // (the queue's duplicate rule) or the queue cannot be written. `album` is
+    // the shelf the entry came from, for the Queue row.
+    Status enqueue_rotate(const Path& scene_folder, int quarters,
+                          const std::string& album = std::string()) override;
     // Oldest first (the queue's enqueue order), done and failed rows kept for
     // the session.
     std::vector<JobView> snapshot() const override;
@@ -57,6 +77,9 @@ public:
     // (the view keeps "running" and says it cancels after this photo).
     Status cancel(const std::string& id) override;
     bool busy() const override;
+    // The folder the viewer has open: the runner refuses to rewrite it. The
+    // host calls this beside UiServices::open_scene.
+    void set_open_scene(const Path& folder) override;
 
 private:
     void worker_main();
@@ -78,6 +101,9 @@ private:
     std::vector<JobView> views_;
     float progress_fraction_ = 0.0f;
     std::string progress_stage_;
+    // The scene the viewer holds, read by the runner on its own thread.
+    mutable std::mutex open_scene_mutex_;
+    Path open_scene_;
     // Id of the running job a cancel was requested for; guarded by queue_mutex_.
     std::string cancel_id_;
 

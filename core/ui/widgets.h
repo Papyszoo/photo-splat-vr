@@ -26,6 +26,7 @@
 #include "ui/services.h"
 #include "ui/theme.h"
 #include "ui/ui_input.h"
+#include "ui/ui_state.h"
 
 namespace splat {
 
@@ -57,6 +58,13 @@ public:
     // Rows that fit in `area`; at least 1.
     int visible_rows(const Rect& area, const UiTheme& theme) const;
 
+    // The plate of row `index` with the current scroll, exactly as draw() lays
+    // it out; an empty rect when the row is not visible. A screen that draws
+    // its own control over a row (Settings' thumbnail slider) uses this for the
+    // drawing and for the pointer hit test, so the two cannot disagree; the
+    // control inside the plate (Slider::hit_rect) is the same box it draws.
+    Rect row_rect(int index, const Rect& area, const UiTheme& theme) const;
+
     // Focus movement, paging, pointer hover/click and scrolling.
     void update(const UiInput& input, const Rect& area, const UiTheme& theme);
     void draw(UiCanvas& canvas, const Rect& area, const UiTheme& theme) const;
@@ -78,7 +86,9 @@ private:
 struct GridCell {
     std::string caption;
     std::string sublabel;           // optional second caption line
-    const UiImage* thumb = nullptr; // optional thumbnail, cropped to fill the tile
+    // Optional thumbnail. Cropped to fill the tile unless `fit` is set, then
+    // the whole picture is fitted inside it (see `fit` below).
+    const UiImage* thumb = nullptr;
     bool dim = false;
 
     // What the tile shows instead of a thumbnail. None draws the labelled
@@ -88,17 +98,31 @@ struct GridCell {
     bool checked = false;   // a selection mark in the corner
     float progress = -1.0f; // >= 0: a progress ring over the image
     std::string badge;      // short state under the ring ("Queued")
+    // Clockwise quarter turns the thumbnail is drawn with (the photo picker's
+    // Square turn). The image is turned at draw time and fitted inside the
+    // tile; it is never decoded again.
+    int turn_quarters = 0;
+    // The whole picture is fitted inside the tile, with the tile's backdrop
+    // showing where its shape differs, instead of being cropped to fill: what
+    // the photo picker does for every photo (stage TF2, like a file browser).
+    // A picture that already has the tile's shape still fills it.
+    bool fit = false;
 };
 
 class GridView {
 public:
-    // Cell size and gap in pixels; columns follow from the area width. The
-    // image fills the cell above the label area: room for `caption_lines`
-    // caption lines (the focused tile wraps its name onto them; the others
-    // keep one line) and, with `show_sublabel`, one sublabel line.
+    // Cell size and gap in pixels; columns follow from the area width. `gap` is
+    // the space between rows and `column_gap` the space between columns (equal
+    // unless a thumbnail screen spreads the panel's spare width over the
+    // columns). The image fills the cell above the label area: room for
+    // `caption_lines` caption lines (a thumbnail screen always uses
+    // kThumbnailCaptionLines and wraps every tile's name onto them, focused or
+    // not; the last line ends in an ellipsis when the name does not fit) and,
+    // with `show_sublabel`, one sublabel line.
     int cell_width = 192;
     int cell_height = 160;
     int gap = 16;
+    int column_gap = 16;
     int caption_lines = 1;
     bool show_sublabel = true;
     // The sublabel only under the focused tile (a scene's model name).
@@ -123,6 +147,10 @@ public:
     // Where cell `index` lands with the current scroll, for pointer hit tests
     // and for screens that draw a marker.
     Rect cell_rect(int index, const Rect& area) const;
+    // The ink box of a scroll chevron: in the panel's right gutter (the margin
+    // beside the grid), level with the grid's bottom edge when `down`, else at
+    // its top edge. It never overlaps a tile, a caption or the hint bar.
+    Rect chevron_rect(const Rect& area, const UiTheme& theme, bool down) const;
 
     void update(const UiInput& input, const Rect& area, const UiTheme& theme);
     void draw(UiCanvas& canvas, const Rect& area, const UiTheme& theme) const;
@@ -136,6 +164,7 @@ public:
 private:
     void draw_cell(UiCanvas& canvas, const GridCell& cell, const Rect& box, bool focused,
                    const UiTheme& theme) const;
+    void draw_chevron(UiCanvas& canvas, const Rect& box, bool up, const UiTheme& theme) const;
 
     std::vector<GridCell> cells_;
     int focus_ = 0;
@@ -172,11 +201,10 @@ private:
     bool open_ = false;
 };
 
-// A thin progress bar under the right-hand text of ListView row `row` (counted
-// from the first visible row) drawn in `area`: the running conversion, the
-// model download. `scrollbar` mirrors the list's own track.
-void draw_row_progress(UiCanvas& canvas, const Rect& area, int row, std::string_view right,
-                       float fraction, bool scrollbar, const UiTheme& theme);
+// A thin progress bar under the right-hand text of list row whose plate is
+// `plate` (ListView::row_rect): the running conversion, the model download.
+void draw_row_progress(UiCanvas& canvas, const Rect& plate, std::string_view right, float fraction,
+                       const UiTheme& theme);
 
 // The one conversion status, in the top bar and in Settings: a chip with a
 // ring for the running photo's progress, "Converting" and how many photos are
@@ -237,5 +265,98 @@ private:
 // white ring `gap` px outside the box.
 void draw_focus_ring(UiCanvas& canvas, const Rect& box, int radius, const UiTheme& theme,
                      int gap = 4);
+
+// ---- the one entry-tile layout (stage T, one picture shape in stage TF) -----
+// Every screen that shows entries as thumbnails - Albums, Scenes, Photos, files
+// and folders alike - lays its grid out from these numbers; no screen carries
+// its own cell size. A step of the slider is a column count: the tile is the
+// width the grid area leaves for one column after the shared gap, so the grid
+// fills the panel on every screen and the gap is the same at every size. `area`
+// is the grid area, because a size's guaranteed entry count is enforced by
+// shrinking a tile on a panel too small for it (the 2-entries-in-VR bug this
+// stage fixes).
+struct ThumbnailMetrics {
+    int cell_width = 176;
+    int cell_height = 160;  // picture + label block
+    int gap = 18;           // between rows and columns (the step's spacing)
+    int column_gap = 18;    // between columns, widened over the rounding's spare pixels
+};
+
+// One label rule for every tile: two caption lines, focused or not, with an
+// ellipsis when the name is cut. A screen may show one sublabel line under them
+// (a scene's model, an album's count); the line is always reserved, so the
+// picture box is the same whether or not a tile is focused.
+constexpr int kThumbnailCaptionLines = 2;
+
+// What a screen draws under its pictures. It changes the cell height (and so
+// the entry count), never the picture shape.
+struct ThumbnailLabel {
+    int caption_lines = kThumbnailCaptionLines;
+    bool sublabel = false;  // one sublabel line is reserved under the captions
+};
+
+// Height of the label block under a tile's picture: the gap between them plus
+// the caption lines and the sublabel line. GridView::image_rect() and the
+// layout below both call this, so the picture box the grid draws is the one
+// the entry counts were measured with.
+int thumbnail_label_height(const UiTheme& theme, int caption_lines, bool sublabel);
+
+// The five steps are kThumbnailSizes in ui_state.h: 9, 8, 7, 6 and 5 columns.
+// The default (index 2) must show at least 12 entries in both modes, the
+// largest at least 6, and the smallest stays readable (the shrink guard stops
+// at a legible floor). The picture keeps one shape at every step: only its
+// width (and with it its height) changes with the column count.
+ThumbnailMetrics thumbnail_metrics(const Rect& area, const UiTheme& theme, int size,
+                                   ThumbnailLabel label = {});
+// Applies the shared metrics to a grid (cell size, height and gap only; the
+// label block comes from the grid's own caption_lines/show_sublabel, so every
+// screen's counts follow what it draws).
+void apply_thumbnail_layout(GridView& grid, const Rect& area, const UiTheme& theme, int size);
+// "About how many entries fit per row" for the Settings slider: the same
+// columns formula the grid uses, at the same metrics.
+int thumbnail_columns(const Rect& area, const UiTheme& theme, int size,
+                      ThumbnailLabel label = {});
+// Entries fully visible in `area` at `size` (columns x visible rows).
+int thumbnail_entries_visible(const Rect& area, const UiTheme& theme, int size,
+                              ThumbnailLabel label = {});
+
+// A horizontal stepped slider for one list row (Settings' "Thumbnail size").
+// The screen owns the input policy - Left/Right or a pointer press/drag - and
+// the widget maps a pointer x to an index and draws the track, its ticks, the
+// knob and the right-aligned value text.
+class Slider {
+public:
+    explicit Slider(int steps = kThumbnailSizeCount, int value = kThumbnailSizeDefault);
+
+    int steps() const { return steps_; }
+    int value() const { return value_; }
+    // Clamps to 0 .. steps()-1; returns true when the value changed.
+    bool set_value(int value);
+
+    // The track inside a row's plate (the right-hand part of `area`): the value
+    // text keeps its drawn width on the right. Both draw() and a screen's
+    // pointer hit test call this, so the drawn control and the hit box cannot
+    // disagree.
+    static Rect track_rect(const Rect& area, std::string_view value_text, const UiTheme& theme);
+    // The track inside a row's plate (the right-hand part of `area`): the value
+    // text keeps `text_width` px on the right. The caller passes the widest
+    // label any step draws, so the track and knob stay put when a step's text
+    // is shorter or longer (a drag must not hunt under the laser). Both draw()
+    // and the pointer hit test call this, so the two cannot disagree.
+    static Rect track_rect(const Rect& area, int text_width, const UiTheme& theme);
+    // The pointer box: the track's x range (plus the knob's radius) over the
+    // row's full height. It stops short of the value text, which is a label.
+    static Rect hit_rect(const Rect& area, int text_width, const UiTheme& theme);
+    // The step a pointer at `px` on `track` selects (clamped, rounded).
+    int value_at(float px, const Rect& track) const;
+
+    // `text_width` is the label's reserved width (see track_rect).
+    void draw(UiCanvas& canvas, const Rect& area, std::string_view value_text, int text_width,
+              bool focused, const UiTheme& theme) const;
+
+private:
+    int steps_;
+    int value_;
+};
 
 }  // namespace splat

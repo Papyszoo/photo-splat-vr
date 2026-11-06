@@ -4,11 +4,13 @@
 # Settings with Options and walks down to its Quit row.
 #
 # Settings starts with the Comfort section (Scale around, Move speed, Turn
-# speed) and the Display section (Edge softness, Blending), then System (Models,
-# Conversions, Quit): the focus starts on Scale around, so Quit is seven
-# selectable rows down. The script stops there and ends through its own `quit`,
-# because activating Quit ends the title through LoadExec and the run would then
-# have no "viewer: script done" line (ui-test.sh's default end line).
+# speed) and the Display section (Edge softness, Blending, Thumbnail size), then
+# System (Models, Conversions, Network locations, Visible folders, Quit): the
+# focus starts on Scale around, so Quit is ten selectable rows down (stage H
+# inserted Visible folders after Network locations, stage T Thumbnail size). The
+# script stops there and ends through its own `quit`, because activating Quit
+# ends the title through LoadExec and the run would then have no
+# "viewer: script done" line (ui-test.sh's default end line).
 #
 # Run: platform/ps5/scripts/ui-test.sh platform/ps5/scripts/ui-tests/browse.txt
 # Expected klog: "viewer: tv scene 1/", a second "viewer: tv scene 2/",
@@ -32,5 +34,8 @@
 18.4 press Down
 19.0 press Down
 19.6 press Down
-20.6 shot settings-quit
-21.6 quit
+20.2 press Down
+20.8 press Down
+21.4 press Down
+21.8 shot settings-quit
+22.8 quit

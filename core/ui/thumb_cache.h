@@ -50,12 +50,22 @@ public:
     // The cached tile, or null. Never blocks on the worker.
     const UiImage* get(const std::string& key) const;
 
+    // Drops a cached tile (and a remembered failure) so the next request loads
+    // it again. Used after a file action changed the picture on disk (a photo
+    // turn or a scene rotation). A load already running for this key is
+    // discarded when it finishes, so it cannot put the old image back.
+    void forget(const std::string& key);
+
     // True while a load is queued or running.
     bool pending() const;
 
     // Tiles currently held (after the last trim); for tests and diagnostics.
     std::size_t size() const;
     std::size_t capacity() const { return capacity_; }
+    // Loaders actually run on the worker, since construction. A layout change
+    // must not make a screen ask for the same thumbnail again, so a test can
+    // compare this number before and after (stage T).
+    std::size_t loads() const;
 
 private:
     struct Job {
@@ -81,9 +91,13 @@ private:
     mutable std::unordered_map<std::string, Entry> cache_;
     mutable std::list<std::string> lru_;  // front = most recently used
     std::unordered_set<std::string> failed_;
+    // Keys whose in-flight load must be thrown away instead of cached: forget()
+    // was called while the worker was decoding them.
+    std::unordered_set<std::string> discard_;
     std::thread worker_;
     bool stop_ = false;
     bool busy_ = false;
+    std::size_t loads_ = 0;
 };
 
 }  // namespace splat

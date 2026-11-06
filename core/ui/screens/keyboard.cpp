@@ -59,6 +59,13 @@ Status delete_album_checked(const Path& root, const std::string& album) {
 void KeyboardScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
     mode_ = args.a.empty() ? std::string("new-album") : args.a;
     delete_mode_ = mode_ == "delete-album";
+    free_text_ = mode_ == "free-text";
+    masked_ = args.masked;
+    max_length_ = args.max_length > 0 ? args.max_length : 64;
+    min_length_ = std::max(0, args.min_length);
+    allow_empty_ = args.allow_empty;
+    title_ = args.title;
+    on_text_ = args.on_text;
     source_ = args.b;
     root_ = ctx.svc.paths.scenes;
     shift_ = false;
@@ -70,7 +77,8 @@ void KeyboardScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
         name_dir_ = root_;
         current_name_ = source_;
     }
-    text_ = current_name_;
+    text_ = free_text_ ? source_ : current_name_;
+    if (static_cast<int>(text_.size()) > max_length_) text_.resize(max_length_);
 
     build_keys();
     layout(ctx.content, ctx.theme);
@@ -80,8 +88,10 @@ void KeyboardScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
         confirm_.open("Delete \u201C" + source_ + "\u201D?", validity_, "Delete", valid_);
         return;
     }
-    // The system dialog is asked first; the grid above is the fallback.
-    begin_system_keyboard(ctx);
+    // The system dialog is asked first; the grid above is the fallback. Free
+    // text keeps the panel grid: its characters (':', '/', '@') are exactly the
+    // ones a system dialog may not offer.
+    if (!free_text_) begin_system_keyboard(ctx);
 }
 
 bool KeyboardScreen::begin_system_keyboard(UiContext& ctx) {
@@ -125,6 +135,13 @@ bool KeyboardScreen::handle_back(UiContext& ctx) {
 }
 
 void KeyboardScreen::confirm_name(UiContext& ctx) {
+    if (free_text_) {
+        // The caller's field owns the value; the keyboard only hands it over
+        // and leaves, exactly once (OK is the only route here).
+        if (on_text_) on_text_(text_);
+        ctx.nav.pop();
+        return;
+    }
     Status status = Status::success();
     std::string done;
     if (mode_ == "rename-scene") {
@@ -141,8 +158,47 @@ void KeyboardScreen::confirm_name(UiContext& ctx) {
     ctx.nav.pop();
 }
 
+std::string KeyboardScreen::drawn_text() const {
+    return masked_ ? std::string(text_.size(), '*') : text_;
+}
+
+void KeyboardScreen::build_free_text_keys() {
+    keys_.clear();
+    columns_ = 14;
+    // The album keyboard's rows, then the characters a path, a URL or a
+    // password needs. Every symbol is its own key (the shifted glyph), so no
+    // Shift state is needed to type '@' or '/'. The dot, dash and underscore
+    // are not optional: a host is "192.168.1.20" or "nas.local" and a folder is
+    // "2026-10-31", and free text never opens the system dialog.
+    for (const char* row : {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm", "/:@#%&+=",
+                            "?!'\"()[]", "{}<>*~^|", "$;", ".-_"}) {
+        for (const char* letter = row; *letter != '\0'; ++letter) {
+            keys_.push_back(
+                KeyboardKey{KeyboardKey::Kind::Character, *letter, std::string(1, *letter)});
+        }
+    }
+    keys_.push_back(KeyboardKey{KeyboardKey::Kind::Shift, 0, "Shift"});
+    keys_.push_back(KeyboardKey{KeyboardKey::Kind::Character, ' ', "Space"});
+    keys_.push_back(KeyboardKey{KeyboardKey::Kind::Backspace, 0, "Delete"});
+    keys_.push_back(KeyboardKey{KeyboardKey::Kind::Ok, 0, "OK"});
+
+    std::vector<GridCell> cells;
+    cells.reserve(keys_.size());
+    for (const KeyboardKey& key : keys_) {
+        GridCell cell;
+        cell.caption = key.label;
+        cells.push_back(std::move(cell));
+    }
+    grid_.set_cells(std::move(cells));
+}
+
 void KeyboardScreen::build_keys() {
     keys_.clear();
+    if (free_text_) {
+        build_free_text_keys();
+        return;
+    }
+    columns_ = kColumns;
 
     // QWERTY (headset test 6: "QWERTY, not ABC"): the digit row, qwertyuiop,
     // asdfghjkl + Shift, zxcvbnm, then the symbols and the action keys. An
@@ -187,16 +243,36 @@ void KeyboardScreen::layout(const Rect& content, const UiTheme& theme) {
     keys_top_ = theme.scaled(kKeysTop);
 
     grid_.gap = gap;
+    grid_.column_gap = gap;
     grid_.cell_height = key_height;
     grid_.cell_width = std::max(theme.scaled(40),
-                                (content.w - (kColumns - 1) * gap) / kColumns);
+                                (content.w - (columns_ - 1) * gap) / columns_);
+    // The rows follow the key count: the album grid has five, the free-text
+    // grid the same because it uses more columns.
+    const int rows = std::max(1, (static_cast<int>(keys_.size()) + columns_ - 1) / columns_);
     keys_area_ = Rect{content.x, content.y + keys_top_, content.w,
-                      (key_height + gap) * 5 - gap};
+                      (key_height + gap) * rows - gap};
 }
 
 void KeyboardScreen::refresh_validity() {
     validity_.clear();
     valid_ = false;
+
+    if (free_text_) {
+        // A free-text field has one rule: something has to be there - and, when
+        // the caller asks for a minimum (the passcode's 4), at least that many
+        // characters. OK stays disabled below either bound.
+        if (text_.empty() && !allow_empty_) {
+            validity_ = "Type a value";
+            return;
+        }
+        if (min_length_ > 0 && static_cast<int>(text_.size()) < min_length_) {
+            validity_ = "At least " + std::to_string(min_length_) + " characters";
+            return;
+        }
+        valid_ = true;
+        return;
+    }
 
     if (delete_mode_) {
         if (source_.empty() || source_ == kAllScenesAlbumName) {
@@ -262,7 +338,14 @@ void KeyboardScreen::refresh_validity() {
 }
 
 void KeyboardScreen::type_character(char character) {
-    if (text_.size() >= kMaxTyped) return;
+    // Free text is bounded by the caller's max_length (a share path may be 256
+    // characters); an album name keeps the 48-character gallery limit's
+    // one-line keyboard ceiling.
+    if (free_text_) {
+        if (static_cast<int>(text_.size()) >= max_length_) return;
+    } else if (text_.size() >= kMaxTyped) {
+        return;
+    }
     if (shift_ && is_letter(character)) {
         text_.push_back(static_cast<char>(character - 'a' + 'A'));
     } else {
@@ -370,7 +453,8 @@ void KeyboardScreen::draw_field(UiContext& ctx, UiCanvas& canvas, const Rect& co
 
     const int text_y = UiCanvas::text_top_centered(content.y, field_height_, size);
     const int text_x = content.x + field_inset_;
-    const uint32_t typed_width = canvas.text(text_x, text_y, text_, size, theme.text);
+    const std::string shown = drawn_text();
+    const uint32_t typed_width = canvas.text(text_x, text_y, shown, size, theme.text);
     const int cap = UiCanvas::line_height(size);
     canvas.fill_rect(text_x + static_cast<int>(typed_width) + theme.scaled(3),
                      content.y + (field_height_ - cap) / 2, std::max(1, theme.scaled(2)), cap,
@@ -429,6 +513,7 @@ std::vector<Hint> KeyboardScreen::hints() const {
 }
 
 std::string KeyboardScreen::title() const {
+    if (free_text_) return title_.empty() ? std::string("Type a value") : title_;
     if (delete_mode_) return "Delete folder";
     if (mode_ == "rename-scene") return "Rename scene";
     if (mode_ == "rename-album") return "Rename folder";

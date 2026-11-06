@@ -80,6 +80,71 @@ splat::SplatScene stepped_plane(float step_x) {
     return scene;
 }
 
+// Fronto-parallel plane at z = 1 m: a symmetric square grid of opaque Gaussians
+// (sigma 3 cm, spacing 3 cm), centred on the axis and identical under a quarter
+// turn about z. A scene rotated by 90 degrees about the placement z axis
+// therefore renders the same footprints, so any difference between two frames is
+// the comfort pass's, not the geometry's.
+splat::SplatScene square_plane() {
+    constexpr float kSigma = 0.03f;
+    constexpr float kSpacing = 0.03f;
+    constexpr int kSide = 61;   // -0.9 .. 0.9 m, odd, so the grid is symmetric
+    const float white_dc = 0.8f / 0.28209479177387814f;
+    splat::SplatScene scene;
+    scene.resize(static_cast<size_t>(kSide) * kSide);
+    size_t i = 0;
+    for (int ix = 0; ix < kSide; ++ix) {
+        const float x = kSpacing * static_cast<float>(ix - kSide / 2);
+        for (int iy = 0; iy < kSide; ++iy, ++i) {
+            const float y = kSpacing * static_cast<float>(iy - kSide / 2);
+            scene.position[i * 3 + 0] = x;
+            scene.position[i * 3 + 1] = y;
+            scene.position[i * 3 + 2] = 1.0f;
+            for (int axis = 0; axis < 3; ++axis) scene.log_scale[i * 3 + axis] = std::log(kSigma);
+            scene.rotation[i * 4 + 0] = 1.0f;
+            scene.rotation[i * 4 + 1] = 0.0f;
+            scene.rotation[i * 4 + 2] = 0.0f;
+            scene.rotation[i * 4 + 3] = 0.0f;
+            for (int channel = 0; channel < 3; ++channel) scene.sh_dc[i * 3 + channel] = white_dc;
+            scene.opacity_logit[i] = 12.0f;
+        }
+    }
+    return scene;
+}
+
+// The centroid of a frame's fade mask, in pixel-centre coordinates: each pixel
+// weighs how far it is from the fully lit splat surface toward the backdrop, so
+// 1 is "fully faded". The two references are the frame's own brightest and
+// darkest red values, which works for any rotation of the same plane.
+bool fade_mask_centroid(const splat::Image& frame, double* cx, double* cy) {
+    int lowest = 255;
+    int highest = 0;
+    for (size_t i = 0; i < frame.pixel_count(); ++i) {
+        const int value = frame.rgb[i * 3];
+        if (value < lowest) lowest = value;
+        if (value > highest) highest = value;
+    }
+    const double span = static_cast<double>(highest - lowest);
+    if (span < 10.0) return false;
+    double mass = 0.0;
+    double sx = 0.0;
+    double sy = 0.0;
+    for (int py = 0; py < frame.height; ++py) {
+        for (int px = 0; px < frame.width; ++px) {
+            double mask = (highest - frame.pixel(px, py)[0]) / span;
+            if (mask < 0.0) mask = 0.0;
+            if (mask > 1.0) mask = 1.0;
+            mass += mask;
+            sx += mask * (px + 0.5);
+            sy += mask * (py + 0.5);
+        }
+    }
+    if (!(mass > 1.0)) return false;
+    *cx = sx / mass;
+    *cy = sy / mass;
+    return true;
+}
+
 // Red-channel profile of one eye, averaged over a band of rows. The step and
 // the fade are vertical, so the average keeps their sub-pixel position while
 // removing the per-splat texture noise.

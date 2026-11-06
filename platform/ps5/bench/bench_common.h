@@ -21,6 +21,7 @@
 #include <dirent.h>
 
 #include "common/path.h"
+#include "image/format.h"
 
 namespace splat {
 namespace bench {
@@ -38,9 +39,8 @@ inline std::string first_image_in(const std::string& dir) {
     std::vector<std::string> names;
     while (dirent* entry = readdir(handle)) {
         const std::string name = entry->d_name;
-        if (has_suffix(name, ".jpg") || has_suffix(name, ".jpeg") || has_suffix(name, ".png")) {
-            names.push_back(name);
-        }
+        // The one photo format list (core/image/format.h), like the app.
+        if (splat::is_photo_file(Path(name))) names.push_back(name);
     }
     closedir(handle);
     if (names.empty()) return {};

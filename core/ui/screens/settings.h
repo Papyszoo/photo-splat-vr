@@ -37,9 +37,12 @@ public:
         DisplayHeader,
         EdgeSoftness,
         Blending,
+        ThumbnailSize,
         SystemHeader,
         Models,
         Conversions,
+        Locations,
+        VisibleFolders,
         Quit,
         ItemCount
     };
@@ -47,6 +50,16 @@ public:
     // For tests: the row order and the live right-hand texts. The conversion
     // status is the top bar's chip (UiApp), not repeated in a row.
     const ListView& list() const { return list_; }
+    // The thumbnail size slider's state and its row text ("Default · 7 per
+    // row"): both are what the row draws and what a pointer drag changes.
+    const Slider& thumbnail_slider() const { return slider_; }
+    std::string thumbnail_text(const UiContext& ctx) const;
+    // The width of the widest step's value text: the slider's track and hit box
+    // are laid out from it, so neither moves when the step's label changes width.
+    int thumbnail_text_width(const UiContext& ctx) const;
+    // The right-hand part of a list row the slider is drawn in (the same box
+    // the pointer hits).
+    Rect slider_area(const Rect& row, const UiTheme& theme) const;
     // The values this screen edits (a mirror of UiServices::state after the
     // last change, or the screen's own copy when there is no service state).
     const UiState& values() const { return local_state_; }
@@ -54,11 +67,17 @@ public:
 private:
     UiState& state(UiContext& ctx);
     void refresh_rows(const UiContext& ctx);
+    // The per-row part of the slider's text: one number, or "low-high" when the
+    // folder grid and the photo picker draw different column counts at a step.
+    std::string thumbnail_columns_text(const UiContext& ctx, int size) const;
+    // The pointer's and the pad's one setting: the thumbnail size step.
+    void set_thumbnail_size(UiContext& ctx, int size);
     // Cycles one setting by `direction` (-1/+1) and saves the state.
     void cycle(UiContext& ctx, int item, int direction);
     void save(UiContext& ctx);
 
     ListView list_;
+    Slider slider_;
     // The screen's copy when there is no UiServices::state (unit tests and the
     // UI preview); otherwise it mirrors the service's object so values() stays
     // usable without a context.

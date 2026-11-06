@@ -884,6 +884,17 @@ Status SplatRenderer::commit_staged_scene() {
     return Status::success();
 }
 
+void SplatRenderer::clear_scene() {
+    if (context_ == nullptr) return;
+    // A zero count draws nothing: the project pass dispatches no group, the
+    // indirect draw's instance count stays 0 and the sort has nothing to order.
+    // The attribute buffers stay resident until the next scene commits over
+    // them, so the descriptor set is always valid.
+    if (count_ == 0) return;
+    count_ = 0;
+    ++scene_generation_;
+}
+
 void SplatRenderer::discard_staged_scene() {
     if (context_ == nullptr || !has_staged_) return;
     vkDeviceWaitIdle(context_->device());
@@ -1380,6 +1391,14 @@ Status SplatRenderer::render(const FrameView& view, const RenderTarget& target, 
     }
     has_readback_ = readback;
     return Status::success();
+}
+
+std::vector<uint32_t> SplatRenderer::last_draw_order() const {
+    std::vector<uint32_t> order;
+    if (values_.mapped == nullptr || count_ == 0) return order;
+    const auto* values = static_cast<const uint32_t*>(values_.mapped);
+    order.assign(values, values + count_);
+    return order;
 }
 
 Result<Image> SplatRenderer::read_image() const {

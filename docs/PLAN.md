@@ -164,6 +164,59 @@ Small's time, same capture-pose PSNR); Small is the one kept.
   lot: they need minification filtering (mipmaps/anisotropy) and the label
   should use the smooth font.
 
+## Scaling fix (2026-10-30) — Capture pivot
+
+- Scene loading and recentering stay exactly as they were; the headset test
+  confirmed they are correct. Only scaling changes.
+- The default scale mode is **Capture**: L2/R2 scale the scene about the photo's
+  capture point (the scene origin), which is where the eyes are at
+  load/recenter. The static image is unchanged, but a smaller scene makes every
+  head/body movement cover a larger fraction of it - the miniature effect the
+  user asked for. No fade, no model view, no stand. Centre (visible 3D centre
+  fixed) and Front (near edge fixed) are the alternatives.
+- The scale range is **0.001x–4x** (the old 0.25 floor left a 160 m street
+  scene 40 m wide and was a large part of why "smaller" never happened).
+- The scale press is twice as fast (doubles every 1.5 s) and the dolly speed
+  cap is 4 m/s, so a large scene can actually be brought down to a small size
+  in a few seconds.
+- The retired table-model mode (ui.json `scale_around = 2`) loads as Capture
+  (`core/ui/ui_state.cpp` maps 2 and every unknown value to the Capture mode).
+- Evidence: `tests/vr9_test.cpp` pins Capture at 0.5x/0.1x with the offset
+  unchanged, the default (no ui.json -> Capture pivot, end to end through
+  `pivot_mode_from_setting`) and the legacy ui.json values (numeric 0/1/2/7,
+  `"front"`/`"centre"`/`"maquette"`); `tests/ui_settings_test.cpp` pins the
+  Scale row's Left/Right/Cross ring; the full suite and the PS5 build are the
+  gates. Headset check pending.
+
+## Rotation is a file action (2026-11-05, user; replaces Track R)
+
+- The user removed scene rotation from the viewer: "we don't need rotation of the
+  scene ... we should handle that before converting", then "I'd rather keep it
+  on file entry in UI to rotate left or right by 90 degrees, just like photos on
+  windows - and rotated version overrides previous one."
+- One control on every entry: a focused photo and a focused scene (converted or
+  imported, local or network) turn left/right by 90 degrees with **L3/R3**; the
+  hint bar names them. A photo JPEG or baseline TIFF has its Orientation tag
+  rewritten in place (no pixel re-encode); anything the app cannot rewrite keeps
+  its source and the turn is saved in `<data>/state/photo-turns.json`, keyed by
+  location and path. A RAW is never written to. A saved turn reaches the
+  conversion through the existing `rotate_quarters`; after a rewrite it is
+  cleared so the turn happens once.
+- A scene's turn is baked into its own files by a background job: positions and
+  Gaussian orientations in `scene.psplat`, `original.jpg` and `thumb.jpg`, and
+  the intrinsics in `meta.json` (about the capture camera's forward axis, the
+  same direction a photo turns). The tile says "Rotating" while it runs, a
+  scene that is open or already being turned is refused, and the renames are
+  ordered scene.psplat → original.jpg → thumb.jpg → meta.json so an interrupted
+  scene still opens.
+- The viewer has no rotation to change or save: the three-axis grab tilt, the
+  D-pad/Square 90 degree steps and the reset are gone, as is
+  `"view"."rotation"` (an old key still loads, ignored, and the next save drops
+  it). Left/right turning (`turn_scene`, `turn_viewer`), moving, scaling and an
+  imported scene's saved `"view"."scale"` stay. The comfort fade follows the
+  scene because the scene and its intrinsics were turned on disk.
+
+
 ## User decisions (2026-10-27, late)
 
 - v0.1 release criterion: converting photos works on the console and the scenes

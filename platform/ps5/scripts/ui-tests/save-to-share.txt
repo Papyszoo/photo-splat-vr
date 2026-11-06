@@ -1,0 +1,43 @@
+# A3.3/A3.4: convert a photo straight into the share, then check the Mac side.
+#
+# The location is pushed by console-run.sh (state/locations.json) with Path =
+# an empty sub-folder of the share, so the library root's tile 0 is
+# "+ Add photos":
+#
+#   Home -> Options -> 7x Down -> Cross (Locations) -> Cross (the library)
+#   -> Cross on "+ Add photos" -> Photos -> Cross (first photo) -> Square
+#   -> Convert dialog -> Cross (Start)
+#
+# The job stages the scene under /data/ps5-splat-vr/tmp/<job id>, uploads it to
+# <share>/library/<name> and deletes the staging copy. console-run.sh then
+# checks, on this Mac, that the four files are on the share and that the
+# console's tmp folder is empty again.
+#
+# With the server stopped (console-run.sh --only smb_server_stopped) the same
+# script must end on "upload failed: ... kept at .../tmp/<job id>" instead.
+0.5  mark home
+0.8  press Options
+1.6  press Down
+1.95 press Down
+2.30 press Down
+2.65 press Down
+3.00 press Down
+3.35 press Down
+3.70 press Down
+4.05 press Down
+4.20 press Cross
+5.0  shot locations
+5.6  press Cross
+7.0  shot library
+7.6  press Cross
+8.6  shot photos
+9.2  press Cross
+9.8  press Square
+10.8 shot dialog
+11.4 press Cross
+12.4 shot started
+40.0 shot done
+41.0 press Circle
+42.0 press Circle
+43.0 press Circle
+44.0 quit

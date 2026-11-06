@@ -42,9 +42,19 @@ jobs="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 # Keep the machine usable: 8 jobs is the sweet spot on this 16 GiB host.
 [ "$jobs" -gt 8 ] && jobs=8
 
+# CODECS_PREFIX points at the cross-built libheif/libde265/libaom (L1-B2,
+# third_party/build_codecs.sh); without it the core archive simply has no HEIF
+# decoder.
+codec_arg=""
+if [ -n "${CODECS_PREFIX:-}" ]; then
+    codec_arg="-DCMAKE_PREFIX_PATH=$CODECS_PREFIX"
+fi
+
+# shellcheck disable=SC2086  # codec_arg is one optional argument
 cmake -S "$here" -B "$BUILD_DIR" -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE="$here/ps5-toolchain.cmake" \
-      -DSPLAT_REPO="$repo"
+      -DSPLAT_REPO="$repo" \
+      $codec_arg
 cmake --build "$BUILD_DIR" -j "$jobs"
 
 echo

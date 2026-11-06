@@ -379,13 +379,31 @@ void HmdView::begin_scale_gesture() {
     // press and grow-then-shrink returns exactly. VR8 measures it from a
     // decimated copy of the scene's splats in a cone around the direction the
     // renderer's camera looks (yaw, pitch and the right-stick turn included):
-    //  - Front (default): the 5th-percentile depth keeps the foreground put;
-    //  - Centre: the median depth keeps the middle put, with a near-content
-    //    guard applied per frame in scale_scene().
+    //  - Capture (the default): the scene origin (handled just below);
+    //  - Front: the 5th-percentile depth keeps the foreground put;
+    //  - Centre: the visible content's 3D centre (per-axis median of the cone)
+    //    keeps the scene's middle put, with a near-content guard in
+    //    scale_scene(). The pivot is not on the gaze ray, so it does not drift
+    //    toward the screen centre as the scene shrinks.
     float head[3];
     placement_head(head);
     float direction[3];
     view_forward(direction);
+    if (pivot_mode_ == ScalePivotMode::capture) {
+        // Capture: scale the scene about the capture point (the scene origin),
+        // which is where the user's eyes are at load/recenter. The static image
+        // is unchanged, but a smaller scene makes every head movement cover a
+        // larger fraction of it - the miniature effect the user asked for.
+        const float* offset = state_.scene_offset();
+        for (int axis = 0; axis < 3; ++axis) pivot_world_[axis] = offset[axis];
+        pivot_distance_ = std::sqrt(offset[0] * offset[0] + offset[1] * offset[1] +
+                                    offset[2] * offset[2]);
+        cone_near_ = 0.0f;
+        gesture_start_scale_ = state_.world_scale();
+        centre_growth_limit_ = 0.0f;
+        scale_gesture_ = true;
+        return;
+    }
     float cone_near = 0.0f;
     float distance = cone_pivot_distance(&cone_near);
     if (!(distance > 0.0f)) {
@@ -403,10 +421,27 @@ void HmdView::begin_scale_gesture() {
         distance = std::max(distance, 0.05f);
         cone_near = near_world;
     }
-    // Front mode can sit below/above eye level when the user looks at a table;
-    // the pivot is still a world point and the formula is unchanged.
-    for (int axis = 0; axis < 3; ++axis) {
-        pivot_world_[axis] = head[axis] + direction[axis] * distance;
+    // Front puts the pivot on the gaze ray at the near depth. Centre uses the
+    // visible content's actual 3D centre (per-axis median of the cone), not a
+    // point on the gaze: the scene then shrinks/grows around what the user is
+    // looking at instead of drifting toward a point on the ray. Both are world
+    // points, so a head turn inside the press does not move them.
+    bool centred = false;
+    if (pivot_mode_ == ScalePivotMode::centre) {
+        float centre[3];
+        if (cone_content_centre(centre)) {
+            for (int axis = 0; axis < 3; ++axis) pivot_world_[axis] = centre[axis];
+            const float dx = centre[0] - head[0];
+            const float dy = centre[1] - head[1];
+            const float dz = centre[2] - head[2];
+            distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            centred = true;
+        }
+    }
+    if (!centred) {
+        for (int axis = 0; axis < 3; ++axis) {
+            pivot_world_[axis] = head[axis] + direction[axis] * distance;
+        }
     }
     pivot_distance_ = distance;
     cone_near_ = cone_near;
@@ -592,6 +627,15 @@ void HmdView::scale_scene(float factor, double seconds) {
     // rigid transform plus uniform scale has to obey.
     if (!scale_gesture_) begin_scale_gesture();
 
+    if (pivot_mode_ == ScalePivotMode::capture) {
+        // Capture: the scene origin is the pivot, so the offset does not move;
+        // only the scene's size changes. This is the miniature effect: the
+        // static picture is the same, but head motion is amplified relative to
+        // a smaller scene.
+        state_.scale_world(factor);
+        return;
+    }
+
     if (pivot_mode_ == ScalePivotMode::maquette) {
         // VR9: the scene shrinks and lands on the table, then grows or shrinks
         // in place there. The placement is a function of the absolute scale
@@ -647,7 +691,7 @@ void HmdView::scale_scene(float factor, double seconds) {
     state_.scale_about_pivot(factor, pivot_world_);
 }
 
-// ---- PanelFollower ---------------------------------------------------------
+// ---- PanelAnchor ----------------------------------------------------------
 
 namespace {
 
@@ -672,44 +716,10 @@ void panel_forward(double yaw, double pitch, float out[3]) {
     out[2] = static_cast<float>(std::cos(yaw)) * cp;
 }
 
-}  // namespace
-
-void PanelFollower::reset(double yaw, double pitch) {
-    panel_forward(yaw, pitch, direction_);
-    initialised_ = true;
-    following_ = false;
-}
-
-void PanelFollower::update(double yaw, double pitch, double seconds) {
-    if (!initialised_) {
-        reset(yaw, pitch);
-        return;
-    }
-    float target[3];
-    panel_forward(yaw, pitch, target);
-    const float dot = direction_[0] * target[0] + direction_[1] * target[1] +
-                      direction_[2] * target[2];
-    const float angle = std::acos(std::max(-1.0f, std::min(1.0f, dot))) * 180.0f /
-                        3.14159265358979323846f;
-    if (angle > kPanelFollowStartDegrees) following_ = true;
-    if (!following_ || !(seconds > 0.0)) return;
-    const float alpha =
-        1.0f - static_cast<float>(std::exp(-seconds / kPanelFollowSeconds));
-    for (int axis = 0; axis < 3; ++axis) {
-        direction_[axis] += (target[axis] - direction_[axis]) * alpha;
-    }
-    normalise3(direction_);
-    const float settled = direction_[0] * target[0] + direction_[1] * target[1] +
-                          direction_[2] * target[2];
-    if (std::acos(std::max(-1.0f, std::min(1.0f, settled))) * 180.0f /
-            3.14159265358979323846f <
-        kPanelFollowSettleDegrees) {
-        for (int axis = 0; axis < 3; ++axis) direction_[axis] = target[axis];
-        following_ = false;
-    }
-}
-
-OverlayQuad PanelFollower::quad(const float eye[3], double yaw, double pitch) const {
+// The quad one latch produces: `kPanelDistanceMetres` along the pose's forward,
+// the plane parallel to that yaw/pitch, upright (no roll). The anchor stores
+// this and never recomputes it; this is the one place the geometry lives.
+OverlayQuad panel_quad_at(const float eye[3], double yaw, double pitch) {
     float forward[3];
     panel_forward(yaw, pitch, forward);
     // Upright without roll: world up (-y in scene axes) made perpendicular to
@@ -727,7 +737,7 @@ OverlayQuad PanelFollower::quad(const float eye[3], double yaw, double pitch) co
 
     OverlayQuad quad;
     for (int axis = 0; axis < 3; ++axis) {
-        quad.center[axis] = eye[axis] + direction_[axis] * distance;
+        quad.center[axis] = eye[axis] + forward[axis] * kPanelDistanceMetres;
         quad.right[axis] = right[axis];
         quad.up[axis] = up[axis];
     }
@@ -735,6 +745,14 @@ OverlayQuad PanelFollower::quad(const float eye[3], double yaw, double pitch) co
     quad.height = 0.7875f;
     return quad;
 }
+
+}  // namespace
+
+void PanelAnchor::latch(const float eye[3], double yaw, double pitch) {
+    quad_ = panel_quad_at(eye, yaw, pitch);
+    latched_ = true;
+}
+
 
 void HmdView::reset_scene_adjust() {
     state_.set_world_scale(initial_scale_);

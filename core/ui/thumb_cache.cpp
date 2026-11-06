@@ -35,6 +35,7 @@ void ThumbCache::request(const std::string& key, Loader loader) {
         if (queue_.size() >= max_queue_) return;
         queue_.push_back(Job{key, std::move(loader)});
         inflight_.insert(key);
+        discard_.erase(key);   // this request wants the result, unlike the old one
         trim_locked();
     }
     wake_.notify_one();
@@ -53,6 +54,20 @@ const UiImage* ThumbCache::get(const std::string& key) const {
     return &cache_.find(key)->second.image;
 }
 
+void ThumbCache::forget(const std::string& key) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = cache_.find(key);
+    if (found != cache_.end()) {
+        lru_.erase(found->second.lru);
+        cache_.erase(found);
+    }
+    failed_.erase(key);
+    // A load already decoding this file may finish after the file changed; its
+    // image is the old one, so it is dropped when it arrives.
+    if (inflight_.find(key) != inflight_.end()) discard_.insert(key);
+}
+
 bool ThumbCache::pending() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return busy_ || !queue_.empty();
@@ -61,6 +76,11 @@ bool ThumbCache::pending() const {
 std::size_t ThumbCache::size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return cache_.size();
+}
+
+std::size_t ThumbCache::loads() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return loads_;
 }
 
 void ThumbCache::touch_locked(const std::string& key) const {
@@ -91,7 +111,13 @@ void ThumbCache::worker() {
 
         Result<UiImage> loaded = Result<UiImage>::failure("no loader");
         try {
-            if (job.loader) loaded = job.loader();
+            if (job.loader) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ++loads_;
+                }
+                loaded = job.loader();
+            }
         } catch (...) {
             loaded = Result<UiImage>::failure("thumbnail loader threw");
         }
@@ -100,6 +126,11 @@ void ThumbCache::worker() {
             std::lock_guard<std::mutex> lock(mutex_);
             busy_ = false;
             inflight_.erase(job.key);
+            if (discard_.erase(job.key) != 0) {
+                // forget() ran while this load was in flight: the file has
+                // changed under it, so its image (or failure) is stale.
+                continue;
+            }
             if (loaded.ok()) {
                 UiImage image = loaded.take();
                 const auto found = cache_.find(job.key);

@@ -9,11 +9,14 @@
 #include "ui/screens/convert_dialog.h"
 #include "ui/screens/keyboard.h"
 #include "ui/screens/licence.h"
+#include "ui/screens/location_edit.h"
+#include "ui/screens/locations.h"
 #include "ui/screens/models.h"
 #include "ui/screens/photos.h"
 #include "ui/screens/queue.h"
 #include "ui/screens/scenes.h"
 #include "ui/screens/settings.h"
+#include "ui/screens/visible_folders.h"
 
 namespace splat {
 
@@ -28,6 +31,10 @@ void register_default_screens(ScreenRegistry& registry) {
     registry.add(ScreenId::AlbumPick, [] { return std::make_unique<AlbumPickScreen>(); });
     registry.add(ScreenId::Models, [] { return std::make_unique<ModelsScreen>(); });
     registry.add(ScreenId::Licence, [] { return std::make_unique<LicenceScreen>(); });
+    registry.add(ScreenId::Locations, [] { return std::make_unique<LocationsScreen>(); });
+    registry.add(ScreenId::LocationEdit, [] { return std::make_unique<LocationEditScreen>(); });
+    registry.add(ScreenId::VisibleFolders,
+                 [] { return std::make_unique<VisibleFoldersScreen>(); });
 }
 
 }  // namespace splat

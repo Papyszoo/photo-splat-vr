@@ -39,6 +39,86 @@ target_include_directories(splat_core PUBLIC
 target_link_libraries(splat_core PUBLIC ggml splat_miniz)
 target_compile_definitions(splat_core PUBLIC SPLAT_VERSION="${PROJECT_VERSION}")
 
+# --- zstd, decompression only (L2-A) ---------------------------------------
+# spz v4 stores one zstd frame per attribute stream. The submodule is vendored
+# whole but only its decompressor is compiled (third_party/zstd_sources.cmake),
+# so the payload never carries a compressor it cannot use. A tree without the
+# submodule still builds and reports that spz v4 is not supported.
+if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/zstd/lib/zstd.h")
+    set(SPLAT_ZSTD_DIR "${PROJECT_SOURCE_DIR}/third_party/zstd")
+    include("${PROJECT_SOURCE_DIR}/third_party/zstd_sources.cmake")
+    add_library(splat_zstd STATIC ${SPLAT_ZSTD_SOURCES})
+    target_include_directories(splat_zstd PUBLIC "${SPLAT_ZSTD_DIR}/lib")
+    target_compile_definitions(splat_zstd PUBLIC
+        ZSTD_LEGACY_SUPPORT=0
+        ZSTD_MULTITHREAD=0
+        ZSTD_DISABLE_ASM=1
+        # The tracing hooks are weak undefined symbols; a PS5 title may export
+        # nothing, and the console link refuses them.
+        ZSTD_TRACE=0)
+    target_link_libraries(splat_core PUBLIC splat_zstd)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_ZSTD=1)
+endif()
+
+# --- image codecs (L1-B1) --------------------------------------------------
+# WebP and TIFF are configured by the top-level CMakeLists.txt; link them only
+# when the subprojects really produced their targets, so a tree in which one of
+# them did not configure still builds (the decoders then report "support is not
+# built into this version" and can_test skips those cases).
+if(TARGET webp)
+    target_link_libraries(splat_core PUBLIC webp)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_WEBP=1)
+endif()
+if(TARGET tiff)
+    target_link_libraries(splat_core PUBLIC tiff)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_TIFF=1)
+endif()
+# HEIF/AVIF: the three archives from the codec prefix (see the top-level
+# CMakeLists.txt), linked by path so the imported config's absolute paths and
+# its AOM::aom dependency never leak into the title link.
+if(SPLAT_HAVE_HEIF)
+    target_include_directories(splat_core PUBLIC "${LIBHEIF_INCLUDE_DIR}")
+    target_link_libraries(splat_core PUBLIC "${LIBHEIF_LIBRARY}" "${LIBDE265_LIBRARY}"
+                                          "${LIBAOM_LIBRARY}")
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_HEIF=1)
+endif()
+
+# --- SMB through libsmb2 (L3-B) --------------------------------------------
+# Linked when the subproject configured; a tree without the submodule still
+# builds and core/vfs/location.cpp reports every SMB location offline. The
+# adapters are compiled only when the header is there as well (core/CMakeLists
+# globs every .cpp, so the guard is the compile definition the sources use).
+if(TARGET smb2)
+    target_link_libraries(splat_core PUBLIC smb2)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_SMB2=1)
+endif()
+
+# --- NFS through libnfs (L4) -----------------------------------------------
+# Linked when the subproject configured; a tree without the submodule still
+# builds and core/vfs/nfs.cpp reports every NFS location offline.
+if(TARGET nfs)
+    target_link_libraries(splat_core PUBLIC nfs)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_NFS=1)
+endif()
+
+# --- RAW through LibRaw (L1-C) ---------------------------------------------
+# LibRaw has no CMake project: third_party/libraw_sources.cmake lists its
+# sources once, and this target compiles them with -DLIBRAW_NOTHREADS and
+# without USE_ZLIB/USE_JPEG/USE_LCMS (the payload SDK has none of them, and the
+# RAW path never writes a file). A tree without the submodule still builds and
+# reports that RAW support is not in.
+if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/libraw/buildfiles/libraw.pro")
+    set(SPLAT_LIBRAW_DIR "${PROJECT_SOURCE_DIR}/third_party/libraw")
+    include("${PROJECT_SOURCE_DIR}/third_party/libraw_sources.cmake")
+    add_library(splat_libraw STATIC ${SPLAT_LIBRAW_SOURCES})
+    # LibRaw's headers are included as <libraw/libraw.h>, so the tree root is
+    # the include directory.
+    target_include_directories(splat_libraw PUBLIC "${SPLAT_LIBRAW_DIR}")
+    target_compile_definitions(splat_libraw PUBLIC LIBRAW_NOTHREADS)
+    target_link_libraries(splat_core PUBLIC splat_libraw)
+    target_compile_definitions(splat_core PUBLIC SPLAT_HAVE_RAW=1)
+endif()
+
 # Shaders -> SPIR-V. Every .comp/.vert/.frag under render/shaders is compiled
 # into ${CMAKE_BINARY_DIR}/shaders/<name>.spv.
 set(SPLAT_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders" CACHE PATH "Compiled SPIR-V directory")

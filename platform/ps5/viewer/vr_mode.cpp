@@ -43,24 +43,32 @@
 // scePad for the same user the Hmd2 session uses (hmd2::user_id()): Options opens
 // the panel (on the DualSense or the right Sense controller; the panel's Quit
 // item ends the session), L1/R1 step through the scenes, L2/R2 grow/shrink the
-// scene about the cone pivot (Front: 5th-percentile depth, the default; Centre:
-// median with a 0.5 m near guard; the viewer never moves), the left stick walks
+// scene about the cone pivot (Capture: the photo's capture point, the default;
+// Front: 5th-percentile depth; Centre: median with a 0.5 m near guard; the
+// viewer never moves), the left stick walks
 // and the right stick rises and turns (the sticks move the viewer, i.e. the
 // world moves the other way), and Cross held for one second recentres (a short
 // press does nothing, and R3 does nothing; the hold's progress is on the
 // head-locked overlay). The stick speeds come from Settings (2.5 m/s and
-// 40 deg/s by default) and ease in/out over 150 ms. Create does nothing, on
+// 40 deg/s by default) and ease in/out over 150 ms. The D-pad and Square have no
+// scene action: the viewer has no rotation to change or save, and a scene is
+// turned on its file entry in the panel (L3/R3, DECISIONS.md "Change
+// 2026-11-05"); a grown, shrunk or moved scene is not saved either: scale and
+// offset belong to the session. Create does nothing, on
 // either device. All three go through one action/analogue table (pad_input.h);
 // any of them can trigger an action and each is optional.
 //
-// W16/VR8: the panel is the TV's panel (ui_setup.h: the same UiApp and UiHost the
-// TV path builds). In VR it is a lazy follower (hmd_view.h PanelFollower): a
-// quad 1.6 m ahead, parallel to the view plane (yaw and pitch, never roll), that
-// re-centres over ~0.3 s once the head has turned ~17 deg away. The old
-// world-locked, yaw-only plane was the keystoned panel of the 2026-10-27
-// recording. While it is up the scene keeps rendering behind it and the scene's
-// own controls (Cross hold, sticks, L2/R2, L1/R1) are suspended; the panel reads
-// the same button word and left stick through pad::ui_actions_for (ui_mode.h).
+// W16/VR8/U2: the panel is the TV's panel (ui_setup.h: the same UiApp and UiHost
+// the TV path builds). In VR it is a world-fixed window (hmd_view.h
+// PanelAnchor): a quad 1.6 m ahead of the pose it opened from, parallel to that
+// pose's view plane (yaw and pitch, never roll), left exactly where it opened
+// while the head moves. It does not follow the head: the follower re-centred
+// itself constantly and the PSVR2's small sweet spot made that unreadable
+// (DECISIONS.md 2026-11-06). Cross held 1 s with the panel open re-latches the
+// window in front of the user; a Cross tap is still the panel's Select. While it
+// is up the scene keeps rendering behind it and the scene's own controls (Cross
+// hold, sticks, L2/R2, L1/R1) are suspended; the panel reads the same button
+// word and left stick through pad::ui_actions_for (ui_mode.h).
 // The menu's ViewScene loads the album's scene through the preload/switch path
 // below (scene_switch.h) and makes that album the L1/R1 playlist; Quit ends the
 // session through the normal teardown. Settings (Comfort/Display) writes
@@ -106,6 +114,7 @@
 #include <vector>
 
 #include "gallery/gallery.h"
+#include "gallery/visibility.h"
 #include "render/grab.h"
 #include "render/hmd_view.h"
 #include "render/overlay_hud.h"
@@ -117,7 +126,9 @@
 #include "render/vulkan_context.h"
 #include "scene/psplat.h"
 #include "scene/scene_folder.h"
+#include "scene/scene_view.h"
 #include "ui/pointer.h"
+#include "ui/pointer_mode.h"
 
 #include "../hmd2/hmd2.h"
 
@@ -224,32 +235,27 @@ constexpr double kScaleMaxHeadDegreesPerSecond = 60.0;
 constexpr double kScaleMarkerMs = 500.0;
 constexpr float kScaleVignetteStrength = 0.35f;
 
-// Settings -> Comfort -> Scale (UiState::scale_around): 0 front, 1 centre,
-// 2 maquette (the default). One mapping for the log, the readout and the press.
-splat::ScalePivotMode pivot_mode_from_setting(int scale_around) {
-    if (scale_around == 0) return splat::ScalePivotMode::front;
-    if (scale_around == 1) return splat::ScalePivotMode::centre;
-    return splat::ScalePivotMode::maquette;
-}
 const char* pivot_mode_name(splat::ScalePivotMode mode) {
     switch (mode) {
         case splat::ScalePivotMode::front: return "front";
         case splat::ScalePivotMode::centre: return "centre";
-        case splat::ScalePivotMode::maquette: return "maquette";
+        case splat::ScalePivotMode::maquette: return "centre";
+        case splat::ScalePivotMode::capture: return "capture";
     }
-    return "maquette";
+    return "capture";
 }
 
 // The HUD's scale line, padded to kScaleHudChars so the mask keeps one size.
-// Maquette's wording is the headset-test-6 readout ("Maquette 0.08x"); the
-// front/centre modes keep the VR8 "Scale 1.6x - front" line.
+// Both in-place modes need two decimals: a large scene goes below 0.1x.
 std::string scale_readout_text(splat::ScalePivotMode mode, float scale) {
     char text[splat::kScaleHudChars + 1];
-    if (mode == splat::ScalePivotMode::maquette) {
-        std::snprintf(text, sizeof text, "Maquette %.2fx", static_cast<double>(scale));
+    if (mode == splat::ScalePivotMode::capture) {
+        std::snprintf(text, sizeof text, "Capture %.2fx", static_cast<double>(scale));
+    } else if (mode == splat::ScalePivotMode::centre ||
+               mode == splat::ScalePivotMode::maquette) {
+        std::snprintf(text, sizeof text, "Centre %.2fx", static_cast<double>(scale));
     } else {
-        std::snprintf(text, sizeof text, "Scale %.1fx - %s", static_cast<double>(scale),
-                      pivot_mode_name(mode));
+        std::snprintf(text, sizeof text, "Front %.2fx", static_cast<double>(scale));
     }
     std::string out(text);
     out.resize(splat::kScaleHudChars, ' ');
@@ -1186,9 +1192,10 @@ int run_vr(const VrOptions& options) {
     loaded.scene = splat::SplatScene{};
     if (boot_has_scene) {
         line("viewer: vr scene centre %.2f m ahead on the capture camera axis, near content %.2f m "
-             "(scale: the maquette - Settings > Scale - lands the cone's median centre on a table "
-             "point 0.7 m ahead / 0.35 m below the eyes and scales there; Front keeps the "
-             "5th-percentile depth put, Centre the median; L2/R2 never move the viewer)",
+             "(scale: Capture is the default - it zooms about the photo's capture point, so the "
+             "image at rest is unchanged, down to 0.001x; Settings > Comfort > Scale also offers "
+             "Centre (the visible middle fixed) and Front (the 5th-percentile depth fixed); "
+             "L2/R2 never move the viewer)",
              static_cast<double>(first_depths.median), static_cast<double>(first_depths.near));
     }
 
@@ -1213,7 +1220,8 @@ int run_vr(const VrOptions& options) {
     if (panel_available) {
         ui_runtime = std::make_unique<viewer::UiRuntime>(viewer::make_ui_runtime(ui_options));
         // The eye intrinsics are passed for symmetry with the TV path; the VR
-        // quad only uses the pose (render/ui_panel.h vr_panel_quad).
+        // quad is the world-fixed anchor (render/hmd_view.h PanelAnchor), which
+        // only uses the pose.
         if (!ui_runtime->start(*renderer, viewer::UiHost::Mode::Vr, renderer_options.intrinsics)) {
             panel_error = ui_runtime->last_error();
             ui_runtime.reset();
@@ -1228,7 +1236,8 @@ int run_vr(const VrOptions& options) {
     const bool boot_open_panel = ui_options.ui || !boot_has_scene || options.scene.empty();
     viewer::PanelMode panel(panel_available, panel_available && boot_open_panel);
     if (ui_runtime != nullptr) {
-        line("viewer: vr ui: panel %s (UI %s, %s); Options opens and closes it, Quit is its last "
+        line("viewer: vr ui: panel %s (UI %s, %s); Options opens and closes it, Cross 1 s "
+             "recentres the window while it is open, Quit is its last "
              "item%s",
              panel.open() ? "open at boot" : "available",
              ui_options.ui_given ? (ui_options.ui ? "=1" : "=0") : "not set, VR default",
@@ -1308,11 +1317,83 @@ int run_vr(const VrOptions& options) {
             : &default_settings;
     splat::HmdView headset;
     headset.set_comfort_radius(options.comfort_radius);
+    headset.set_scale_pivot_mode(splat::pivot_mode_from_setting(settings->scale_around));
     headset.set_world_scale(options.world_scale);
     headset.set_median_depth(first_depths.median);
     headset.set_near_depth(first_depths.near);
     headset.set_pivot_samples(std::move(first_depths.samples));
-    headset.set_scale_pivot_mode(pivot_mode_from_setting(settings->scale_around));
+
+    // ---- the scene's stored scale (v0.2 RC) --------------------------------
+    // The viewer has no scene rotation to change or save (DECISIONS.md,
+    // "Change 2026-11-05"). An imported scene's own scale is still stored with
+    // the scene (meta.json's "view"."scale"); <state>/views.json is the fallback
+    // for a folder that refuses the write, keyed by location id + path for a
+    // network scene. The boot scene's scale is applied here, before the first
+    // placed frame; every scene switch applies its own in apply_switch().
+    splat::SceneViewStore view_store{splat::Path(data_path("state"))};
+    // `scale_dirty`: this session changed an imported scene's own scale and the
+    // folder has not taken it yet. A converted scene has no scale to store, so
+    // its session scale never makes the view dirty.
+    bool scale_dirty = false;
+    // A grab that scaled the scene releases repeatedly; at most one save a
+    // second.
+    double next_grab_save_ms = 0.0;
+    // True when the scene on screen is an imported one: only then does save()
+    // persist the scale (scene_view.h, SceneViewStore::persists_scale).
+    bool scene_stores_scale = false;
+    bool scene_imported = false;
+    auto load_view = [&](const splat::Path& folder, bool keep_scale) {
+        // One read of meta.json answers both questions: the stored scale and
+        // whether this is an import (a converted scene on a share must not pay
+        // two blocking round-trips).
+        const splat::Result<splat::SceneView> view = view_store.load(folder, &scene_imported);
+        if (!view.ok()) {
+            line("viewer: vr view: %s; the scene opens at the session scale",
+                 view.message().c_str());
+        }
+        const splat::SceneView stored = view.value_or(splat::SceneView{});
+        // A stored scale (an imported scene's) wins over the session's; a scene
+        // without one keeps the placement, as every converted scene does.
+        // `keep_scale` is the same rule for a scale this session has already
+        // changed and not yet written.
+        if (!keep_scale && splat::scene_view_has_scale(stored)) {
+            headset.set_world_scale(stored.scale);
+        }
+        scene_stores_scale = scene_imported;
+        // The Scenes shelf refuses to turn the scene the viewer holds; the host
+        // is the only place that knows which folder that is.
+        if (ui_runtime != nullptr) {
+            ui_runtime->services.open_scene = folder;
+            // The runner checks the same rule from its own thread (a turn may
+            // have been queued before the scene was opened).
+            if (ui_runtime->services.jobs != nullptr) {
+                ui_runtime->services.jobs->set_open_scene(folder);
+            }
+        }
+        if (!keep_scale) scale_dirty = false;
+    };
+    auto save_view = [&](const char* why) {
+        if (scenes.empty() || !scene_stores_scale) return;
+        // Only an imported scene stores its own scale; a converted scene keeps
+        // the session's.
+        splat::SceneView view;
+        view.scale = headset.world_scale();
+        bool local_only = false;
+        const splat::Status status = view_store.save(scenes.current().folder, view, &local_only);
+        if (!status.ok()) {
+            // Keep the flag: a save point that failed must be retried by the
+            // next one (a scene switch, the panel's resume, quit), not dropped.
+            line("viewer: vr view: save on %s failed (%s): %s", why,
+                 scenes.current().folder.filename().string().c_str(), status.message().c_str());
+            return;
+        }
+        scale_dirty = false;
+        if (local_only) {
+            line("viewer: scale saved on this console only (%s: the scene folder took no write)",
+                 why);
+        }
+    };
+    if (boot_has_scene) load_view(scenes.current().folder, false);
 
     // One warm-up frame before the headset is waited for: the pipeline compile
     // (ACO, seconds on a cold cache) must not happen in the first frame the
@@ -1344,10 +1425,11 @@ int run_vr(const VrOptions& options) {
     line("viewer: vr input: Options opens the menu (DualSense or right Sense; its Quit item ends "
          "the session), hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
          "scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene: by default "
-         "the maquette lands on a table 0.7 m ahead and scales there (Settings > Scale), left "
-         "stick walks "
-         "(forward/back, right/left), right stick rises and turns right; Create does nothing, one "
-         "table for all pads");
+         "Capture zooms about the photo's capture point (Settings > Scale can pick Front or "
+         "Centre), left stick walks "
+         "(forward/back, right/left), right stick rises and turns right; the D-pad and Square have "
+         "no scene action (the viewer has no rotation; turn a scene with L3/R3 on its panel "
+         "entry); Create does nothing, one table for all pads");
 
     // ---- the frame loop ---------------------------------------------------
     // One loop for the whole session, in two phases. Until Hmd2 reports the
@@ -1418,7 +1500,7 @@ int run_vr(const VrOptions& options) {
     double scale_marker_until = 0.0;
     float scale_vignette = 0.0f;
     std::string scale_text =
-        scale_readout_text(headset.scale_pivot_mode(), headset.world_scale());
+        scale_readout_text(headset.scale_pivot_mode(), headset.hud_scale());
 
     // The solid texture the label plate and every HUD bar share.
     {
@@ -1564,12 +1646,14 @@ int run_vr(const VrOptions& options) {
     // scale and offset, plus whatever HUD is up this frame, plus the panel when
     // it is visible (W16: the same UiHost quads the TV merges). Called once per
     // frame while something moves, a HUD element is visible, or the panel is
-    // visible - its lazy follower rebuilds the quads every frame
+    // visible - the panel's quads are rebuilt from its world anchor every frame
     // (overlay_refresh.h); the vertex buffer is rewritten in place, so this is
     // a memcpy of a few tens of floating-point values.
     auto update_overlay = [&](const splat::FrameView& view, double now) {
         const bool hud_visible = hold_progress >= 0.0f || now < scale_hint_until;
-        const bool marker_visible = now < scale_marker_until && marker_texture != UINT32_MAX;
+        const bool marker_visible = now < scale_marker_until &&
+                                 marker_texture != UINT32_MAX &&
+                                 headset.scale_pivot_mode() != splat::ScalePivotMode::capture;
         const bool ui_visible = ui_runtime != nullptr && ui_runtime->host->visible();
         const bool ui_changed = ui_visible != overlay_ui;
         const bool marker_changed = marker_visible != overlay_marker;
@@ -1579,8 +1663,10 @@ int run_vr(const VrOptions& options) {
                            offset[1] != overlay_offset[1] || offset[2] != overlay_offset[2];
         // `hud_shown` is the previous frame's state: the frame the last HUD
         // element disappears still has to rebuild the list without it. A visible
-        // panel is live - its quads follow the head every frame - so it is
-        // pushed every frame, not only on the frame it opens and closes.
+        // panel is not a static list either - its quads come from the world
+        // anchor, and the Cross hold recentre moves that anchor with no other
+        // edge on that frame - so it is pushed every frame, not only on the
+        // frame it opens and closes.
         const viewer::OverlayRefresh refresh{ui_visible, hud_visible, hud_shown, moved,
                                              overlay_dirty, ui_changed, marker_changed};
         if (!viewer::overlay_needs_update(refresh)) return;
@@ -1669,6 +1755,25 @@ int run_vr(const VrOptions& options) {
     VrSwitchSlot switch_slot(*renderer, scenes);
     switch_slot.on_load = [&](const splat::LoadedScene& next) { note_intrinsics(next); };
 
+    // Stage H: the visible-folders policy from the host's side. A hidden scene
+    // is dropped (the panel stays, the picture does not) and ResumeScene /
+    // OpenPath refuse one before loading it.
+    auto scene_allowed = [&](const splat::Path& folder) {
+        return folder.empty() || splat::current_visibility()->allows_scene_folder(folder);
+    };
+    auto clear_hidden_scene = [&]() {
+        switch_slot.reset();
+        scenes = splat::ScenePlaylist{};
+        renderer->clear_scene();
+        if (ui_runtime != nullptr) {
+            ui_runtime->app->set_scene_loaded(false);
+            ui_runtime->services.open_scene.clear();
+            if (ui_runtime->services.jobs != nullptr) {
+                ui_runtime->services.jobs->set_open_scene(splat::Path());
+            }
+        }
+    };
+
     // Everything after a successful switch: its log lines, the new scene's two
     // depth measures and its label. Shared by L1/R1 (over switch_slot) and the
     // panel's ViewScene, which stages the album's scene through a slot of its own
@@ -1702,12 +1807,15 @@ int run_vr(const VrOptions& options) {
         headset.set_median_depth(median_depth);
         headset.set_near_depth(slot.applied_near_depth());
         headset.set_pivot_samples(slot.applied_pivot_samples());
+        // The new scene's own stored view (its scale; the viewer has no
+        // rotation) is applied to the placement the switch keeps.
+        load_view(scenes.entry(index).folder, false);
         line("viewer: vr scene %zu/%zu %s: %u splats, last frame held during the switch, "
              "placement kept (anchor %.2f %.2f %.2f m, scale %.2fx, scene centre %.2f m, near "
              "content %.2f m)",
              index + 1, scenes.size(), current_folder().c_str(), renderer->scene_count(),
              static_cast<double>(headset.anchor()[0]), static_cast<double>(headset.anchor()[1]),
-             static_cast<double>(headset.anchor()[2]), static_cast<double>(headset.world_scale()),
+             static_cast<double>(headset.anchor()[2]), static_cast<double>(headset.hud_scale()),
              static_cast<double>(median_depth), static_cast<double>(slot.applied_near_depth()));
         refresh_label(index);
     };
@@ -1731,6 +1839,9 @@ int run_vr(const VrOptions& options) {
             line("viewer: vr scene switch waits for the model load to finish");
             return false;
         }
+        // The outgoing scene's own scale is stored before it leaves the screen
+        // (a grab saves its own release, this catches anything else).
+        if (scale_dirty) save_view("scene switch");
         const double started = now_ms();
         const viewer::SwitchReport report = viewer::switch_scene(switch_slot, index);
         if (!report.switched) return false;
@@ -1778,12 +1889,14 @@ int run_vr(const VrOptions& options) {
     // runs as for SECONDS and the quit file (W16).
     bool panel_quit = false;
     double next_quit_check = 0.0;
-    // W25: the Sense right controller's laser. `pointer_filter` smooths the
-    // panel pixel the ray hits; `pointer_r2_down` is the previous frame's
-    // trigger state for the rising edge; `pointer_registered` is the one-time
-    // VrTracker2 registration (the pad handle is the tracker handle).
+    // W25/U3: the Sense right controller's laser. `pointer_filter` smooths the
+    // panel pixel the ray hits; `pointer_mode` (ui/pointer_mode.h) decides
+    // whether this frame's ray exists at all - R2 arms it, any d-pad/stick
+    // direction turns it off again, and a closed panel always starts off;
+    // `pointer_registered` is the one-time VrTracker2 registration (the pad
+    // handle is the tracker handle).
     splat::PointerFilter pointer_filter;
-    bool pointer_r2_down = false;
+    splat::PointerMode pointer_mode;
     bool pointer_registered = false;
     bool pointer_register_failed_logged = false;
     double next_pointer_log = 0.0;
@@ -1792,6 +1905,11 @@ int run_vr(const VrOptions& options) {
     // are logged as events. `placement_wait` is the first placement's gate
     // (hmd_view.h): worn + tracked + no tracker jump for half a second.
     pad::RecentreHold recentre_hold;
+    // U2: Cross inside the open panel resolves on release - a tap is one Select,
+    // a 1 s hold recentres the window (pad_input.h TapHold). Reset on the
+    // panel's open/close edge, so a press cannot straddle it.
+    pad::TapHold panel_tap;
+    bool panel_tap_open = false;
     splat::PlacementWait placement_wait;
     double last_input_ms = now_ms();
     bool scale_gesture = false;
@@ -1830,7 +1948,7 @@ int run_vr(const VrOptions& options) {
         pose_log.row((now_ms() - session_started) / 1000.0, counters.frames, last_raw.head,
                      headset.view_yaw() * kRadToDeg, headset.scene_pitch() * kRadToDeg,
                      headset.scene_roll() * kRadToDeg, dualsense.buttons(), sense_left.buttons(),
-                     sense_right.buttons(), log_actions, headset.world_scale(),
+                     sense_right.buttons(), log_actions, headset.hud_scale(),
                      headset.scene_offset(), headset.scene_turn() * kRadToDeg,
                      pad::logged_hold_progress(hold_progress), current_folder().c_str(), event);
     };
@@ -1846,7 +1964,7 @@ int run_vr(const VrOptions& options) {
         const double removed_yaw = headset.view_yaw() * kRadToDeg;
         headset.recentre_here();
         headset.reset_scene_adjust();
-        set_scale_text(headset.world_scale());
+        set_scale_text(headset.hud_scale());
         overlay_dirty = true;
         return removed_yaw;
     };
@@ -1979,7 +2097,7 @@ int run_vr(const VrOptions& options) {
         // The Settings values are read every frame; the mode and rates apply to
         // the next press / stick frame without a restart.
         const splat::ScalePivotMode pivot_mode =
-            pivot_mode_from_setting(settings->scale_around);
+            splat::pivot_mode_from_setting(settings->scale_around);
         headset.set_scale_pivot_mode(pivot_mode);
         renderer->set_low_pass_eps(settings->edge_softness);
 
@@ -2061,9 +2179,13 @@ int run_vr(const VrOptions& options) {
                     const splat::ViewerAdjust wanted = splat::viewer_adjust(after, head_placement);
                     if (wanted.scale != adjust.scale && adjust.scale > 0.0f) {
                         headset.scale_scene(wanted.scale / adjust.scale);
-                        set_scale_text(headset.world_scale());
+                        set_scale_text(headset.hud_scale());
                         scale_hint_until = now_loop + kScaleHintMs;
+                        if (scene_stores_scale) scale_dirty = true;
                     }
+                    // A hand that turns the wrist still turns the scene
+                    // left/right (the same heading the sticks use); pitch and
+                    // roll are not part of the viewer's transform.
                     if (wanted.turn != adjust.turn) {
                         headset.turn_scene(wanted.turn - adjust.turn);
                     }
@@ -2093,7 +2215,7 @@ int run_vr(const VrOptions& options) {
                          hands[0].grabbing && hands[1].grabbing
                              ? "both hands"
                              : (hands[0].grabbing ? "left hand" : "right hand"),
-                         static_cast<double>(headset.world_scale()));
+                         static_cast<double>(headset.hud_scale()));
                 } else if (!grabbing_now && grab_gesture) {
                     grab_gesture = false;
                     // The grab's own scaling went through scale_scene(), which
@@ -2105,10 +2227,16 @@ int run_vr(const VrOptions& options) {
                     std::snprintf(log_event, sizeof log_event, "%s", "grab end");
                     line("viewer: grab end: scale=%.2fx, offset %.2f %.2f %.2f m kept (the viewer "
                          "moved 0.00 m)",
-                         static_cast<double>(headset.world_scale()),
+                         static_cast<double>(headset.hud_scale()),
                          static_cast<double>(headset.scene_offset()[0]),
                          static_cast<double>(headset.scene_offset()[1]),
                          static_cast<double>(headset.scene_offset()[2]));
+                    // A grab may have scaled an imported scene: release is a
+                    // save point, debounced to one write a second.
+                    if (scale_dirty && now_loop >= next_grab_save_ms) {
+                        next_grab_save_ms = now_loop + 1000.0;
+                        save_view("grab release");
+                    }
                 }
                 // A grip released inside the tap window with the hand still
                 // was a tap, not a grab: the grab's own tiny delta has been
@@ -2124,8 +2252,11 @@ int run_vr(const VrOptions& options) {
                 }
             }
 
-            // Cross held for one second recentres. A short press and R3 do
-            // nothing; releasing early cancels. The HUD bar follows progress.
+            // Cross held for one second recentres the *scene*; this block only
+            // runs with the panel closed (route.scene_controls), so the same
+            // button is the panel's Select/recentre while it is up. A short
+            // press and R3 do nothing; releasing early cancels. The HUD bar
+            // follows progress.
             const pad::RecentreHold::Step hold =
                 recentre_hold.update((held_buttons & pad::kCross) != 0,
                                      (now_loop - session_started) / 1000.0);
@@ -2137,9 +2268,9 @@ int run_vr(const VrOptions& options) {
                 log_actions |= pad::kRecentre;
                 std::snprintf(log_event, sizeof log_event, "%s", "recentre");
                 line("viewer: vr recentred: Cross held %.1f s, capture camera placed at the head "
-                     "(%.1f deg of yaw removed), scale reset to %.2fx, offset and turn cleared",
+                     "(%.1f deg of yaw removed), scale reset to %.2fx, offset and rotation cleared",
                      hold.held_seconds, removed_yaw,
-                     static_cast<double>(headset.world_scale()));
+                     static_cast<double>(headset.hud_scale()));
             } else if (hold.cancelled) {
                 line("viewer: vr recentre cancelled: Cross released after %.0f ms (a short press "
                      "does nothing)",
@@ -2151,6 +2282,10 @@ int run_vr(const VrOptions& options) {
             if (recentre_hold.active()) {
                 hold_progress = recentre_hold.progress();
             }
+
+            // The D-pad and Square have no scene action: the viewer has no
+            // rotation to change or save (DECISIONS.md, "Change 2026-11-05").
+            // Left/right turning stays on the right stick.
 
             // Sticks and triggers: L2/R2 scale the scene about a point fixed in
             // the frozen cone pivot, the left stick walks and the right stick
@@ -2173,46 +2308,36 @@ int run_vr(const VrOptions& options) {
                     line("viewer: vr scale start: %s from %.2fx about the %s pivot %.2f m ahead "
                          "(world %.2f %.2f %.2f m, cone near %.2f m; the viewer does not move)",
                          control.scale > 0.0f ? "R2" : "L2",
-                         static_cast<double>(headset.world_scale()),
+                         static_cast<double>(headset.hud_scale()),
                          pivot_mode_name(pivot_mode),
                          static_cast<double>(headset.scale_pivot_distance()),
                          static_cast<double>(pivot[0]), static_cast<double>(pivot[1]),
                          static_cast<double>(pivot[2]),
                          static_cast<double>(headset.scale_cone_near()));
-                    if (pivot_mode == splat::ScalePivotMode::maquette) {
-                        line("viewer: vr maquette: table %.2f %.2f %.2f m (%.0f cm ahead, %.0f cm "
-                             "below the eyes), content centre %.2f %.2f %.2f m, robust extent "
-                             "%.2f m, maquette scale %.3fx (the 5-95 box is %.2f m wide there)",
-                             static_cast<double>(headset.maquette_table()[0]),
-                             static_cast<double>(headset.maquette_table()[1]),
-                             static_cast<double>(headset.maquette_table()[2]),
-                             static_cast<double>(splat::kMaquetteTableForwardMetres) * 100.0,
-                             static_cast<double>(splat::kMaquetteTableBelowEyesMetres) * 100.0,
-                             static_cast<double>(headset.maquette_content_centre()[0]),
-                             static_cast<double>(headset.maquette_content_centre()[1]),
-                             static_cast<double>(headset.maquette_content_centre()[2]),
-                             static_cast<double>(headset.maquette_extent()),
-                             static_cast<double>(headset.maquette_scale()),
-                             static_cast<double>(headset.maquette_extent()) *
-                                 static_cast<double>(headset.maquette_scale()));
-                    }
                 }
                 headset.scale_scene(pad::scale_factor(
                                         control.scale, input_seconds,
                                         (now_loop - scale_gesture_started) / 1000.0),
                                     input_seconds);
+                // The Capture scale is the scene's own size on an imported
+                // scene (meta.json has "origin"): it is stored when the press
+                // ends and at every later save point (Quit included). A
+                // converted scene's size belongs to the session (Track R's scene
+                // switch keeps the placement), so the store ignores it and
+                // there is nothing to mark.
+                if (scene_stores_scale) scale_dirty = true;
                 scale_hint_until = now_loop + kScaleHintMs;
                 scale_marker_until = now_loop + kScaleMarkerMs;
-                set_scale_text(headset.world_scale());
+                set_scale_text(headset.hud_scale());
             } else if (scale_gesture) {
                 scale_gesture = false;
                 headset.end_scale_gesture();
                 scale_marker_until = now_loop + kScaleMarkerMs;
                 std::snprintf(log_event, sizeof log_event, "%s", "scale end");
-                line("viewer: vr scale end: %.2fx (range %.2f-%.2f, the %s pivot kept its place, "
+                line("viewer: vr scale end: %.3fx (range %.3f-%.1f, the %s scale, "
                      "the viewer moved 0.00 m)",
-                     static_cast<double>(headset.world_scale()),
-                     static_cast<double>(splat::kMinWorldScale),
+                     static_cast<double>(headset.hud_scale()),
+                     static_cast<double>(splat::kMinSceneScale),
                      static_cast<double>(splat::kMaxWorldScale), pivot_mode_name(pivot_mode));
             }
 
@@ -2270,7 +2395,7 @@ int run_vr(const VrOptions& options) {
                 scale_gesture = false;
                 headset.end_scale_gesture();
                 line("viewer: vr scale end: %.2fx (the menu suspended the scene controls)",
-                     static_cast<double>(headset.world_scale()));
+                     static_cast<double>(headset.hud_scale()));
             }
             if (move_gesture) {
                 move_gesture = false;
@@ -2290,7 +2415,7 @@ int run_vr(const VrOptions& options) {
                 grab_state.reset();
                 headset.end_scale_gesture();
                 line("viewer: grab end: scale=%.2fx (the menu suspended the scene controls)",
-                     static_cast<double>(headset.world_scale()));
+                     static_cast<double>(headset.hud_scale()));
             }
             service_preload();
         } else {
@@ -2362,6 +2487,10 @@ int run_vr(const VrOptions& options) {
             // left the photo to the user's right until they recentred.
             headset.update(tracked);
             const double removed_yaw = place_scene_at_head();
+            // Track R: the first placement is not a user recentre, so the
+            // scene's stored rotation is put back - the placement anchored the
+            // camera, and the scene stays the way the user left it.
+            if (!scenes.empty()) load_view(scenes.current().folder, false);
             placed = true;
             placed_at = now_ms();
             second_started = placed_at;
@@ -2374,7 +2503,7 @@ int run_vr(const VrOptions& options) {
                  "looking forward - the recentre path, %.1f deg of yaw removed, world scale %.2f), "
                  "ipd %.1f mm %s",
                  waited, static_cast<unsigned long long>(counters.wait_frames),
-                 settle.stable_seconds, removed_yaw, static_cast<double>(headset.world_scale()),
+                 settle.stable_seconds, removed_yaw, static_cast<double>(headset.hud_scale()),
                  headset.ipd() * 1000.0,
                  poses.left.tracked && poses.right.tracked ? "from the tracker's eye poses"
                                                            : "from the 63 mm default");
@@ -2396,31 +2525,75 @@ int run_vr(const VrOptions& options) {
         const splat::FrameView view = headset.frame();
         last_fade = view.comfort_fade;
 
-        // ---- the panel (W16, Sense pointer W25) -----------------------------
+        // ---- the panel (W16, Sense pointer W25, world-fixed window U2) --------
         // The host draws its canvas into the renderer's RGBA overlay texture
         // (only when it changed), and its quads are appended to the overlay below.
-        // The reference pose is latched on the frame the panel appears, so the
-        // quad is world-locked where the user opened it (UiHost, Mode::Vr:
-        // vr_panel_quad, yaw only, 1.6 m ahead).
+        // The window is world-fixed where it opened: UiHost latches its anchor
+        // (PanelAnchor, 1.6 m ahead, parallel to that pose's view plane) on the
+        // first visible frame and never moves it afterwards. Cross held 1 s with
+        // the panel open recentres it in front of the user; a Cross tap is still
+        // a Select.
         //
-        // The right Sense controller is the panel's laser: R2 past
-        // kPointerClickTrigger is a click on the pixel the ray hits. The trigger
-        // edge is tracked every frame, so a press held while the panel opens is
-        // not a click on its first frame; no controller pose (or no ray hit)
-        // leaves pointer_valid false, and the d-pad/stick path is untouched.
-        const bool pointer_trigger = sense_right.axes().r2 > kPointerClickTrigger;
-        const bool pointer_click_edge = pointer_trigger && !pointer_r2_down;
-        pointer_r2_down = pointer_trigger;
+        // The right Sense controller is the panel's laser, armed by R2 (U3).
+        // `pad::kR2` is one bit for the DualSense and the right Sense pad
+        // (pad_bits.h), and the analog read W25 used (past kPointerClickTrigger)
+        // stays as the same press for a Sense trigger whose digital bit is not
+        // proven on hardware. With the panel open the scene controls are
+        // suspended (route.scene_controls), so this R2 cannot scale anything;
+        // with the panel closed R2 is still the scene's scale trigger and the
+        // pointer mode ignores it (panel closed -> off).
+        const bool r2_down =
+            (held_buttons & pad::kR2) != 0 || sense_right.axes().r2 > kPointerClickTrigger;
         if (ui_runtime != nullptr) {
             viewer::UiHost& ui_host = *ui_runtime->host;
             if (ui_host.visible() != route.panel_visible) ui_host.set_visible(route.panel_visible);
-            // Advance the lazy follower once, before the pointer ray and the
-            // drawn quads, so both use the same panel this frame.
-            ui_host.update_panel(view.midpoint, input_seconds);
+            // Latch the window on its first visible frame (set_visible(true)
+            // cleared it); a latched window is never moved here.
+            ui_host.update_panel(view.midpoint);
+            // U3: one frame in the pointer mode, before the ray: the joystick
+            // drives the menu and the Sense pointer is off until R2 arms it.
+            // `route.ui_pressed`/`ui_held` already carry the d-pad and the left
+            // stick through pad::ui_actions_for (the one input map), so this is
+            // the same "direction" the screens see. The R2 that arms the ray
+            // is not the scene's scale trigger here: with the panel up the
+            // scene controls are suspended (route.scene_controls).
+            const splat::PointerMode::Step pointer = pointer_mode.update(
+                ui_host.visible(), route.ui_pressed, route.ui_held, r2_down);
+            if (pointer.turned_on) line("viewer: pointer on (R2); the ray is armed");
+            if (pointer.turned_off) {
+                line("viewer: pointer off (joystick); focus stays where the stick moved it");
+            }
             splat::UiInput input;
             input.pressed = route.ui_pressed;
             input.held = route.ui_held;
             input.dt = input_seconds;
+
+            // Cross is the panel's Select *and*, with the panel open, the
+            // window's recentre ("same button, context"). It resolves on
+            // release: released before 1 s it is one tap (one Select, injected
+            // below), held to the second it is one recentre and no Select - so
+            // a hold can never open the focused row first. While the press is
+            // unresolved Select is withheld from the panel entirely, which is
+            // why the same word cannot both act and be held.
+            if (ui_host.visible() != panel_tap_open) {
+                panel_tap_open = ui_host.visible();
+                panel_tap.reset();
+            }
+            const pad::TapHold::Step cross = panel_tap.update(
+                ui_host.visible() && (route.ui_held & splat::Select) != 0,
+                (now_loop - session_started) / 1000.0);
+            if (ui_host.visible()) {
+                if (cross.pending) {
+                    input.pressed &= ~splat::Select;
+                    input.held &= ~splat::Select;
+                }
+                if (cross.tap) input.pressed |= splat::Select;
+                if (cross.hold) {
+                    ui_host.recenter_panel(view.midpoint);
+                    line("viewer: vr panel recentred: Cross held %.1f s (window %.1f m ahead)",
+                         pad::kRecentreHoldSeconds, static_cast<double>(splat::kPanelDistanceMetres));
+                }
+            }
 
             if (ui_host.visible()) {
                 // VrTracker2 registration is per pad handle (the same handle
@@ -2445,7 +2618,12 @@ int run_vr(const VrOptions& options) {
                 std::optional<splat::PanelHit> hit;
                 float controller_pos[3] = {0.0f, 0.0f, 0.0f};
                 float controller_quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-                if (pointer_registered && last_raw.head.tracked &&
+                // U3: no ray while disarmed. No pose is read and no hit test
+                // runs, so there is no `pointer hit` line, and the filter is
+                // cleared so the ray's next arm starts where it points instead
+                // of gliding in from the pixel left armed.
+                if (!pointer.pointer) pointer_filter.reset();
+                if (pointer.pointer && pointer_registered && last_raw.head.tracked &&
                     hmd2::controller_pose(sense_right.handle(), controller_pos, controller_quat)) {
                     const splat::PointerRay ray = splat::controller_ray(
                         last_raw.head.position, last_raw.head.quaternion, controller_pos,
@@ -2455,13 +2633,16 @@ int run_vr(const VrOptions& options) {
                                                ui_host.canvas_width(), ui_host.canvas_height());
                 }
                 const std::optional<splat::PanelHit> filtered =
-                    pointer_filter.update(hit, input_seconds);
+                    pointer.pointer ? pointer_filter.update(hit, input_seconds) : std::nullopt;
                 if (filtered) {
                     input.pointer_valid = true;
                     input.px = filtered->x;
                     input.py = filtered->y;
                 }
-                input.click = pointer_click_edge && input.pointer_valid;
+                // A click is the R2 press edge the mode reported, and only with
+                // a ray hit; `pointer_down` is the drag level while armed.
+                input.click = pointer.click && input.pointer_valid;
+                input.pointer_down = pointer.down && input.pointer_valid;
                 if (filtered && now_loop >= next_pointer_log) {
                     next_pointer_log = now_loop + kPointerLogMs;
                     line("viewer: pointer hit %.0f %.0f", static_cast<double>(filtered->x),
@@ -2514,6 +2695,9 @@ int run_vr(const VrOptions& options) {
                         // The old album's forward preload is not this scene: drop
                         // it (and its index) before the probe takes the slot.
                         switch_slot.reset();
+                        // The album being left keeps its own scale; only this
+                        // session's own change needs writing.
+                        if (scale_dirty) save_view("scene switch");
                         const double started = now_ms();
                         const viewer::SwitchReport report =
                             viewer::switch_scene(probe, album.index());
@@ -2538,10 +2722,67 @@ int run_vr(const VrOptions& options) {
                         line("viewer: ui close");
                         break;
                     }
+                    case splat::UiCommand::OpenPath: {
+                        // L3: a scene on a network location. Read from where
+                        // it lies, as a one-entry playlist, through the VFS.
+                        line("viewer: ui command open_path");
+                        if (!splat::current_visibility()->allows_scene_path(command->path)) {
+                            // A stale path listed before the passcode was set.
+                            line("viewer: hidden scene refused");
+                            ui_runtime->app->toast("That scene is no longer visible");
+                            break;
+                        }
+                        if (scene_loads_paused()) {
+                            ui_runtime->app->toast("Converting... scene switch in a moment");
+                            break;
+                        }
+                        auto built = splat::ScenePlaylist::from_entries(
+                            {splat::PlaylistEntry{command->path.parent_path(), command->path}});
+                        if (!built.ok()) {
+                            ui_runtime->app->toast("No scene at " + command->path.string());
+                            break;
+                        }
+                        splat::ScenePlaylist album = built.take();
+                        VrSwitchSlot probe(*renderer, album);
+                        probe.on_load = [&](const splat::LoadedScene& next) {
+                            note_intrinsics(next);
+                        };
+                        switch_slot.reset();
+                        // The scene being left keeps its own scale too: the
+                        // same save ViewScene makes, so a scale this session
+                        // changed is not dropped when the panel opens a network
+                        // scene instead.
+                        if (scale_dirty) save_view("scene switch");
+                        const double started = now_ms();
+                        const viewer::SwitchReport report = viewer::switch_scene(probe, 0);
+                        if (!report.switched) {
+                            ui_runtime->app->toast("Cannot load " + command->path.string());
+                            line("viewer: FAIL open path %s",
+                                 command->path.string().c_str());
+                            break;
+                        }
+                        scenes = std::move(album);
+                        switch_slot.reset();
+                        apply_switch(0, probe, report, started);
+                        ui_runtime->app->set_scene_loaded(true);
+                        line("viewer: vr scene %s (opened from %s)", current_folder().c_str(),
+                             command->path.string().c_str());
+                        panel.close();
+                        ui_host.set_visible(false);
+                        break;
+                    }
                     case splat::UiCommand::ResumeScene:
                         // Options in the panel: back to the scene that is still
                         // loaded, with the menu where the user left it.
                         line("viewer: ui command resume_scene");
+                        // A scene the visible-folders policy hid while the panel
+                        // was open is closed instead of resumed.
+                        if (!scenes.empty() && !scene_allowed(scenes.current().folder)) {
+                            clear_hidden_scene();
+                            line("viewer: hidden scene refused");
+                            ui_runtime->app->toast("That scene is no longer visible");
+                            break;
+                        }
                         // With no scene loaded there is nothing to resume to: the
                         // menu stays up instead of leaving the user on the empty
                         // view with no way back except Options.
@@ -2553,7 +2794,22 @@ int run_vr(const VrOptions& options) {
                         panel.close();
                         ui_host.set_visible(false);
                         line("viewer: ui close");
+                        // The panel's Scenes screen may have turned the scene
+                        // on disk. This session has no rotation to re-read; a
+                        // scale this session changed is kept instead of the
+                        // stored one (keep_scale), so a scale press survives the
+                        // panel.
+                        if (!scenes.empty()) load_view(scenes.current().folder, scale_dirty);
                         break;
+                    case splat::UiCommand::HideScene: {
+                        // The owner changed the allow-list. Nothing survives in
+                        // the renderer: an empty view behind the panel is the
+                        // same state a fresh install boots into.
+                        if (scenes.empty() || scene_allowed(scenes.current().folder)) break;
+                        clear_hidden_scene();
+                        line("viewer: hidden scene closed");
+                        break;
+                    }
                     case splat::UiCommand::Quit:
                         // The one quit route a title has: LoadExec after this
                         // loop's teardown, as SECONDS and the quit file do.
@@ -2661,7 +2917,7 @@ int run_vr(const VrOptions& options) {
                  frames ? counters.copy_second / frames : 0.0,
                  frames ? (project_second + sort_second + draw_second) / frames : 0.0,
                  renderer->last_visible_count(), last_fade,
-                 static_cast<double>(headset.world_scale()), headset.ipd() * 1000.0,
+                 static_cast<double>(headset.hud_scale()), headset.ipd() * 1000.0,
                  static_cast<unsigned long long>(counters.slow_frames),
                  static_cast<unsigned long long>(counters.frames), missed_now,
                  static_cast<unsigned long long>(flip.shown), hmd2::repeated_frames(),
@@ -2702,6 +2958,11 @@ int run_vr(const VrOptions& options) {
             second_started = now;
         }
     }
+
+    // v0.2 RC: an imported scene's scale that no save point caught up with is
+    // stored here, on the one exit every path goes through (Quit, the quit file,
+    // SECONDS, a failure).
+    if (scale_dirty && !scenes.empty()) save_view("quit");
 
     const double run_s = (now_ms() - placed_at) / 1000.0;
     const hmd2::FlipInfo flip = hmd2::flip_status();

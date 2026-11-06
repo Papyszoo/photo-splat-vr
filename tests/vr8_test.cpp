@@ -1,7 +1,7 @@
-// VR8: scale pivots, the lazy VR panel and the persisted comfort/display
-// values. These are CPU-only (no Vulkan): the same HmdView and PanelFollower
-// code the console runs, driven with synthetic poses and a synthetic splat
-// cloud, so the geometry is checked on any desktop build.
+// VR8: scale pivots, the world-fixed VR panel anchor and the persisted
+// comfort/display values. These are CPU-only (no Vulkan): the same HmdView and
+// PanelAnchor code the console runs, driven with synthetic poses and a
+// synthetic splat cloud, so the geometry is checked on any desktop build.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -112,6 +112,21 @@ float dot3(const float a[3], const float b[3]) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
+void cross3(const float a[3], const float b[3], float out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+// The panel's forward as the renderer defines it for a pose (splat_renderer.cpp:
+// yaw about world y, then pitch), so a test can say where the window should sit.
+void pose_forward(double yaw, double pitch, float out[3]) {
+    const float cp = static_cast<float>(std::cos(pitch));
+    out[0] = static_cast<float>(std::sin(yaw)) * cp;
+    out[1] = static_cast<float>(std::sin(pitch));
+    out[2] = static_cast<float>(std::cos(yaw)) * cp;
+}
+
 }  // namespace
 
 TEST_CASE("vr8 front pivot is the 5th-percentile depth in the head cone") {
@@ -167,11 +182,12 @@ TEST_CASE("vr8 centre pivot stays inside the clamp when the cone is beyond 60 m"
     splat::HmdView view;
     REQUIRE(view.place(identity_head()));
     view.set_scale_pivot_mode(splat::ScalePivotMode::centre);
-    // A distant scene: p5 = 70 m, p50 = 85 m. The press must still run, with
-    // the pivot clamped to the 60 m ceiling.
+    // A distant scene: p5 = 70 m, content centre 85 m. The press must still
+    // run; the centre pivot is the 3D content centre, the near guard uses the
+    // clamped 60 m p5.
     view.set_pivot_samples(two_depth_cloud(70.0f, 100, 85.0f, 900));
     view.begin_scale_gesture();
-    CHECK(view.scale_pivot_distance() == doctest::Approx(60.0f));
+    CHECK(view.scale_pivot_distance() == doctest::Approx(85.0f));
     CHECK(view.scale_cone_near() == doctest::Approx(60.0f));
     view.scale_scene(1.5f);
     CHECK(view.world_scale() == doctest::Approx(1.5f).epsilon(1e-5));
@@ -198,9 +214,9 @@ TEST_CASE("vr8 the overlay is rebuilt every frame the panel is visible") {
     viewer::OverlayRefresh idle;
     CHECK_FALSE(viewer::overlay_needs_update(idle));
 
-    // The panel's lazy follower moves its quads every frame even though the
-    // scene, HUD, marker and textures are unchanged: without this term the
-    // drawn panel freezes at the pose the menu opened from.
+    // The panel's quads are rebuilt from the world anchor every frame, and the
+    // recentre frame has no other edge: without this term the drawn window
+    // stays at the old anchor while the pointer ray tests the new panel_quad().
     idle.panel_visible = true;
     CHECK(viewer::overlay_needs_update(idle));
 
@@ -223,7 +239,7 @@ TEST_CASE("vr8 the overlay is rebuilt every frame the panel is visible") {
     CHECK(viewer::overlay_needs_update(edges));
 }
 
-TEST_CASE("vr8 a scale press caps the dolly speed at 1.5 m/s") {
+TEST_CASE("vr8 a scale press caps the dolly speed at 4 m/s") {
     splat::HmdView view;
     REQUIRE(view.place(identity_head()));
     view.set_scale_pivot_mode(splat::ScalePivotMode::front);
@@ -232,41 +248,129 @@ TEST_CASE("vr8 a scale press caps the dolly speed at 1.5 m/s") {
     REQUIRE(view.scale_pivot_distance() == doctest::Approx(4.0f).epsilon(0.01));
     const double dt = 1.0 / 60.0;
     view.scale_scene(2.0f, dt);
-    // (f - 1) * D <= 1.5 * dt.
+    // (f - 1) * D <= 4 * dt.
     CHECK((view.world_scale() - 1.0f) * view.scale_pivot_distance() <=
-          1.5f * static_cast<float>(dt) + 1.0e-5f);
-    CHECK(view.world_scale() < 1.01f);
+          4.0f * static_cast<float>(dt) + 1.0e-5f);
+    CHECK(view.world_scale() < 1.02f);
 }
 
-TEST_CASE("vr8 the panel follows lazily and keeps a fixed distance") {
-    splat::PanelFollower panel;
-    panel.reset(0.0, 0.0);
-    CHECK(panel.direction()[2] == doctest::Approx(1.0f));
-    // A small head turn is inside the dead zone: the panel stays put.
-    panel.update(10.0 * kPi / 180.0, 0.0, 1.0 / 60.0);
-    CHECK(panel.direction()[2] == doctest::Approx(1.0f));
-    CHECK_FALSE(panel.following());
-    // A large turn re-centres; after ~0.3 s it is back in front.
-    const double yaw = 40.0 * kPi / 180.0;
-    panel.update(yaw, 0.0, 0.1);
-    CHECK(panel.following());
-    for (int i = 0; i < 24; ++i) panel.update(yaw, 0.0, 1.0 / 60.0);
-    CHECK(panel.direction()[0] == doctest::Approx(std::sin(yaw)).epsilon(0.03));
-    CHECK_FALSE(panel.following());
-    // The quad stays at the fixed distance, even after the re-centre.
+TEST_CASE("vr8 the panel anchors where it opened and never follows the head") {
+    splat::PanelAnchor panel;
+    CHECK_FALSE(panel.latched());
+    // Nothing to draw before the first latch (the same "empty" convention as a
+    // hidden panel in UiHost).
+    CHECK(panel.quad().width == doctest::Approx(0.0f));
+    CHECK(panel.quad().height == doctest::Approx(0.0f));
+
     const float eye[3] = {0.0f, 0.0f, 0.0f};
-    const splat::OverlayQuad quad = panel.quad(eye, yaw, 0.0);
-    const double length = std::sqrt(quad.center[0] * quad.center[0] +
-                                    quad.center[1] * quad.center[1] +
-                                    quad.center[2] * quad.center[2]);
-    CHECK(length == doctest::Approx(splat::kPanelDistanceMetres).epsilon(1e-5));
+    panel.latch(eye, 0.0, 0.0);
+    CHECK(panel.latched());
+    const splat::OverlayQuad first = panel.quad();
+    // Centre: kPanelDistanceMetres straight ahead (+z is forward), 1.4 x 0.7875.
+    CHECK(first.center[0] == doctest::Approx(0.0f).epsilon(1e-6));
+    CHECK(first.center[1] == doctest::Approx(0.0f).epsilon(1e-6));
+    CHECK(first.center[2] == doctest::Approx(splat::kPanelDistanceMetres).epsilon(1e-6));
+    CHECK(first.width == doctest::Approx(1.4f));
+    CHECK(first.height == doctest::Approx(0.7875f));
+    // Upright: right is level, up is world up (-y is down in scene axes).
+    CHECK(first.right[1] == doctest::Approx(0.0f).epsilon(1e-6));
+    CHECK(first.up[0] == doctest::Approx(0.0f).epsilon(1e-6));
+    CHECK(first.up[1] == doctest::Approx(-1.0f).epsilon(1e-6));
+    // Front faces the user: right x up = -forward.
+    float front[3];
+    cross3(first.right, first.up, front);
+    CHECK(front[2] == doctest::Approx(-1.0f).epsilon(1e-6));
+
+    // The old "follows lazily" case is now this one: the head turns 40 deg of
+    // yaw and 20 deg of pitch while the window is up, and the quad the frame
+    // loop would draw is bit-identical - the window stays where it was created.
+    // The frame loop's rule (UiHost::update_panel) is "latch only while
+    // unlatched"; quad() itself has no head argument, so even that latch cannot
+    // run a second time and the anchor cannot drift by an ease.
+    splat::CameraPose turned;
+    turned.position[0] = 0.30f;
+    turned.position[1] = 0.10f;
+    turned.position[2] = -0.40f;
+    turned.yaw = 40.0 * kPi / 180.0;
+    turned.pitch = 20.0 * kPi / 180.0;
+    auto latch_if_needed = [](splat::PanelAnchor& anchor, const splat::CameraPose& head) {
+        if (!anchor.latched()) anchor.latch(head.position, head.yaw, head.pitch);
+    };
+    latch_if_needed(panel, turned);
+    const splat::OverlayQuad after = panel.quad();
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(after.center[axis] == first.center[axis]);
+        CHECK(after.right[axis] == first.right[axis]);
+        CHECK(after.up[axis] == first.up[axis]);
+    }
+    CHECK(after.width == first.width);
+    CHECK(after.height == first.height);
+
+    // ... and it is not where the head now looks: a latch at the new pose would
+    // sit 1.6 m along that direction instead.
+    splat::PanelAnchor moved;
+    moved.latch(eye, 40.0 * kPi / 180.0, 20.0 * kPi / 180.0);
+    float moved_forward[3];
+    pose_forward(40.0 * kPi / 180.0, 20.0 * kPi / 180.0, moved_forward);
+    CHECK(moved.quad().center[0] ==
+          doctest::Approx(moved_forward[0] * splat::kPanelDistanceMetres).epsilon(1e-5));
+    CHECK(moved.quad().center[2] ==
+          doctest::Approx(moved_forward[2] * splat::kPanelDistanceMetres).epsilon(1e-5));
+    CHECK(moved.quad().center[2] != doctest::Approx(first.center[2]));
+
+    // A second latch at the same pose is the same quad (the geometry is a pure
+    // function of the pose, not a state that drifts).
+    splat::PanelAnchor again;
+    again.latch(eye, 0.0, 0.0);
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(again.quad().center[axis] == first.center[axis]);
+        CHECK(again.quad().right[axis] == first.right[axis]);
+        CHECK(again.quad().up[axis] == first.up[axis]);
+    }
+}
+
+TEST_CASE("vr8 the panel recentre puts the window in front of the new pose") {
+    splat::PanelAnchor panel;
+    const float eye[3] = {0.10f, 1.62f, -0.20f};
+    panel.latch(eye, 0.0, 0.0);
+    const splat::OverlayQuad before = panel.quad();
+
+    // recenter() is the latch at the current pose: the Cross hold with the
+    // panel open. 40 deg right and 15 deg down from where the window opened.
+    const double yaw = 40.0 * kPi / 180.0;
+    const double pitch = -15.0 * kPi / 180.0;
+    panel.recenter(eye, yaw, pitch);
+    const splat::OverlayQuad quad = panel.quad();
+    float forward[3];
+    pose_forward(yaw, pitch, forward);
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(quad.center[axis] ==
+              doctest::Approx(eye[axis] + forward[axis] * splat::kPanelDistanceMetres)
+                  .epsilon(1e-5));
+    }
+    // It is no longer where it was, and it turned with the pose: level right,
+    // now along the new yaw, and the front still faces the user.
+    CHECK(quad.center[0] != doctest::Approx(before.center[0]));
+    CHECK(quad.right[1] == doctest::Approx(0.0f).epsilon(1e-6));
+    CHECK(quad.right[0] == doctest::Approx(std::cos(yaw)).epsilon(1e-5));
+    CHECK(quad.right[2] == doctest::Approx(-std::sin(yaw)).epsilon(1e-5));
+    float front[3];
+    cross3(quad.right, quad.up, front);
+    CHECK(dot3(front, forward) == doctest::Approx(-1.0f).epsilon(1e-5));
+
+    // Recentring again at the same pose changes nothing.
+    panel.recenter(eye, yaw, pitch);
+    for (int axis = 0; axis < 3; ++axis) {
+        CHECK(panel.quad().center[axis] == quad.center[axis]);
+        CHECK(panel.quad().right[axis] == quad.right[axis]);
+    }
 }
 
 TEST_CASE("vr8 a rolled and pitched head projects the panel as a rigid rectangle") {
-    splat::PanelFollower panel;
-    panel.reset(0.0, 0.0);
-    // The head has a yaw, a pitch and a roll; the panel's quad uses the head's
-    // yaw/pitch (parallel to the view plane) and no roll.
+    // The window is latched at this head pose, so its plane is parallel to that
+    // pose's view plane; the head's roll (0.30 rad) then rotates the image but
+    // cannot keystone it, because roll turns the camera about its own forward
+    // axis and leaves the image plane where it was.
     splat::CameraPose head;
     head.position[0] = 0.10f;
     head.position[1] = 1.62f;
@@ -274,8 +378,9 @@ TEST_CASE("vr8 a rolled and pitched head projects the panel as a rigid rectangle
     head.yaw = 0.35f;
     head.pitch = 0.28f;
     head.roll = 0.30f;
-    panel.update(head.yaw, head.pitch, 0.016);
-    const splat::OverlayQuad quad = panel.quad(head.position, head.yaw, head.pitch);
+    splat::PanelAnchor panel;
+    panel.latch(head.position, head.yaw, head.pitch);
+    const splat::OverlayQuad quad = panel.quad();
 
     // The 3D shape is rigid: unit, orthogonal right/up, constant width/height.
     CHECK(dot3(quad.right, quad.up) == doctest::Approx(0.0f).epsilon(1e-5));

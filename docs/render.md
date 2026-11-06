@@ -243,14 +243,31 @@ over the sequence, 4× gain).
 desktop viewer and the PS5 HMD layer feed it a tracked head pose and get a
 `FrameView` back, so the same comfort rules apply on both.
 
+- **The scene transform.** The viewer has no scene rotation (DECISIONS.md,
+  "Change 2026-11-05"): the display transform is one uniform scale and one
+  translation in the placement frame,
+
+  ```
+  display = s * p_scene + offset
+  ```
+
+  `s` is `scene_scale` (= `FrameView::scene_scale`) and `offset` is the scene
+  offset (metres). The offset is applied as a camera translation - the camera is
+  the head minus the offset - so only `s` reaches the shader. A left/right turn
+  is a yaw of the camera (`turn_`): `view_yaw() = scene_yaw - turn_`, and the
+  scene offset does not move. A rotation that used to be part of the viewer is
+  now a file action: a scene entry turned with L3/R3 has its own
+  `scene.psplat`, images and intrinsics rewritten (`core/scene/scene_rotate.h`).
+  The overlay (panel, HUD, label) is drawn with its own matrices and is never
+  turned.
 - **Capture-point anchor.** `ViewerState` holds an anchor position in tracking
   space. The scene origin (the capture camera) sits at the anchor, and the
   comfort radius is the head's distance from it.
-- **Recentre (R3).** `recentre(head_position, head_yaw)` moves the anchor to
-  the current head position and sets the yaw offset so the current head yaw is
-  scene yaw zero. Pitch is left alone. The scene-relative position is the head
-  offset rotated by `-yaw_offset`, so moving forward after recentring maps to
-  scene +z and strafing right maps to scene +x.
+- **Recentre (Cross hold 1 s).** `recentre(head_position, head_yaw)` moves the
+  anchor to the current head position and sets the yaw offset so the current
+  head yaw is scene yaw zero. Pitch is left alone. The scene-relative position
+  is the head offset rotated by `-yaw_offset`, so moving forward after
+  recentring maps to scene +z and strafing right maps to scene +x.
 - **Headset placement (`HmdView`).** `core/render/hmd_view.{h,cpp}` wraps that
   state for PSVR2: it maps Hmd2's tracker poses (x,y,z,w; +y up; −z forward;
   metres) to the scene axes, takes the eye midpoint and IPD from the per-eye
@@ -258,7 +275,8 @@ desktop viewer and the PS5 HMD layer feed it a tracked head pose and get a
   scene's level, so the first frame (and every R3) is the capture photo upright
   and in front. `ViewerState` itself still leaves pitch alone; the offset lives
   in `HmdView`.
-- **World scale.** Clamped to 0.25x–4x. The renderer multiplies both the splat
+- **World scale.** Clamped to 0.25x–4x (the model view widens this for its fit;
+  see below). The renderer multiplies both the splat
   positions and the Gaussian standard deviations by the scale
   (`project.comp`), which scales the whole scene about the capture point. At
   the capture pose the image is therefore unchanged by scale; scaling becomes
@@ -267,6 +285,20 @@ desktop viewer and the PS5 HMD layer feed it a tracked head pose and get a
   the same frame as 1.0 byte for byte, while at a 10 cm sideways offset they
   differ by 12.5 dB. Scaling positions without the splat sizes
   makes a scaled-up world grainy, so both are scaled.
+- **Capture scale (default).** L2/R2 scale the scene about the photo's capture
+  point (the scene origin, displayed at the scene offset), which is exactly
+  where the eyes are at load/recenter. The offset does not move; only
+  `scene_scale` changes. At rest the image is scale-invariant (the old VR6
+  property), but head/body motion is amplified relative to a smaller scene:
+  that is the miniature effect. The range is **0.001x–4x**
+  (`kMinSceneScale`), far below the old 0.25 floor that left a 160 m street
+  scene 40 m wide. Settings → Comfort → Scale also offers **Centre** (visible
+  3D centre fixed) and **Front** (5th-percentile near edge fixed), which change
+  the image at rest. The desktop `--scale` remains 0.25–4x; the wide range is
+  the VR modes' `ViewerState` limits.
+  The renderer scales the Gaussian sizes with the positions, so an extremely
+  sparse cloud minified by 1/1000 can look dim (Mip-Splatting alpha
+  compensation); the real sample scenes are dense enough.
 - **Comfort fade.** Radius defaults to 0.25 m and is configurable
   (`--comfort-radius`). The fade starts at **50 %** of the radius (default,
   `--fade-start`; `kDefaultFadeStart`) and reaches the neutral backdrop at the
@@ -289,11 +321,20 @@ desktop viewer and the PS5 HMD layer feed it a tracked head pose and get a
   image:
 
   ```
-  scene      = R^T * (ray * view_z + (eye_offset, 0, 0)) + midpoint
+  display    = R^T * (ray * view_z + (eye_offset, 0, 0)) + midpoint
+  scene      = R_scene^T * display / s
   capture_px = K_capture * scene.xy / scene.z + c_capture
   outside    = max(-u, u - 1, -v, v - 1)               // u, v in image units
   frustum    = 1 - smoothstep(-inner, margin, outside)  // 0.02, 0.03125
   ```
+
+  `R` here is the *camera's* rotation (from the view matrix); `s` is the scene
+  scale (`camera.params.x`). The photo is a property of the **scene**, which is
+  no longer turned in the viewer: the scene and its intrinsics are turned on
+  disk, so the reconstructed display point is only un-scaled before the capture
+  projection - `comfort.frag`'s `p_scene = p_display / s`. A scene turned with
+  L3/R3 therefore fades along its turned photo, because both were rewritten
+  together (`core/scene/scene_rotate.cpp`).
 
   `eye_offset` is `-half IPD` for the left eye and `+half IPD` for the right
   (`camera_position.w`, zero on a mono frame), applied along camera x before
@@ -405,6 +446,10 @@ splat_desktop --scenes DIR [options]
   --fade-start F          radial fade start, fraction of the radius (default 0.5)
   --playlist N            headless: play the playlist N loops, one frame per scene
 ```
+
+The viewer no longer has a rotation option: a scene is turned on disk (L3/R3 on
+its entry), so a numeric check turns the scene folder first and then renders it.
+`--screenshot` still writes the frame it rendered.
 
 Interactive controls mirror the DualSense/PS5 mapping: `[` / `]` = L1/R1
 previous/next scene, the scroll wheel or `+`/`-` = world scale, `R` = recentre

@@ -29,12 +29,16 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <utility>
+#include <vector>
 
+#include "jobs/staging.h"
 #include "recon/fallback/fallback_reconstructor.h"
 #include "recon/sharp/sharp_reconstructor.h"
 #include "title_common.h"
+#include "ui/job_log.h"
 #include "ui_setup.h"
 
 namespace viewer {
@@ -46,6 +50,12 @@ constexpr size_t kConverterStackBytes = 32u * 1024u * 1024u;
 
 }  // namespace
 
+// An import job (L2) never reaches this thread: JobRunner::run_next dispatches
+// on Job::kind before it loads a backend, so importing a .spz reads and thins
+// splats on the JobService worker and the queue's model log line stays empty.
+// The panel's conversion gate therefore never pauses the viewer for an import,
+// and a console with no model installed can still import a converted scene.
+//
 // One thread for every ggml call, with W18's 32 MiB stack. The JobService
 // worker posts a task and waits, so the runner's ordering (model loaded before
 // the photo, unloaded before the next job) is unchanged and only one thread ever
@@ -239,33 +249,18 @@ private:
 // console run's own log says what the queue did (the panel shows it on screen,
 // which an unattended run cannot read). Called from the worker thread after every
 // published change; only a new stage, a new 10 % step or a job's end prints.
+// The decision lives in core/ui/job_log.h so it can be tested without a console.
 struct JobLog {
     std::mutex mutex;
     const splat::IJobService* service = nullptr;
-    std::string stage;
-    int decile = -1;
-    std::map<std::string, std::string> states;  // job id -> last logged state
+    splat::JobLog state;
 };
 
 void log_changes(const std::shared_ptr<JobLog>& state) {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->service == nullptr) return;
-    for (const splat::JobView& view : state->service->snapshot()) {
-        std::string& known = state->states[view.id];
-        if (view.state == "running") {
-            const int decile = static_cast<int>(view.fraction * 10.0f);
-            if (view.stage == state->stage && decile == state->decile) continue;
-            state->stage = view.stage;
-            state->decile = decile;
-            line("viewer: jobs: %s %s %d%% (%s)", view.name.c_str(), view.stage.c_str(),
-                 decile * 10, view.backend.c_str());
-            continue;
-        }
-        if (known == view.state) continue;
-        known = view.state;
-        if (view.state == "queued") continue;
-        line("viewer: jobs: %s %s%s%s", view.name.c_str(), view.state.c_str(),
-             view.message.empty() ? "" : ": ", view.message.c_str());
+    for (const std::string& text : state->state.consume(state->service->snapshot())) {
+        line("viewer: jobs: %s", text.c_str());
     }
 }
 
@@ -276,10 +271,16 @@ std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& sce
     std::error_code error;
     std::filesystem::create_directories(state_dir, error);
     const Path queue_file = state_dir / "jobs.json";
-    splat::Result<splat::JobQueue> opened = splat::JobQueue::open(queue_file);
-    if (!opened.ok()) {
-        line("viewer: jobs: %s; conversions stay unavailable", opened.message().c_str());
-        return nullptr;
+    // A boot path must start whatever the last session left (0.5.0 crashed here
+    // on a queue whose row count came out as 1.1e19: REPORT-CR.md). A file that
+    // cannot be read, parsed or believed is kept beside itself as
+    // jobs.json.rejected, the reason is logged, and the queue starts empty:
+    // every count and size that follows comes from a validated file or from
+    // nothing at all, never from a corrupt one.
+    std::string queue_notice;
+    splat::JobQueue queue = splat::JobQueue::open_or_empty(queue_file, &queue_notice);
+    if (!queue_notice.empty()) {
+        line("viewer: jobs: %s; starting with an empty queue", queue_notice.c_str());
     }
 
     const std::string selected = models.service != nullptr ? models.service->selected() : "";
@@ -306,7 +307,7 @@ std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& sce
     }
 
     auto setup = std::make_unique<JobSetup>();
-    setup->queue = opened.take();
+    setup->queue = std::move(queue);
 
     // Declared before the runner so the factory's shared_ptr keeps the thread
     // alive until the last backend object (and the runner's copy of the lambda)
@@ -335,6 +336,26 @@ std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& sce
 
     splat::JobRunnerConfig config;
     config.output_root = scenes_dir;
+    // A scene for a network library is built here first, then uploaded: the
+    // staging folder is under the title's own data directory, so a failed
+    // upload leaves a copy the operator can inspect (the message names it).
+    config.staging_root = splat::Path(data_path("tmp"));
+    // Folders a finished or cancelled job left behind (an interrupted delete)
+    // and folders that name no job at all go now; a failed job's copy stays
+    // because it is the scene's only copy (core/jobs/staging.h).
+    {
+        const std::vector<std::string> swept =
+            splat::sweep_staging(config.staging_root, setup->queue->jobs());
+        if (!swept.empty()) {
+            std::string names;
+            for (const std::string& name : swept) {
+                if (!names.empty()) names += ", ";
+                names += name;
+            }
+            line("viewer: jobs: removed %zu stale staging folder(s): %s", swept.size(),
+                 names.c_str());
+        }
+    }
     // The runner loads a model per job and unloads it before the guard admits a
     // viewer. This path is only what the runner hands to load(); ConsoleSharp
     // ignores it and loads the file resolved for the job's own backend, so a
@@ -344,6 +365,12 @@ std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& sce
     setup->runner =
         std::make_unique<splat::JobRunner>(*setup->queue, setup->guard, std::move(factory), config);
     auto job_log = std::make_shared<JobLog>();
+    // Rows the queue file carried in from the last session are history: a
+    // failure the user has already seen is not announced again at this boot
+    // (the console pass logged the stale "upload failed: unknown location"
+    // row in all ten of its runs). Seeded from the loaded queue, before the
+    // service exists, so the worker's first publish has nothing stale to say.
+    job_log->state.seed_rows(setup->queue->jobs());
     setup->service = std::make_unique<splat::JobService>(
         *setup->queue, *setup->runner, [job_log] { log_changes(job_log); });
     job_log->service = setup->service.get();

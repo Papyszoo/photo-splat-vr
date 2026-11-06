@@ -1,0 +1,38 @@
+# Stage P2: the rotation is a file action on the focused entry.
+#
+# One prepare run, read from the klog - no picture is read by a person:
+#
+#  1. Photo turn. Home (Albums) -> 00_v02_console -> Left to "+ Add photos" ->
+#     Cross opens the picker (Inbox tab, first photo focused, a JPEG). R3 turns
+#     it right: the source's Orientation tag is rewritten, so the toast says
+#     "(file updated)" and the thumbnail is the turned picture. L3 turns it back
+#     left. A photo the app cannot rewrite (a RAW) would say "the file itself
+#     was not changed"; this run uses the JPEG fixture.
+#
+#  2. Scene turn. Circle returns to the album, Right to the first scene
+#     "0a-big" (the 3 M-splat import), R3 queues a right turn as a background
+#     job: the tile says "Rotating" and the toast is "Rotating 0a-big…". The
+#     scene's own files are rewritten, so the completion toast is "Rotated
+#     0a-big". L3 queues the opposite turn once the first has finished.
+#
+# console-run.sh runs this before reopen-rotation.txt, which reopens the album
+# after a fresh launch and proves the scene still opens and the run reaches its
+# own end. No rotation value is read from a log: there is no viewer rotation to
+# persist (DECISIONS.md, "Change 2026-11-05").
+0.5   mark home
+1.0   press Right
+1.6   press Cross
+2.4   press Left
+3.0   press Cross
+4.5   shot pt-picker
+5.2   press R3
+6.4   shot pt-right
+7.2   press L3
+8.4   shot pt-left
+9.2   press Circle
+10.4  press Right
+11.0  press R3
+12.0  shot scene-rotating
+20.0  press L3
+21.0  shot scene-turning
+30.0  quit

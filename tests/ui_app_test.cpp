@@ -139,7 +139,7 @@ TEST_CASE("ui_app options opens and closes settings") {
     fixture.app.set_scene_loaded(true);
 
     // Into Models, then Options closes Settings and everything above it.
-    for (int i = 0; i < 5; ++i) fixture.app.update(press(splat::Down));
+    for (int i = 0; i < 6; ++i) fixture.app.update(press(splat::Down));
     fixture.app.update(press(splat::Select));
     CHECK(fixture.app.nav().top_id() == splat::ScreenId::Models);
     fixture.app.update(press(splat::Menu));
@@ -152,7 +152,11 @@ TEST_CASE("ui_app quit is a settings row") {
     Fixture fixture;
     fixture.app.start();
     fixture.app.update(press(splat::Menu));
-    for (int i = 0; i < 7; ++i) fixture.app.update(press(splat::Down));
+    // Ten focusable rows reach Quit: the three comfort rows, the three display
+    // rows (Thumbnail size is stage T's), Models, Conversions, Network
+    // locations, Visible folders and then Quit (L3 added the locations row,
+    // stage H the visible-folders row).
+    for (int i = 0; i < 10; ++i) fixture.app.update(press(splat::Down));
     fixture.app.update(press(splat::Select));
 
     const std::optional<splat::UiCommand> command = fixture.app.take_command();
@@ -293,4 +297,41 @@ TEST_CASE("ui_app scene flag dirties once") {
     CHECK(fixture.app.draw(fixture.canvas));
     fixture.app.set_scene_loaded(true);
     CHECK_FALSE(fixture.app.draw(fixture.canvas));
+}
+
+TEST_CASE("ui_app logs every screen change and toast once, for unattended runs") {
+    // An unattended console run has no eyes: `ui: screen <name> depth <n>` and
+    // `ui: toast <text>` are how a script asserts where the panel went and what
+    // it said (platform/ps5/scripts/console-run.sh reads them).
+    Fixture fixture;
+    std::vector<std::string> lines;
+    fixture.services.log = [&lines](const std::string& text) { lines.push_back(text); };
+    fixture.app.start();
+    fixture.app.update(splat::UiInput{});
+    REQUIRE_FALSE(lines.empty());
+    CHECK(lines.front() == "ui: screen Scenes depth 1");
+
+    // An idle frame repeats nothing.
+    const std::size_t after_start = lines.size();
+    fixture.app.update(splat::UiInput{});
+    CHECK(lines.size() == after_start);
+
+    // Options opens Settings (depth 2) and closes it again.
+    fixture.app.update(press(splat::Menu));
+    REQUIRE(lines.size() > after_start);
+    CHECK(lines.back() == "ui: screen Settings depth 2");
+    fixture.app.update(press(splat::Menu));
+    CHECK(lines.back() == "ui: screen Scenes depth 1");
+
+    // A toast is logged with its text, once, and its expiry is an empty line.
+    fixture.app.toast("Added smb0", 0.2);
+    fixture.app.update(splat::UiInput{});
+    CHECK(lines.back() == "ui: toast Added smb0");
+    const std::size_t with_toast = lines.size();
+    fixture.app.update(splat::UiInput{});
+    CHECK(lines.size() == with_toast);  // same text: not repeated
+    splat::UiInput tick;
+    tick.dt = 0.3;
+    fixture.app.update(tick);
+    CHECK(lines.back() == "ui: toast ");
 }

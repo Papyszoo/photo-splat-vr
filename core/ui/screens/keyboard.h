@@ -5,6 +5,9 @@
 //   "rename-album" b = the existing album folder name
 //   "rename-scene" b = the scene folder path (renamed inside its album)
 //   "delete-album" b = the existing album folder name (confirmation only)
+//   "free-text"    b = the starting text; a = "free-text" with ScreenArgs'
+//                  on_text/masked/max_length/min_length/title (the location
+//                  editor's fields and the Visible folders passcode)
 //
 // The grid is QWERTY (VR9, headset test 6): the digit row 1-0, qwertyuiop,
 // asdfghjkl + Shift, zxcvbnm, then '.', '-', '_', Space, Delete and OK. The
@@ -32,6 +35,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -87,6 +91,13 @@ public:
     bool valid() const { return valid_; }
     // One line for the validity area ("That name already exists", ...).
     const std::string& validity_text() const { return validity_; }
+    // True in the free-text mode; the field then draws `drawn_text()`.
+    bool free_text() const { return free_text_; }
+    bool masked() const { return masked_; }
+    // The text the field shows: `text()` or one '*' per character when masked.
+    std::string drawn_text() const;
+    // Where the OK callback goes in the free-text mode.
+    const std::function<void(const std::string&)>& on_text() const { return on_text_; }
 
     const std::vector<KeyboardKey>& keys() const { return keys_; }
     int focus() const { return grid_.focus(); }
@@ -97,6 +108,9 @@ public:
 
 private:
     void build_keys();
+    // The free-text grid: letters, digits, the URL/file characters, Shift,
+    // Space, Delete, OK.
+    void build_free_text_keys();
     // Sizes the grid from the content rect and the theme's scale (VR9: the VR
     // panel's 0.7 theme must fit all five rows in the shorter area as well).
     void layout(const Rect& content, const UiTheme& theme);
@@ -129,6 +143,20 @@ private:
     bool valid_ = false;
     bool shift_ = false;
     bool delete_mode_ = false;
+    // Free-text mode ("a" == "free-text"): full ASCII, ScreenArgs::on_text on
+    // OK, and an optional masked field (the location editor's password).
+    bool free_text_ = false;
+    bool masked_ = false;
+    int max_length_ = 64;
+    // Free text only: the title the caller asked for ("" keeps "Type a value")
+    // and the minimum length before OK is enabled (0 = only "not empty").
+    std::string title_;
+    int min_length_ = 0;
+    bool allow_empty_ = false;  // the caller's field means "empty" (Port = default)
+    std::function<void(const std::string&)> on_text_;
+    // The grid's column count: 10 for the album modes, 14 for free text (it has
+    // twice the keys and must still fit five rows).
+    int columns_ = 10;
     // The system dialog (ITextInput) owns the input while this is true.
     bool ime_open_ = false;
 

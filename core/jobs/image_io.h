@@ -7,13 +7,20 @@
 #include "common/image.h"
 #include "common/path.h"
 #include "common/status.h"
+#include "image/decode.h"
+#include "scene/scene_folder.h"
 
 namespace splat {
 
-// Ingest image I/O, implemented with the stb headers in third_party. Decoding
-// always yields tightly packed RGB8 (no alpha), matching Image.
+// Ingest image I/O. The decoders live in core/image; these are the ingest-side
+// wrappers, and decoding always yields tightly packed RGB8 (no alpha), matching
+// Image.
 
-Result<std::vector<uint8_t>> read_file_bytes(const Path& path);
+// Reads a whole file. `max_bytes` (0 = no limit) is checked against the file
+// size before anything is read, so an oversized photo is refused without
+// allocating it - the guard decode_photo() runs afterwards is too late for a
+// multi-GB file.
+Result<std::vector<uint8_t>> read_file_bytes(const Path& path, size_t max_bytes = 0);
 
 // True for a JPEG SOI marker. Used to keep the source JPEG verbatim when the
 // photo already is one, and to decide whether EXIF parsing makes sense.
@@ -21,6 +28,9 @@ bool looks_like_jpeg(const uint8_t* data, size_t size);
 
 Result<Image> decode_image(const uint8_t* data, size_t size);
 Result<Image> decode_image(const Path& path);
+// The same decode, reporting the format, the source size, the EXIF orientation
+// and the decoded size the caller needs for the intrinsics.
+Result<Image> decode_image(const Path& path, image::DecodeInfo* info);
 
 // quality is clamped to [1, 100]. Returns the encoded bytes.
 Result<std::vector<uint8_t>> encode_jpeg(const Image& image, int quality = 90);
@@ -40,5 +50,12 @@ Result<Image> make_thumbnail(const Image& image, int max_edge = 512);
 // instead of failing, so one bad tag cannot fail a conversion. The job runner
 // and the console convert mode both call this.
 Result<float> focal_px_from_photo(const uint8_t* data, size_t size, int width, int height);
+
+// The intrinsics a finished scene carries: the EXIF focal (or the 30 mm
+// default) for the size the file stores, then the same EXIF-orientation and
+// quarter-turn map the pixels went through, so the scene and its photo always
+// agree. `info` comes from decode_image()/image::decode_photo().
+Result<Intrinsics> photo_intrinsics(const uint8_t* data, size_t size,
+                                    const image::DecodeInfo& info);
 
 }  // namespace splat

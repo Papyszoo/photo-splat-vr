@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <utility>
 
+#include "ui/pointer_mode.h"
 #include "ui/screens/placeholder.h"
 #include "ui/text_fit.h"
 
@@ -70,15 +71,244 @@ void draw_focus_ring(UiCanvas& canvas, const Rect& box, int radius, const UiThem
                              radius + gap, 3, theme.focus);
 }
 
-void draw_row_progress(UiCanvas& canvas, const Rect& area, int row, std::string_view right,
-                       float fraction, bool scrollbar, const UiTheme& theme) {
-    const int plate_y = area.y + row * theme.row_height + kRowInset;
-    const int plate_h = theme.row_height - 2 * kRowInset;
-    const int plate_right = area.right() - (scrollbar ? 12 : 0);
+namespace {
+
+// The five steps as column counts: the smallest step shows the most entries,
+// the largest the fewest. A tile is the width the panel leaves for one column
+// after the one shared gap, so at every size and on every screen the row fills
+// the panel's width with the same gap. Stage TF scaled a 176 px tile by a
+// percentage and spread the spare width over the column gaps; at the largest
+// step that gave the folder grid four 220 px tiles with 90 px gaps while the
+// photo picker (whose shorter area needs a fifth column for its six entries)
+// showed 19 px gaps. Column counts keep the two screens identical at every step.
+constexpr int kThumbnailColumns[kThumbnailSizeCount] = {9, 8, 7, 6, 5};
+// The space between two columns (and between two rows) in design pixels: 18 px
+// on the 1280x720 canvas, 13 px on the VR panel's 0.7 theme.
+constexpr int kThumbnailGap = 18;
+// One picture shape for every tile (stage TF): the photo screen's default
+// picture, 176x102 design pixels (about 1.73:1, what the review measured on the
+// default photo screen). A tile's picture is always `width * 102 / 176` tall and
+// only the label block is added on top, so every size and every screen shows
+// the same crop of a photo instead of a strip that gets flatter as the tile
+// grows.
+constexpr int kThumbnailPictureWidth = 176;
+constexpr int kThumbnailPictureHeight = 102;
+// The fewest entries a step must show when the area is small. The default and
+// the small step keep 12, the large 8 and the largest 6; the smallest only has
+// to stay legible (0 = no count requirement).
+constexpr int kThumbnailMinEntries[kThumbnailSizeCount] = {0, 12, 12, 8, 6};
+// The legibility floor a shrink may not cross (design pixels): a tile still
+// leaves room for a picture and a caption at this size.
+constexpr int kThumbnailFloorWidth = 110;
+
+// The one columns/rows formula. thumbnail_metrics() below and GridView's own
+// columns()/visible_rows() both call these, so a size's entry-count guarantee
+// is computed with the layout the grid really draws.
+int grid_columns(int width, int cell_width, int gap) {
+    const int stride = std::max(1, cell_width + gap);
+    return std::max(1, (width + gap) / stride);
+}
+
+int grid_rows(int height, int cell_height, int gap) {
+    const int stride = std::max(1, cell_height + gap);
+    return std::max(1, (height + gap) / stride);
+}
+
+// The picture of a tile `width` px wide at the one shared shape.
+int picture_height(int width) {
+    return std::max(1, static_cast<int>(std::lround(static_cast<double>(width) *
+                                                    kThumbnailPictureHeight /
+                                                    kThumbnailPictureWidth)));
+}
+
+// The scroll chevrons: 36 x 16 px with 4 px strokes at the design size. They
+// sit in the panel's right gutter (the empty margin beside the grid), never in
+// the area itself: at the eight-column step the photo picker has only 4 px of
+// bottom spare, so the "more below" chevron covered the last row's second
+// caption line when it was drawn inside the grid (stage TF2 fix).
+constexpr int kChevronHalfWidth = 18;
+constexpr int kChevronHeight = 16;
+constexpr int kChevronInset = 8;
+constexpr int kChevronStroke = 4;
+// A little past the gutter's middle: a focused tile in the last column grows
+// and draws its ring 4 px out, so the chevron keeps clear of that too.
+constexpr int kChevronGutterShift = 4;
+
+}  // namespace
+
+int thumbnail_label_height(const UiTheme& theme, int caption_lines, bool sublabel) {
+    if (caption_lines <= 0) return 0;
+    // The gap between the picture and its caption is a design constant too, so
+    // the whole block scales with the panel.
+    int height = theme.scaled(10) + caption_lines * UiCanvas::line_height(theme.body_size - 2);
+    if (sublabel) height += UiCanvas::line_height(theme.small_size);
+    return height;
+}
+
+ThumbnailMetrics thumbnail_metrics(const Rect& area, const UiTheme& theme, int size,
+                                   ThumbnailLabel label) {
+    const int index = clamp_thumbnail_size(size);
+    const int label_height =
+        thumbnail_label_height(theme, label.caption_lines, label.sublabel);
+    // The count guarantee is computed with the tallest label block a thumbnail
+    // screen can draw, not with this screen's: the photo picker reserves its
+    // sublabel line only when the folder lists a splat file, and a step must not
+    // change its column count when such a file appears. Only the guard uses the
+    // taller block; the cell keeps the label the screen really draws, so the
+    // picture box stays the one shape.
+    const int guard_label_height = thumbnail_label_height(theme, label.caption_lines, true);
+    const int floor_width = std::max(1, theme.scaled(kThumbnailFloorWidth));
+    ThumbnailMetrics metrics;
+    metrics.gap = std::max(2, theme.scaled(kThumbnailGap));
+    // The step's share of the panel: the column count is fixed and the gap is
+    // shared, so the tile takes the rest of the width. The same numbers come out
+    // on the folder grids and on the photo picker, whatever their height.
+    const int columns = kThumbnailColumns[index];
+    const int inner = area.w - metrics.gap * (columns - 1);
+    metrics.cell_width = std::max(floor_width, inner / std::max(1, columns));
+    metrics.cell_height = picture_height(metrics.cell_width) + label_height;
+
+    // A panel too small for the step's guaranteed entry count gets smaller
+    // tiles, never fewer entries: the 2-entries-in-VR case cannot come back by
+    // running a different canvas. The tile shrinks on the one shared shape, so
+    // the picture stays the same crop; past the legibility floor only the gap
+    // shrinks (to its 2 px minimum), which is what lets a small panel keep the
+    // count with the smallest allowed tiles.
+    const int required = kThumbnailMinEntries[index];
+    while (required > 0 &&
+           grid_columns(area.w, metrics.cell_width, metrics.gap) *
+                   grid_rows(area.h, picture_height(metrics.cell_width) + guard_label_height,
+                             metrics.gap) <
+               required) {
+        if (metrics.cell_width <= floor_width && metrics.gap <= 2) break;
+        if (metrics.cell_width > floor_width) {
+            metrics.cell_width = std::max(
+                floor_width, metrics.cell_width - std::max(1, metrics.cell_width / 40));
+        }
+        metrics.gap = std::max(2, metrics.gap - 1);
+        metrics.cell_height = picture_height(metrics.cell_width) + label_height;
+    }
+
+    // The grid uses the panel's whole width (stage TF): the tiles keep the
+    // step's width and the rounding's spare pixels are spread over the spaces
+    // between columns, so the right margin is never wider than one gap. Only
+    // the space between columns moves, so the number of rows (and the entry
+    // count) does not.
+    const int drawn = grid_columns(area.w, metrics.cell_width, metrics.gap);
+    metrics.column_gap = metrics.gap;
+    if (drawn > 1) {
+        const int spare = area.w - drawn * metrics.cell_width;
+        if (spare > 0) metrics.column_gap = std::max(metrics.gap, spare / (drawn - 1));
+    }
+    return metrics;
+}
+
+void apply_thumbnail_layout(GridView& grid, const Rect& area, const UiTheme& theme, int size) {
+    // One label rule for every tile, whatever the screen: two caption lines,
+    // reserved whether or not the tile is focused.
+    grid.caption_lines = kThumbnailCaptionLines;
+    const ThumbnailMetrics metrics =
+        thumbnail_metrics(area, theme, size, ThumbnailLabel{grid.caption_lines, grid.show_sublabel});
+    grid.cell_width = metrics.cell_width;
+    grid.cell_height = metrics.cell_height;
+    grid.gap = metrics.gap;
+    grid.column_gap = metrics.column_gap;
+}
+
+int thumbnail_columns(const Rect& area, const UiTheme& theme, int size, ThumbnailLabel label) {
+    const ThumbnailMetrics metrics = thumbnail_metrics(area, theme, size, label);
+    return grid_columns(area.w, metrics.cell_width, metrics.column_gap);
+}
+
+int thumbnail_entries_visible(const Rect& area, const UiTheme& theme, int size,
+                              ThumbnailLabel label) {
+    const ThumbnailMetrics metrics = thumbnail_metrics(area, theme, size, label);
+    return grid_columns(area.w, metrics.cell_width, metrics.column_gap) *
+           grid_rows(area.h, metrics.cell_height, metrics.gap);
+}
+
+Slider::Slider(int steps, int value) : steps_(std::max(1, steps)), value_(0) {
+    set_value(value);
+}
+
+bool Slider::set_value(int value) {
+    const int clamped = std::max(0, std::min(value, steps_ - 1));
+    if (clamped == value_) return false;
+    value_ = clamped;
+    return true;
+}
+
+Rect Slider::track_rect(const Rect& area, int text_width, const UiTheme& theme) {
+    const int knob = std::max(4, theme.scaled(9));
+    const int right_gap = std::max(2, theme.scaled(16));
+    const int wanted = area.w - std::max(0, text_width) - right_gap;
+    const int height = std::max(4, theme.scaled(6));
+    const int min_width = std::max(knob * 2, theme.scaled(90));
+    const int width = std::max(min_width, wanted);
+    return Rect{area.x, area.y + (area.h - height) / 2, width, height};
+}
+
+Rect Slider::hit_rect(const Rect& area, int text_width, const UiTheme& theme) {
+    // The track's x range, widened by the knob's radius so a drag just past an
+    // end still clamps there, over the row's whole height (the track itself is
+    // a few px tall and would be hard to hit with a laser). The value text is a
+    // label, not a control: a press on it changes nothing, which is why this
+    // box stops short of it instead of covering the whole slider_area.
+    const Rect track = track_rect(area, text_width, theme);
+    const int margin = std::max(4, theme.scaled(9));
+    const int x = std::max(area.x, track.x - margin);
+    const int right = std::max(x + 1, std::min(area.right(), track.right() + margin));
+    return Rect{x, area.y, right - x, area.h};
+}
+
+int Slider::value_at(float px, const Rect& track) const {
+    if (steps_ <= 1) return 0;
+    const float t = (px - static_cast<float>(track.x)) / static_cast<float>(std::max(1, track.w));
+    const float clamped = std::clamp(t, 0.0f, 1.0f);
+    return std::max(0, std::min(static_cast<int>(std::lround(clamped * (steps_ - 1))),
+                                  steps_ - 1));
+}
+
+void Slider::draw(UiCanvas& canvas, const Rect& area, std::string_view value_text, int text_width,
+                  bool focused, const UiTheme& theme) const {
+    const int text_size = theme.small_size;
+    const Rect track = track_rect(area, text_width, theme);
+    const int radius = std::max(2, track.h / 2);
+    const int knob = std::max(4, theme.scaled(9));
+
+    canvas.fill_round_rect(track.x, track.y, track.w, track.h, radius,
+                           focused ? Rgba{255, 255, 255, 54} : Rgba{255, 255, 255, 34});
+    // A step tick per value, centred on the knob's travel.
+    const int travel = std::max(1, track.w - 1);
+    const int tick = std::max(2, theme.scaled(3));
+    for (int step = 0; step < steps_; ++step) {
+        const int x = track.x + travel * step / std::max(1, steps_ - 1);
+        canvas.fill_round_rect(x - tick / 2, track.y - tick, tick, track.h + 2 * tick,
+                               std::max(1, tick / 2), Rgba{255, 255, 255, 60});
+    }
+    const int knob_x = track.x + travel * value_ / std::max(1, steps_ - 1);
+    if (knob_x > track.x) {
+        canvas.fill_round_rect(track.x, track.y, knob_x - track.x, track.h, radius, theme.accent);
+    }
+    const float cy = static_cast<float>(track.y) + static_cast<float>(track.h) * 0.5f;
+    canvas.fill_circle(static_cast<float>(knob_x), cy, static_cast<float>(knob),
+                       focused ? theme.text : theme.light);
+    if (focused) {
+        canvas.stroke_circle(static_cast<float>(knob_x), cy, static_cast<float>(knob + 4), 2.0f,
+                             theme.glow);
+    }
+    canvas.text(area.right() - text_width,
+                UiCanvas::text_top_centered(area.y, area.h, text_size), value_text, text_size,
+                focused ? theme.text : theme.dim_text);
+}
+
+void draw_row_progress(UiCanvas& canvas, const Rect& plate, std::string_view right,
+                       float fraction, const UiTheme& theme) {
+    const int plate_right = plate.right();
     const int text_w = static_cast<int>(UiCanvas::text_width(right, theme.small_size));
     const int w = std::max(140, text_w);
     const int x = plate_right - 24 - w;
-    const int y = plate_y + plate_h / 2 + 14;
+    const int y = plate.y + plate.h / 2 + 14;
     canvas.fill_round_rect(x, y, w, 4, 2, Rgba{255, 255, 255, 40});
     const float clamped = std::clamp(std::isfinite(fraction) ? fraction : 0.0f, 0.0f, 1.0f);
     const int filled = static_cast<int>(static_cast<float>(w) * clamped + 0.5f);
@@ -89,6 +319,9 @@ ConversionStatus conversion_status(const IJobService* jobs) {
     ConversionStatus status;
     if (jobs == nullptr) return status;
     for (const JobView& job : jobs->snapshot()) {
+        // A scene turn is its own entry's busy mark, not a conversion: the
+        // top-bar chip speaks about photos becoming scenes.
+        if (job.kind == "rotate") continue;
         if (job.state == "running") status.fraction = job.fraction;
         if (job.state == "queued") ++status.queued;
         if (job.state == "running" || job.state == "queued") ++status.active;
@@ -166,6 +399,18 @@ int ListView::visible_rows(const Rect& area, const UiTheme& theme) const {
     return std::max(1, area.h / row_height);
 }
 
+Rect ListView::row_rect(int index, const Rect& area, const UiTheme& theme) const {
+    const int row_height = std::max(1, theme.row_height);
+    const int visible = visible_rows(area, theme);
+    const int row = index - scroll_;
+    if (index < 0 || index >= static_cast<int>(rows_.size()) || row < 0 || row >= visible) {
+        return Rect{};
+    }
+    const int scrollbar = static_cast<int>(rows_.size()) > visible ? 12 : 0;
+    return Rect{area.x, area.y + row * row_height + kRowInset, area.w - scrollbar,
+                row_height - 2 * kRowInset};
+}
+
 void ListView::ensure_visible(int visible) {
     if (rows_.empty()) {
         scroll_ = 0;
@@ -206,7 +451,15 @@ void ListView::update(const UiInput& input, const Rect& area, const UiTheme& the
     if ((input.pressed & PagePrev) != 0) step_focus(-1, visible);
     if ((input.pressed & PageNext) != 0) step_focus(1, visible);
 
-    if (input.pointer_valid && area.contains(input.px, input.py)) {
+    // U3: the stick owns a frame it moved in. A direction press (including the
+    // repeats UiApp folds into `pressed`) means the pointer block is skipped, so
+    // a ray that happens to sit over another row cannot undo the step - the
+    // user's "because pointing fought with my selection I couldn't scroll with
+    // a joystick". The state machine (ui/pointer_mode.h) already disarms the
+    // pointer on the same frame; this is the widgets' own belt, and it reuses
+    // the mode's one definition of the four focus directions.
+    const bool direction_pressed = (input.pressed & PointerMode::kDirections) != 0;
+    if (!direction_pressed && input.pointer_valid && area.contains(input.px, input.py)) {
         const int row = scroll_ + static_cast<int>((input.py - static_cast<float>(area.y)) /
                                                    static_cast<float>(std::max(1, theme.row_height)));
         if (row >= 0 && row < count && !rows_[static_cast<std::size_t>(row)].header) {
@@ -233,8 +486,10 @@ void ListView::draw(UiCanvas& canvas, const Rect& area, const UiTheme& theme) co
         if (index >= static_cast<int>(rows_.size())) break;
         const ListRow& item = rows_[static_cast<std::size_t>(index)];
         const bool focused = index == focus_;
-        const Rect plate{area.x, area.y + row * row_height + kRowInset, area.w - scrollbar,
-                         row_height - 2 * kRowInset};
+        // The one plate geometry: row_rect() is also what a screen's pointer
+        // hit test and its row overlay (Settings' slider) use.
+        const Rect plate = row_rect(index, area, theme);
+        if (plate.empty()) continue;
 
         if (item.header) {
             // A section heading: a small, dim line with no plate or focus ring.
@@ -315,30 +570,46 @@ void GridView::set_focus(int index) {
 }
 
 int GridView::columns(const Rect& area) const {
-    const int stride = std::max(1, cell_width + gap);
-    return std::max(1, (area.w + gap) / stride);
+    return grid_columns(area.w, cell_width, column_gap);
 }
 
 int GridView::visible_rows(const Rect& area) const {
-    const int stride = std::max(1, cell_height + gap);
-    return std::max(1, (area.h + gap) / stride);
+    return grid_rows(area.h, cell_height, gap);
 }
 
 Rect GridView::cell_rect(int index, const Rect& area) const {
     const int per_row = columns(area);
     const int column = index % per_row;
     const int row = index / per_row - scroll_row_;
-    return Rect{area.x + column * (cell_width + gap), area.y + row * (cell_height + gap), cell_width,
-                cell_height};
+    return Rect{area.x + column * (cell_width + column_gap),
+                area.y + row * (cell_height + gap), cell_width, cell_height};
 }
 
 Rect GridView::image_rect(const Rect& cell, const UiTheme& theme) const {
-    int text_block = 0;
-    if (caption_lines >= 1) {
-        text_block += 10 + caption_lines * UiCanvas::line_height(theme.body_size - 2);
-        if (show_sublabel) text_block += UiCanvas::line_height(theme.small_size);
-    }
+    const int text_block = thumbnail_label_height(theme, caption_lines, show_sublabel);
     return Rect{cell.x, cell.y, cell.w, std::max(1, cell.h - text_block)};
+}
+
+Rect GridView::chevron_rect(const Rect& area, const UiTheme& theme, bool down) const {
+    const int half = theme.scaled(kChevronHalfWidth);
+    const int height = theme.scaled(kChevronHeight);
+    const int inset = theme.scaled(kChevronInset);
+    // The middle of the panel margin to the right of the grid, a little
+    // further out than half way so a focused last-column tile's ring cannot
+    // reach it.
+    const int cx = area.right() + theme.margin / 2 + theme.scaled(kChevronGutterShift);
+    const int y = down ? area.bottom() - inset - height : area.y + inset;
+    return Rect{cx - half, y, 2 * half, height};
+}
+
+void GridView::draw_chevron(UiCanvas& canvas, const Rect& box, bool up,
+                            const UiTheme& theme) const {
+    const float cx = static_cast<float>(box.x) + static_cast<float>(box.w) * 0.5f;
+    const float stroke = static_cast<float>(theme.scaled(kChevronStroke));
+    const float tip = up ? static_cast<float>(box.y) : static_cast<float>(box.bottom() - 1);
+    const float base = up ? static_cast<float>(box.bottom() - 1) : static_cast<float>(box.y);
+    canvas.line(static_cast<float>(box.x), base, cx, tip, stroke, theme.dim_text);
+    canvas.line(cx, tip, static_cast<float>(box.right() - 1), base, stroke, theme.dim_text);
 }
 
 void GridView::update(const UiInput& input, const Rect& area, const UiTheme& theme) {
@@ -360,13 +631,25 @@ void GridView::update(const UiInput& input, const Rect& area, const UiTheme& the
     // partial row below that is too short for this column).
     if ((input.pressed & Up) != 0 && focus_ >= per_row) focus_ -= per_row;
     if ((input.pressed & Down) != 0 && focus_ + per_row < count) focus_ += per_row;
+    // One visible page: the page size follows the layout, so a larger tile
+    // setting moves the focus fewer entries per press.
+    if ((input.pressed & PagePrev) != 0) {
+        focus_ = std::max(0, focus_ - per_row * visible);
+    }
+    if ((input.pressed & PageNext) != 0) {
+        focus_ = std::min(count - 1, focus_ + per_row * visible);
+    }
 
-    if (input.pointer_valid && area.contains(input.px, input.py)) {
+    // U3: a direction press owns the frame (the same belt as ListView::update):
+    // the ray hovering another cell must not pull the focus back off the cell
+    // the stick just moved to.
+    const bool direction_pressed = (input.pressed & PointerMode::kDirections) != 0;
+    if (!direction_pressed && input.pointer_valid && area.contains(input.px, input.py)) {
         const int column = static_cast<int>(input.px - static_cast<float>(area.x)) /
-                           std::max(1, cell_width + gap);
+                           std::max(1, cell_width + column_gap);
         const int row = scroll_row_ + static_cast<int>(input.py - static_cast<float>(area.y)) /
                                           std::max(1, cell_height + gap);
-        const int cell_x = area.x + column * (cell_width + gap);
+        const int cell_x = area.x + column * (cell_width + column_gap);
         const int cell_y = area.y + (row - scroll_row_) * (cell_height + gap);
         const bool inside_cell = input.px >= static_cast<float>(cell_x) &&
                                  input.px < static_cast<float>(cell_x + cell_width) &&
@@ -409,7 +692,19 @@ void GridView::draw_cell(UiCanvas& canvas, const GridCell& cell, const Rect& box
                                Rgba{255, 255, 255, static_cast<uint8_t>(focused ? 100 : 48)});
     }
     if (cell.thumb != nullptr && !cell.thumb->empty()) {
-        canvas.blit_cover(image.x, image.y, image.w, image.h, *cell.thumb, radius);
+        if (((cell.turn_quarters % 4) + 4) % 4 != 0) {
+            // A turned photo is fitted, not cropped: the whole turned frame is
+            // visible, on the tile's own backdrop.
+            canvas.blit_turned_fit(image.x, image.y, image.w, image.h, cell.turn_quarters,
+                                   *cell.thumb, radius, theme.background);
+        } else if (cell.fit) {
+            // A photo tile shows the whole picture (stage TF2): fitted inside
+            // the tile, with the backdrop in the bars where the shape differs.
+            canvas.blit_fit(image.x, image.y, image.w, image.h, *cell.thumb, radius,
+                            theme.background);
+        } else {
+            canvas.blit_cover(image.x, image.y, image.w, image.h, *cell.thumb, radius);
+        }
     } else if (cell.icon != GridCell::Icon::None) {
         // Opaque, so a folder's stacked plates do not show through.
         canvas.fill_round_rect(image.x, image.y, image.w, image.h, radius,
@@ -447,14 +742,24 @@ void GridView::draw_cell(UiCanvas& canvas, const GridCell& cell, const Rect& box
                         UiCanvas::text_top_centered(static_cast<int>(cy) - 10, 20, size), percent,
                         size, theme.text);
         }
-        if (!cell.badge.empty()) {
-            const int badge_w = static_cast<int>(UiCanvas::text_width(cell.badge, size));
-            const int badge_y = static_cast<int>(cy + ring) + 8;
-            canvas.fill_round_rect(static_cast<int>(cx) - badge_w / 2 - 10, badge_y - 2,
-                                   badge_w + 20, UiCanvas::line_height(size) + 4, 12,
-                                   Rgba{4, 8, 20, 200});
-            canvas.text(static_cast<int>(cx) - badge_w / 2, badge_y, cell.badge, size, theme.text);
+    }
+
+    if (!cell.badge.empty()) {
+        // Under the progress ring, or (with no ring: a splat file's SPLAT
+        // badge) along the bottom of the tile.
+        const int size = theme.small_size;
+        const int badge_w = static_cast<int>(UiCanvas::text_width(cell.badge, size));
+        int badge_y = image.bottom() - UiCanvas::line_height(size) - 14;
+        if (cell.progress >= 0.0f) {
+            const float ring = static_cast<float>(std::min(image.w, image.h)) * 0.17f;
+            const float cy = static_cast<float>(image.y) + static_cast<float>(image.h) * 0.5f -
+                             ring * 0.45f;
+            badge_y = static_cast<int>(cy + ring) + 8;
         }
+        const int badge_x = image.x + (image.w - badge_w) / 2;
+        canvas.fill_round_rect(badge_x - 10, badge_y - 2, badge_w + 20,
+                               UiCanvas::line_height(size) + 4, 12, Rgba{4, 8, 20, 200});
+        canvas.text(badge_x, badge_y, cell.badge, size, theme.text);
     }
 
     if (cell.checked) {
@@ -471,14 +776,16 @@ void GridView::draw_cell(UiCanvas& canvas, const GridCell& cell, const Rect& box
 
     if (caption_lines <= 0) return;
     const int caption_size = theme.body_size - 2;
-    int y = box.y + image_rect(box, theme).h + 10;
+    int y = box.y + image_rect(box, theme).h + theme.scaled(10);
     const Rgba caption_color =
         cell.dim ? theme.faint_text : (focused ? theme.text : theme.dim_text);
-    // The focused tile shows its whole name on up to `caption_lines` lines
-    // inside the label area; the others keep one line so the grid stays calm.
+    // One label rule for every tile: up to `caption_lines` lines, focused or
+    // not, and the last line ends in an ellipsis when the name does not fit.
+    // The rule used to be "the focused tile wraps, the others keep one line",
+    // which at the smallest size showed one name cut short next to a focused
+    // one on two lines.
     const std::vector<std::string> lines =
-        focused ? wrap_lines(cell.caption, caption_size, box.w - 4, caption_lines)
-                : std::vector<std::string>{fit_text(cell.caption, caption_size, box.w - 4)};
+        wrap_lines(cell.caption, caption_size, box.w - 4, caption_lines);
     for (const std::string& line : lines) {
         canvas.text(box.x + 2, y, line, caption_size, caption_color);
         y += UiCanvas::line_height(caption_size);
@@ -511,19 +818,16 @@ void GridView::draw(UiCanvas& canvas, const Rect& area, const UiTheme& theme) co
                   cell_rect(focused_index, area), true, theme);
     }
 
-    // More rows below or above the visible ones: a small chevron at the edge.
+    // More rows below or above the visible ones: a chevron in the panel's right
+    // gutter, level with the grid's top or bottom edge. It is outside the area
+    // at every size, so it hides neither a tile nor a caption, and it keeps the
+    // hint bar's ink 28 px away (stage TF2).
     const int total_rows = (static_cast<int>(cells_.size()) + per_row - 1) / per_row;
-    const float cx = static_cast<float>(area.x + area.w / 2);
-    // 36 x 18 px chevrons, readable in the headset.
     if (scroll_row_ + visible < total_rows) {
-        const float y = static_cast<float>(area.bottom()) + 2.0f;
-        canvas.line(cx - 18.0f, y, cx, y + 16.0f, 4.0f, theme.dim_text);
-        canvas.line(cx, y + 16.0f, cx + 18.0f, y, 4.0f, theme.dim_text);
+        draw_chevron(canvas, chevron_rect(area, theme, true), false, theme);
     }
     if (scroll_row_ > 0) {
-        const float y = static_cast<float>(area.y) - 4.0f;
-        canvas.line(cx - 18.0f, y, cx, y - 16.0f, 4.0f, theme.dim_text);
-        canvas.line(cx, y - 16.0f, cx + 18.0f, y, 4.0f, theme.dim_text);
+        draw_chevron(canvas, chevron_rect(area, theme, false), true, theme);
     }
 }
 

@@ -1,0 +1,105 @@
+# Stage H, part 3; stage U1 updated the scope.
+#
+# This script is driven by visible-folders-check.sh after the locked script.
+# Nothing here is chosen by hand.
+#
+# What it proves: entering the passcode, turning it off deletes the state file,
+# every album comes back (the previously hidden family-b opens and its scene
+# appears in the klog as "album family-b"), and the passcode string never reaches
+# the log.
+#
+# Settings: the focus starts on Scale; Visible folders is nine Downs (stage T
+# added the Thumbnail size row in Display). In the
+# unlocked list, every row keeps its position, so the last row ("Turn off
+# passcode") is reached by clamping with enough Downs; the confirmation card
+# opens with Cancel focused, so Right then Cross turns it off. Stage U1 dropped
+# the "Network locations..." row, so the two actions are now the last two rows.
+0.5   mark off-start
+0.6   shot home
+1.4   press Options
+2.3   press Down
+2.7   press Down
+3.1   press Down
+3.5   press Down
+3.9   press Down
+4.3   press Down
+4.7   press Down
+5.1   press Down
+5.5   press Down
+5.9   press Cross
+6.1   press Cross
+6.7   press Right
+7.1   press Cross
+7.7   press Right
+8.1   press Right
+8.5   press Cross
+9.1   press Right
+9.5   press Right
+9.9   press Cross
+10.5  press Right
+10.9  press Right
+11.3  press Cross
+11.9  press Down
+12.3  press Down
+12.7  press Down
+13.1  press Down
+13.5  press Right
+13.9  press Right
+14.3  press Right
+14.7  press Right
+15.1  press Cross
+15.7  shot visible-folders-list
+16.5  press Down
+16.9  press Down
+17.3  press Down
+17.7  press Down
+18.1  press Down
+18.5  press Down
+18.9  press Down
+19.3  press Down
+19.7  press Down
+20.1  press Down
+20.5  press Down
+20.9  press Down
+21.3  press Down
+21.7  press Down
+22.1  press Down
+22.5  press Down
+22.9  press Down
+23.3  press Down
+23.7  press Down
+24.1  press Down
+24.5  press Down
+24.9  press Down
+25.3  press Down
+25.7  press Down
+26.1  press Down
+26.5  press Down
+26.9  press Down
+27.3  press Down
+27.7  press Down
+28.1  press Down
+28.5  press Down
+28.9  press Down
+29.3  press Down
+29.7  press Down
+30.1  press Down
+30.5  press Down
+30.9  press Down
+31.3  press Down
+31.7  press Down
+32.1  press Cross
+32.7  shot turn-off-confirm
+33.5  press Right
+33.9  press Cross
+34.5  shot visible-folders-off
+35.3  press Circle
+35.9  press Circle
+36.5  shot home-all-albums
+37.3  press Right
+37.9  press Right
+38.5  press Cross
+39.1  shot family-b
+39.9  press Cross
+40.5  shot scene-open
+41.3  quit

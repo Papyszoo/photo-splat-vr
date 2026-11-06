@@ -293,9 +293,9 @@ TEST_CASE("ui_jobservice snapshot is safe while jobs and readers run") {
     Fixture fixture;
     fixture.start();
 
-    std::vector<splat::Path> photos;
+    std::vector<splat::PhotoPick> photos;
     for (int index = 0; index < 6; ++index) {
-        photos.push_back(write_test_jpeg(fixture.photo("stress_" + std::to_string(index) + ".jpg")));
+        photos.emplace_back(write_test_jpeg(fixture.photo("stress_" + std::to_string(index) + ".jpg")));
     }
     REQUIRE(fixture.service->enqueue(photos, "fake", "").ok());
 

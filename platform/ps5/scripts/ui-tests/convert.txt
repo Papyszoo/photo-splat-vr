@@ -68,6 +68,7 @@
 22.6  press Down
 23.2  press Down
 23.8  press Down
+24.2  press Down
 24.8  shot c2-settings-conversions
 25.4  press Cross
 26.6  shot c2-queue

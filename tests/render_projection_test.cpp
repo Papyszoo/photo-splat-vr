@@ -168,7 +168,8 @@ bool image_moments(const splat::Image& image, Moments& out) {
 // Renders one Gaussian at the capture pose and returns the image.
 splat::Result<splat::Image> render_one(const splat::SplatScene& scene,
                                        const splat::RendererOptions& options,
-                                       splat::VulkanContext& device) {
+                                       splat::VulkanContext& device,
+                                       const splat::FrameView& view = splat::FrameView{}) {
     using Result = splat::Result<splat::Image>;
     auto renderer = splat::SplatRenderer::create(device, options, scene);
     if (!renderer.ok()) return Result::failure(renderer.message());
@@ -185,7 +186,7 @@ splat::Result<splat::Image> render_one(const splat::SplatScene& scene,
     target.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     target.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-    const splat::Status status = renderer.value()->render(splat::FrameView{}, target, true);
+    const splat::Status status = renderer.value()->render(view, target, true);
     if (!status.ok()) return Result::failure(status.message());
     auto pixels = renderer.value()->read_image();
     splat::destroy_vulkan_image(device, image.value());

@@ -28,15 +28,34 @@ LAN-page album editing, cloud anything.
   keeps every colour; no new pipeline beyond that fragment shader, no atlas. The
   R8 mask + tint path stays for the scene label and HUD. The same canvas is
   PNG-dumpable on the desktop (`tools/ui_preview`) with no console.
+- **Panel placement in VR**: world-fixed where it opens. It is latched 1.6 m
+  ahead of the pose the menu opened from, parallel to that pose's view plane
+  (yaw and pitch, never roll), and it stays there while the head moves - turning
+  the head away sees it at an angle, which is the point: the PSVR2 sweet spot is
+  small and a window that keeps re-centring itself cannot be read (user,
+  2026-11-06). **Cross held 1 s with the panel open recentres the window** in
+  front of the user; the same hold with the panel closed recentres the scene
+  ("same button, context"). A Cross tap is still the panel's select.
 - **Input map** (identical on DualSense and Sense, `pad_input.h` stays the one
   table). In a scene: Options = open menu (no longer quits), Cross hold 1 s =
   recentre, L1/R1 = previous/next scene in the album, L2/R2 shrink/grow, sticks
   move/turn, Triangle = toggle tooltips, Create untouched. In the UI:
-  d-pad/left stick = move focus, Cross = select, Circle = back, L1/R1 = page/tab,
+  d-pad/left stick = move focus, Cross = select (it resolves on release while
+  the panel is open: a tap selects, a 1 s hold recentres the window), Circle =
+  back, L1/R1 = page/tab,
   Square = secondary action (select toggle / delete / cancel), Triangle =
   tooltips, Options = close menu (back to the scene if one is loaded). Quit =
-  menu item "Quit" (`LoadExec("exit")`). Sense extras: right-controller laser
-  ray hovers, R2 trigger = click.
+  menu item "Quit" (`LoadExec("exit")`). Sense pointer (U3): the joystick/d-pad
+  owns the menu and the laser is off, so moving the controller never changes
+  the focus. **R2 arms the ray** (the ring appears; that first press only arms,
+  it does not click and does not drag), **R2 again clicks** what the ring points at (Cross still
+  selects the focused entry), and **any d-pad/left-stick direction turns the
+  ray off again** - held counts, not only the press - so a stick frame moves
+  the focus and the pointer cannot pull it back in that frame. Every panel open
+  starts on the joystick (the arm state is not remembered). The DualSense's R2
+  and the right Sense trigger are the same press; with the panel closed R2 is
+  still the scene's scale trigger, because the open panel suspends the scene
+  controls (`route.scene_controls`).
 - **TLS = native sceHttp/sceSsl/sceNet**, not mbedTLS. Why: no new dependency;
   the console's own CA store; the SDK already ships
   `libSceHttp/libSceSsl/libSceNet` stubs (`ref/radv-ps5/sdk/target/lib`);
@@ -106,7 +125,14 @@ Each has a deterministic fake in `core/ui/fakes.h` (used by tests, `ui_preview`
 and fake-mode console runs).
 
 **platform/ps5/viewer**: `UiHost{UiHost(SplatRenderer&, IPanelContent&, Mode tv|vr); init(); frame(UiInput, head pose); visible(); set_visible(); quads(); }`
-— the only thing `main.cpp`/`vr_mode.cpp` talk to. viewer.env keys added: `UI=1`
+— the only thing `main.cpp`/`vr_mode.cpp` talk to. In VR the panel is a
+**world-fixed window** (`PanelAnchor`, `render/hmd_view.h`): it is latched 1.6 m
+in front of the pose it opened from, parallel to that pose's view plane (yaw and
+pitch, never roll, so it is not keystoned), and it never follows the head - the
+2026-11-06 decision, because the PSVR2's small sweet spot makes a constantly
+re-centring window unreadable. `update_panel()` only latches on the first visible
+frame, `panel_quad()` returns the latched quad (the pointer ray tests exactly
+what is drawn) and `recenter_panel()` re-latches it in front of the user. viewer.env keys added: `UI=1`
 (start in the menu), `UI_FAKE=1` (fake services), `SCRIPT=<path>`, `SHOTS_DIR`
 (default `/data/ps5-splat-vr/shots`).
 
@@ -155,7 +181,7 @@ The numbers are kept because code comments refer to them.
 | 13 | models service + screens | core/model adapter, core/ui |
 | 14 | keyboard + album management | core/ui/screens |
 | 15 | viewer integration TV (action map, UiApp in TV, real gallery) | viewer, pad_input |
-| 16 | viewer integration VR (panel quad, Options=menu, album playlist) | vr_mode |
+| 16 | viewer integration VR (world-fixed panel window, Cross 1 s recentres it, Options=menu, album playlist) | vr_mode |
 | 17 | console browse test (scripted TV tour) | tests only |
 | 18 | console+code convert spike (S1/S2) | viewer |
 | 19 | PS5 convert service + queue wiring | platform/ps5 |

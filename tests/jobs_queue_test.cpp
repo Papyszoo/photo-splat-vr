@@ -177,6 +177,40 @@ TEST_CASE("jobs: a job remembers its album and an old queue file still loads") {
     CHECK(old.value().jobs()[0].backend == "sharp");
 }
 
+TEST_CASE("jobs: a job carries its source folder and an old queue file loads without one") {
+    splat_test::TempDir dir("jobs-source");
+    const splat::Path file = queue_file(dir);
+
+    JobQueue queue = JobQueue::open(file).value();
+    const auto converted = queue.enqueue(dir.path() / "a.jpg", "sharp", "Family A", 0,
+                                         splat::Path(), "folder:/data/Photos");
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    const auto imported = queue.enqueue_import(dir.path() / "b.spz", "Family A",
+                                               splat::Path(), "source:usb0");
+    REQUIRE_MESSAGE(imported.ok(), imported.message());
+
+    const JobQueue reloaded = JobQueue::open(file).value();
+    REQUIRE(reloaded.find(converted.value()) != nullptr);
+    CHECK(reloaded.find(converted.value())->source_folder == "folder:/data/Photos");
+    CHECK(reloaded.find(imported.value())->source_folder == "source:usb0");
+
+    // A queue file written before stage H has no "source_folder" key: it loads
+    // with an empty string and the runner derives one at run time.
+    write_text(file,
+               "{\n"
+               "  \"version\": 1,\n"
+               "  \"next_sequence\": 2,\n"
+               "  \"jobs\": [\n"
+               "    {\"id\": \"job-000001\", \"photo\": \"/tmp/a.jpg\", \"backend\": \"sharp\",\n"
+               "     \"state\": \"queued\", \"message\": \"\", \"scene_folder\": \"\",\n"
+               "     \"seconds_taken\": 0.0, \"sequence\": 1}\n"
+               "  ]\n"
+               "}\n");
+    const JobQueue old = JobQueue::open(file).value();
+    REQUIRE(old.jobs().size() == 1);
+    CHECK(old.jobs()[0].source_folder.empty());
+}
+
 TEST_CASE("jobs: cancel stops queued and running jobs") {
     splat_test::TempDir dir("jobs-cancel");
     const splat::Path file = queue_file(dir);
@@ -340,4 +374,28 @@ TEST_CASE("jobs: a job interrupted mid-run is re-queued, not left running") {
     const splat::Job* running = queue.find(taken.value()->id);
     REQUIRE(running != nullptr);
     CHECK(running->state == JobState::Running);
+}
+
+TEST_CASE("jobs: a scene turn is its own queued job kind and survives a restart") {
+    splat_test::TempDir dir("jobs-rotate-queue");
+    const splat::Path folder = dir.path() / "scenes" / "s1";
+    std::filesystem::create_directories(folder);
+    JobQueue queue = JobQueue::open(queue_file(dir)).value();
+    const auto id = queue.enqueue_rotate(folder, 3, "trip");   // three clockwise = left
+    REQUIRE_MESSAGE(id.ok(), id.message());
+
+    const auto reloaded = JobQueue::open(queue_file(dir));
+    REQUIRE_MESSAGE(reloaded.ok(), reloaded.message());
+    const splat::Job* job = reloaded.value().find(id.value());
+    REQUIRE(job != nullptr);
+    CHECK(job->kind == splat::JobKind::rotate);
+    CHECK(job->photo == folder);
+    CHECK(job->rotate_quarters == 3);
+    CHECK(job->album == "trip");
+    CHECK(job->state == JobState::Queued);
+
+    // The same rule as a conversion: the folder is not queued twice while it
+    // is active.
+    JobQueue same = reloaded.value();
+    CHECK_FALSE(same.enqueue_rotate(folder, 1).ok());
 }

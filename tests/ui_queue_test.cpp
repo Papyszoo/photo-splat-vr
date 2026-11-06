@@ -32,8 +32,8 @@ public:
     std::vector<JobView> views;
     std::vector<std::string> cancelled;
 
-    splat::Status enqueue(const std::vector<splat::Path>&, const std::string&,
-                          const std::string&) override {
+    splat::Status enqueue(const std::vector<splat::PhotoPick>&, const std::string&,
+                          const std::string&, const splat::Path& = splat::Path()) override {
         return splat::Status::success();
     }
     std::vector<JobView> snapshot() const override { return views; }
@@ -99,6 +99,29 @@ struct Fixture {
 
 }  // namespace
 
+TEST_CASE("ui_queue Select on a done network row opens the scene from the share") {
+    Fixture fixture;
+    StubJobService jobs;
+
+    // An upload job: the scene folder is on the share, not under
+    // services.paths.scenes, and the row still offers View.
+    JobView done = make_view("job-000030", "trip.jpg", "done", "album");
+    done.output_root = splat::Path("smb0:/scenes");
+    done.scene_folder = splat::Path("smb0:/scenes/album/trip");
+    jobs.views = {done};
+    fixture.services.jobs = &jobs;
+    fixture.enter();
+
+    REQUIRE(fixture.screen.hints().size() == 2);
+    CHECK(fixture.screen.hints()[0].label == "View");
+
+    fixture.press(splat::Select);
+    REQUIRE(fixture.commands.size() == 1);
+    CHECK(fixture.commands[0].kind == splat::UiCommand::OpenPath);
+    CHECK(fixture.commands[0].path == splat::Path("smb0:/scenes/album/trip/scene.psplat"));
+    CHECK(fixture.toasts.empty());
+}
+
 TEST_CASE("ui_queue lists name, backend, album and stage for every job") {
     Fixture fixture;
     StubJobService jobs;
@@ -148,6 +171,74 @@ TEST_CASE("ui_queue lists name, backend, album and stage for every job") {
     hints = fixture.screen.hints();
     REQUIRE(hints.size() == 1);
     CHECK(hints[0].label == "Back");
+}
+
+TEST_CASE("an import row names its stage while running and its notice when done") {
+    Fixture fixture;
+    StubJobService jobs;
+
+    JobView running = make_view("job-000010", "robot.spz", "running");
+    running.backend = "import";
+    running.stage = "importing";
+    running.fraction = 0.1f;
+    JobView thinned = make_view("job-000011", "big.spz", "done");
+    thinned.backend = "import";
+    thinned.message = "thinned 4,000,000 to 2,000,000 splats";
+    JobView imported = make_view("job-000012", "small.spz", "done");
+    imported.backend = "import";
+    imported.message = "imported 3 splats";
+    jobs.views = {running, thinned, imported};
+
+    fixture.services.jobs = &jobs;
+    fixture.enter();
+
+    const std::vector<splat::ListRow>& rows = fixture.screen.list().rows();
+    REQUIRE(rows.size() == 3);
+    // An import has no meaningful percentage: the row carries the runner's
+    // stage instead of "Converting".
+    CHECK(rows[0].right == "Importing");
+    // A finished import keeps its count, which is the whole notice L2-B asks for.
+    CHECK(rows[1].right == "thinned 4,000,000 to 2,000,000 splats");
+    CHECK(rows[2].right == "imported 3 splats");
+}
+
+TEST_CASE("ui_queue names a scene turn and does not offer View for it") {
+    Fixture fixture;
+    StubJobService jobs;
+
+    JobView running = make_view("job-000020", "s1", "running", "trip");
+    running.kind = "rotate";
+    running.backend = "rotate";
+    running.stage = "rotating";
+    running.fraction = 0.5f;
+    JobView done = make_view("job-000021", "s2", "done", "trip");
+    done.kind = "rotate";
+    done.backend = "rotate";
+    done.message = "rotated";
+    jobs.views = {running, done};
+
+    fixture.services.jobs = &jobs;
+    fixture.enter();
+
+    const std::vector<splat::ListRow>& rows = fixture.screen.list().rows();
+    REQUIRE(rows.size() == 2);
+    // Not a conversion and not a model: the row says what it is doing and the
+    // shelf the entry came from.
+    CHECK(rows[0].label == "s1");
+    CHECK(rows[0].sublabel == "Scene  \xC2\xB7  trip");
+    CHECK(rows[0].right == "Rotating 50%");
+    CHECK(rows[1].right == "Rotated");
+
+    // A turn rewrites the entry the shelf already has; there is no new scene
+    // in an album to look up, so Cross is not offered (the old lookup toasted
+    // "scene is not there yet").
+    fixture.press(splat::Down);
+    const std::vector<splat::Hint> hints = fixture.screen.hints();
+    REQUIRE(hints.size() == 1);
+    CHECK(hints[0].button == "Circle");
+    fixture.press(splat::Select);
+    CHECK(fixture.commands.empty());
+    CHECK(fixture.toasts.empty());
 }
 
 TEST_CASE("ui_queue Select on a done row emits ViewScene for its scene") {

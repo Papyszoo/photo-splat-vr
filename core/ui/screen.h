@@ -12,6 +12,7 @@
 #pragma once
 
 #include <functional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +38,9 @@ enum class ScreenId {
     Keyboard,
     Controls,
     AlbumPick,
+    Locations,        // the configured network shares
+    LocationEdit,     // one location's fields
+    VisibleFolders,   // the passcode and the allow-list (stage H)
 };
 
 // Display name, used for the "not available yet" toast.
@@ -53,6 +57,9 @@ inline const char* screen_id_name(ScreenId id) {
         case ScreenId::Keyboard: return "Keyboard";
         case ScreenId::Controls: return "Controls";
         case ScreenId::AlbumPick: return "Move";
+        case ScreenId::Locations: return "Network locations";
+        case ScreenId::LocationEdit: return "Location";
+        case ScreenId::VisibleFolders: return "Visible folders";
     }
     return "Screen";
 }
@@ -64,6 +71,29 @@ struct ScreenArgs {
     std::string b;
     std::vector<std::string> list;
     int n = 0;
+    // Per-item integers for a screen that needs them, parallel to `list`: the
+    // photo picker's clockwise quarter turns (missing entries are 0).
+    std::vector<int> turns;
+    // The visible-folders key of each entry in `list`, parallel to `list`: the
+    // photo picker hands its source key to the convert dialog so the queue never
+    // has to guess which tab a photo came from (missing entries are empty).
+    std::vector<std::string> sources;
+    // The free-text keyboard ("a" == "free-text"): where the typed value goes,
+    // whether the field draws one '*' per character, and the length cap. A
+    // screen sets on_text on the arguments it pushes and reads the value in the
+    // callback; the keyboard pops itself afterwards.
+    std::function<void(const std::string&)> on_text;
+    bool masked = false;
+    int max_length = 64;
+    // The keyboard's title for free text ("" keeps the default), and the minimum
+    // length free text must reach before OK is enabled (0 = only non-empty, the
+    // location editor's rule). The Visible folders passcode uses both.
+    std::string title;
+    int min_length = 0;
+    // True for a field whose empty value is meaningful (the location editor's
+    // Port: empty is the protocol default). Without it the keyboard's "type a
+    // value" rule makes the value impossible to clear back.
+    bool allow_empty = false;
 };
 
 // One button/label pair in the bottom hint bar: {"Cross", "Open"} renders as
@@ -112,6 +142,10 @@ struct UiServices {
     IJobService* jobs = nullptr;
     IModelService* models = nullptr;
     ICaptureService* captures = nullptr;
+    // The configured network shares: the Locations screen edits them, the photo
+    // picker takes a tab from each photo_source, and a location path in a scene
+    // library is read through the VFS. Null: the feature is not in this build.
+    ILocationService* locations = nullptr;
     // The system text-entry dialog. Null or unavailable: the panel keyboard
     // draws its own QWERTY grid (the fallback until the IME spike lands).
     ITextInput* text_input = nullptr;
@@ -122,13 +156,31 @@ struct UiServices {
     // Host line sink (the viewer passes viewer::line, so a screen's log line
     // lands in klog). Empty in builds without a log reader.
     std::function<void(const std::string&)> log;
+    // The scene folder the viewer currently has open ("" = none). The host
+    // updates it as scenes load; the Scenes shelf refuses to rotate that folder
+    // because the renderer is holding the version it read.
+    Path open_scene;
+    // The rotate job ids whose completion has already been shown as a toast.
+    // Session-wide so a turn that finishes while its shelf is off screen is
+    // announced once on the way back, and history from an earlier launch (seeded
+    // on the first shelf entry) is not announced again.
+    std::set<std::string> announced_turns;
+    bool turns_seeded = false;
 };
 
 // A request to the host, emitted from a screen through UiContext::command().
 struct UiCommand {
-    enum Kind { ViewScene, ResumeScene, Quit } kind = ResumeScene;
+    // OpenPath: load this scene file from where it lies (a network location or
+    // any path the panel browsed), through the VFS and without copying it into
+    // the local library. The host makes it a one-entry playlist.
+    // HideScene: the visible-folders policy changed (a tick, a new passcode,
+    // turning it off). The host checks the scene the viewer has open and closes
+    // it when it is no longer allowed, so a hidden scene never stays on screen
+    // or resumes behind the panel.
+    enum Kind { ViewScene, ResumeScene, Quit, OpenPath, HideScene } kind = ResumeScene;
     std::string album;  // ViewScene: album folder name ("" = loose scenes)
     int index = 0;      // ViewScene: scene index in that album
+    Path path;          // OpenPath: the scene file (.psplat)
 };
 
 class ScreenStack;
@@ -161,6 +213,10 @@ struct UiContext {
     void invalidate() {
         if (invalidate_sink) invalidate_sink();
     }
+    // The one thumbnail size index every entry grid lays out from
+    // (core/ui/widgets.h, stage T): the saved setting clamped, or the default
+    // when this context has no state (unit tests, the preview).
+    int thumbnail_size() const;
 };
 
 }  // namespace splat

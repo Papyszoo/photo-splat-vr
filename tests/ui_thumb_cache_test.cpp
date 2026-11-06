@@ -41,7 +41,15 @@ splat::ThumbCache::Loader tile(uint32_t width, uint32_t height) {
 TEST_CASE("ui_thumb_cache delivers a loaded tile") {
     splat::ThumbCache cache(8);
     CHECK_FALSE(cache.pending());
-    cache.request("scene-a", tile(3, 2));
+    // A loader that takes a few milliseconds: with a trivial one the worker can
+    // finish before the next statement runs, and pending() is then legitimately
+    // already false (a full-suite run hit that race).
+    cache.request("scene-a", [] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        splat::UiImage image;
+        image.resize(3, 2);
+        return splat::Result<splat::UiImage>::success(std::move(image));
+    });
     CHECK(cache.pending());
     REQUIRE(wait_until([&cache] { return !cache.pending(); }));
 

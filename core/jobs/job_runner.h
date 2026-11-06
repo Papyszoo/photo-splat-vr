@@ -21,6 +21,11 @@ struct JobRunnerConfig {
     Path model_path;                  // GGUF handed to IReconstructor::load
     int thumbnail_max_edge = 512;     // thumb.jpg longest edge
     int jpeg_quality = 90;            // original.jpg (re-encode) and thumb.jpg
+    // Where a scene for a network destination is built before it is uploaded
+    // (<staging_root>/<job id>). Empty: a remote output_root fails the job with
+    // a message instead of writing somewhere unintended. Last so the existing
+    // positional initialisers (root, model, edge, quality) keep their meaning.
+    Path staging_root;
 };
 
 // The folder name a job for `photo` gets: the photo stem with every character
@@ -40,10 +45,13 @@ struct JobOutcome {
     double seconds_taken = 0.0;
 };
 
-// C9. Runs the next queued job: take it, decode the photo, read the EXIF focal
-// length (SHARP's 30 mm default when there is none), run the backend, then
-// write a C5 scene folder in the job's album. Failures are recorded on the job
-// with a message instead of being thrown.
+// C9. Runs the next queued job. A `convert` job decodes the photo, reads the
+// EXIF focal length (SHARP's 30 mm default when there is none), runs the
+// backend, then writes a C5 scene folder in the job's album. An `import` job
+// takes a different branch before any model is loaded: it reads the splat
+// file, thins it to kMaxSceneSplats and writes an imported scene folder
+// (core/scene/imported_scene.h). Failures are recorded on the job with a
+// message instead of being thrown.
 //
 // A crash mid-job is safe from both sides: the queue file says "running", which
 // open() re-queues, and the scene folder is only valid once meta.json is
@@ -78,6 +86,11 @@ public:
     // it around every queue call and never holds it during inference, so an
     // enqueue on another thread does not wait for a conversion.
     void set_queue_mutex(std::mutex* mutex);
+    // Asked before a scene turn starts whether the viewer has that folder open.
+    // True refuses the job: rewriting under the loaded scene would leave the
+    // renderer and the file disagreeing. Set by the UI adapter; a runner driven
+    // straight from a CLI leaves it empty.
+    void set_scene_open(std::function<bool(const Path& folder)> open);
 
     // Runs at most one job. Returns nullopt when nothing is queued or a job is
     // already running. progress receives 0..1 with a short stage label.
@@ -89,6 +102,7 @@ private:
     Factory factory_;
     JobRunnerConfig config_;
     std::function<bool(const std::string&)> cancel_request_;
+    std::function<bool(const Path&)> scene_open_;
     std::mutex* queue_mutex_ = nullptr;
 };
 

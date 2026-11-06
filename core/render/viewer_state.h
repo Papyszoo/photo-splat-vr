@@ -21,6 +21,10 @@ inline constexpr float kDefaultFadeStart = 0.5f;
 // viewer. The desktop's WORLD_SCALE key is clamped to the same range.
 inline constexpr float kMinWorldScale = 0.25f;
 inline constexpr float kMaxWorldScale = 4.0f;
+// The in-place Centre view can shrink far below the immersive floor: a 160 m
+// street reconstruction has to become a small object to read as "smaller", and
+// the old 0.25 floor left it 40 m wide. Scaling up stays at kMaxWorldScale.
+inline constexpr float kMinSceneScale = 0.001f;
 inline constexpr float kMinComfortRadius = 0.05f;
 inline constexpr float kMaxComfortRadius = 5.0f;
 
@@ -50,8 +54,17 @@ public:
     const float* anchor() const { return anchor_; }
     void set_anchor(float x, float y, float z);
 
-    // Clamped to [kMinWorldScale, kMaxWorldScale].
+    // Clamped to the current limits (kMinWorldScale..kMaxWorldScale unless
+    // set_world_scale_limits() widened them for a model view).
     void set_world_scale(float scale);
+    // The range set_world_scale() and scale_about_pivot() clamp to. The VR
+    // model view needs scales below kMinWorldScale: a 160 m street scene is
+    // 1/160 of a table-sized model, which the immersive 0.25 floor cannot
+    // express. Defaults are kMinWorldScale..kMaxWorldScale, so every existing
+    // path and test is unchanged.
+    void set_world_scale_limits(float min_scale, float max_scale);
+    float min_world_scale() const { return min_scale_; }
+    float max_world_scale() const { return max_scale_; }
     // Same, by a factor, about the scene's origin (the capture point): a pure
     // zoom when the viewer stands at the capture point, which is why the VR
     // viewer uses scale_about_pivot() instead.
@@ -109,6 +122,8 @@ private:
     float offset_[3] = {0.0f, 0.0f, 0.0f};
     float yaw_offset_ = 0.0f;
     float world_scale_ = 1.0f;
+    float min_scale_ = kMinWorldScale;
+    float max_scale_ = kMaxWorldScale;
     float comfort_radius_ = kDefaultComfortRadius;
     float fade_start_ = kDefaultFadeStart;
     bool paused_ = false;

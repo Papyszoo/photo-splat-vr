@@ -40,8 +40,12 @@ include $(REPO)/platform/ps5/title/identity.mk
 # protocol compares capture paths with; it is compiled in by path because the
 # payload links no library. copy_captures() itself resolves each source with the
 # helper's own realpath/lstat.
-SOURCES := main.cpp $(REPO)/core/capture/helper_protocol.cpp $(REPO)/core/common/path.cpp
-HEADERS := $(REPO)/core/capture/helper_protocol.h $(REPO)/core/common/path.h
+# core/image/format.cpp is the one photo format list: capture_format() delegates
+# to it (L1), so the helper classifies a capture exactly as the app does.
+SOURCES := main.cpp $(REPO)/core/capture/helper_protocol.cpp $(REPO)/core/common/path.cpp \
+           $(REPO)/core/common/tiff_tags.cpp $(REPO)/core/image/format.cpp
+HEADERS := $(REPO)/core/capture/helper_protocol.h $(REPO)/core/common/path.h \
+           $(REPO)/core/image/format.h
 
 # Size matters twice: the whole ELF is streamed to elfldr over the loopback
 # socket when the title starts it, and the package check keeps the shipped copy

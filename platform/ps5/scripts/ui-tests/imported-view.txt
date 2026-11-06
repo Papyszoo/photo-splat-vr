@@ -1,0 +1,22 @@
+# A2's last step, without a person: open the imported scene and prove it draws.
+#
+# Home (Albums) -> 00_v02_console: entering an album puts the focus on its first
+# scene, which is "0a-big" - the import of the 3 M-splat fixture (thinned to
+# 2 M). Cross opens it. The shot is taken 6 s later, when the scene is staged,
+# and console-run.sh counts the pixels that are not the backdrop (A2 asks for
+# more than 5 %). A flat 118,118,118 frame - the clear colour of an empty
+# pipeline - fails the case, which is exactly what the console pass's reopen
+# shot was.
+#
+# The driver asserts the scene's name from the klog
+# ("viewer: tv scene 1/N 0a-big (album 00_v02_console)"): the album also holds
+# the format case's converted scenes, and without the name this case measured
+# whatever sorted first (that was "avif", a conversion, not an import).
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+3.0  press Cross
+7.0  shot imported-scene
+8.0  press Circle
+9.0  press Circle
+10.0 quit

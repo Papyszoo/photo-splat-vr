@@ -4,3 +4,30 @@
 [submodule "third_party/glfw"]
 	path = third_party/glfw
 	url = https://github.com/glfw/glfw.git
+[submodule "third_party/libwebp"]
+	path = third_party/libwebp
+	url = https://github.com/webmproject/libwebp.git
+[submodule "third_party/libtiff"]
+	path = third_party/libtiff
+	url = https://gitlab.com/libtiff/libtiff.git
+[submodule "third_party/libde265"]
+	path = third_party/libde265
+	url = https://github.com/strukturag/libde265.git
+[submodule "third_party/libheif"]
+	path = third_party/libheif
+	url = https://github.com/strukturag/libheif.git
+[submodule "third_party/libaom"]
+	path = third_party/libaom
+	url = https://aomedia.googlesource.com/aom
+[submodule "third_party/libraw"]
+	path = third_party/libraw
+	url = https://github.com/LibRaw/LibRaw.git
+[submodule "third_party/zstd"]
+	path = third_party/zstd
+	url = https://github.com/facebook/zstd.git
+[submodule "third_party/libsmb2"]
+	path = third_party/libsmb2
+	url = https://github.com/sahlberg/libsmb2.git
+[submodule "third_party/libnfs"]
+	path = third_party/libnfs
+	url = https://github.com/sahlberg/libnfs.git

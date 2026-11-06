@@ -3,6 +3,7 @@
 #if defined(SPLAT_HAVE_VULKAN)
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -11,7 +12,9 @@
 #include <vector>
 
 #include "render/radix_sort.h"
+#include "render/splat_renderer.h"
 #include "render/vulkan_context.h"
+#include "scene/splat_scene.h"
 
 namespace {
 
@@ -182,6 +185,82 @@ TEST_CASE("GPU radix sort matches std::stable_sort, including ties") {
         check_sort(count);
     }
 }
+
+namespace {
+
+// One splat cloud on a coarse lattice: all of it in front of the camera and
+// inside the frame, and no two splats at the same depth, so the sort order is
+// decided and the CPU's pre-rotated copy cannot tie with it.
+splat::SplatScene lattice_scene() {
+    constexpr int kSide = 4;   // 4 x 4 x 3 = 48 splats
+    constexpr int kDepth = 3;
+    splat::SplatScene scene;
+    scene.resize(static_cast<size_t>(kSide * kSide * kDepth));
+    const float white_dc = 0.5f / 0.28209479177387814f;
+    const float log_sigma = std::log(0.02f);
+    size_t index = 0;
+    for (int z = 0; z < kDepth; ++z) {
+        for (int y = 0; y < kSide; ++y) {
+            for (int x = 0; x < kSide; ++x, ++index) {
+                // z spans 0.80 .. 1.10 m in 0.15 m steps, x and y +-0.15 m.
+                scene.position[index * 3 + 0] = 0.1f * static_cast<float>(x - 1);
+                scene.position[index * 3 + 1] = 0.1f * static_cast<float>(y - 1);
+                scene.position[index * 3 + 2] = 0.8f + 0.15f * static_cast<float>(z);
+                for (int axis = 0; axis < 3; ++axis) {
+                    scene.log_scale[index * 3 + axis] = log_sigma;
+                }
+                scene.rotation[index * 4 + 0] = 1.0f;   // w, x, y, z: identity
+                scene.rotation[index * 4 + 1] = 0.0f;
+                scene.rotation[index * 4 + 2] = 0.0f;
+                scene.rotation[index * 4 + 3] = 0.0f;
+                for (int channel = 0; channel < 3; ++channel) {
+                    scene.sh_dc[index * 3 + channel] = white_dc;
+                }
+                scene.opacity_logit[index] = 12.0f;
+            }
+        }
+    }
+    return scene;
+}
+
+// Renders the scene once (no readback) and returns the frame's draw order: the
+// splat indices as the sort left them, which is what a rotation must not
+// change. Empty with `error` set on failure.
+std::vector<uint32_t> draw_order(const splat::SplatScene& scene,
+                                 const splat::RendererOptions& options,
+                                 const splat::FrameView& view, splat::VulkanContext& device,
+                                 std::string& error) {
+    auto renderer = splat::SplatRenderer::create(device, options, scene);
+    if (!renderer.ok()) {
+        error = renderer.message();
+        return {};
+    }
+    auto image = splat::create_vulkan_color_image(
+        device, options.target_format, renderer.value()->target_extent(),
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!image.ok()) {
+        error = image.message();
+        return {};
+    }
+    splat::RenderTarget target;
+    target.image = image.value().image;
+    target.view = image.value().view;
+    target.extent = renderer.value()->target_extent();
+    target.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    target.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const splat::Status status = renderer.value()->render(view, target, false);
+    std::vector<uint32_t> order;
+    if (!status.ok()) {
+        error = status.message();
+    } else {
+        order = renderer.value()->last_draw_order();
+        if (order.empty()) error = "the renderer returned no draw order";
+    }
+    splat::destroy_vulkan_image(device, image.value());
+    return order;
+}
+
+}  // namespace
 
 #else
 

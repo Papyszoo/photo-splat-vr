@@ -1,0 +1,26 @@
+# The four malformed splat files, and nothing else.
+#
+# console-run.sh pushes exactly runs/v0.2-library/console/splats-bad (bad.splat,
+# bad.spz, bad.ply, bad.compressed.ply) into the inbox, so all four are among the
+# panel's six reachable tiles whatever order the inbox lists them in - the
+# import case with nine fixtures could only press the first six, which is why
+# its refusal assertions were never real (console pass 3, T10).
+#
+# Home (Albums) -> 00_v02_console -> Left ("+ Add photos") -> Photos, Inbox tab.
+# Cross on a splat tile queues the import immediately and the malformed ones fail
+# on their own; the queue goes on to the next file. Four tiles: Cross, Right,
+# Cross, Right, Cross, Right, Cross.
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+3.0  press Left
+3.6  press Cross
+5.0  press Cross
+5.6  press Right
+6.0  press Cross
+6.6  press Right
+7.0  press Cross
+7.6  press Right
+8.0  press Cross
+20.0 shot refused
+21.0 quit

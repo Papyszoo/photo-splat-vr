@@ -54,6 +54,10 @@ RADV_SDK ?= $(RADV_PS5)/sdk
 RADV_LIB := $(RADV_PS5)/lib/libvulkan_radeon.ps5.a
 RADV_BUILTINS := $(RADV_PS5)/lib/libclang_rt.builtins-x86_64.a
 BUILD    ?= $(REPO)/build-ps5-ggml
+# The cross-built HEIF stack (third_party/build_codecs.sh). The gate builds it
+# into build-ps5-codecs/prefix and passes CODECS_PREFIX to the libraries build;
+# the title link names the same archives here.
+CODECS_PREFIX ?= $(REPO)/build-ps5-codecs/prefix
 GGML_LIB := $(BUILD)/ggml/src
 GLUE     := $(REPO)/platform/ps5/ggml
 
@@ -81,16 +85,16 @@ TITLE_STEM       := viewer
 # fetcher assembly, see ui_setup.h) and W3's sceHttp fetcher, which is
 # PS5_TITLE-only and therefore compiled into the title rather than the archive.
 TITLE_SOURCES    := main.cpp videoout.cpp vk_entrypoints.cpp eye_buffers.cpp \
-                    convert_session.cpp ui_host.cpp ui_setup.cpp ps5_jobs.cpp \
-                    ../net/ps5_http_fetcher.cpp \
+                    convert_session.cpp ui_host.cpp ui_setup.cpp ps5_jobs.cpp net_init.cpp \
+                    ../net/ps5_http_fetcher.cpp ../net/resolve_glue.cpp \
                     vr_mode.cpp ../hmd2/hmd2.cpp
 TITLE_HEADERS    := videoout.h title_common.h vk_common.h eye_buffers.h pad_input.h vr_mode.h \
                     scene_switch.h convert_session.h ui_host.h ui_setup.h ui_mode.h \
-                    ps5_jobs.h convert_gate.h ../hmd2/hmd2.h
+                    ps5_jobs.h convert_gate.h net_init.h ../hmd2/hmd2.h
 # -I$(REPO): the fetcher is included by its repo path
 # (platform/ps5/net/ps5_http_fetcher.h), the same include root the bench title
 # uses.
-TITLE_CPPFLAGS   := -DPS5_TITLE -DSPLAT_HAVE_VULKAN=1 -DSPLAT_VERSION=\"0.1.1\" \
+TITLE_CPPFLAGS   := -DPS5_TITLE -DSPLAT_HAVE_VULKAN=1 -DSPLAT_VERSION=\"0.5.0\" \
                     -I$(REPO) -I$(REPO)/core -I$(REPO)/third_party -I$(REPO)/third_party/json \
                     -I$(RADV_PS5)/include -I$(GLUE) -I$(REPO)/third_party/ggml/include
 TITLE_CXXFLAGS   := $(CXXFLAGS) -ffunction-sections -fdata-sections
@@ -100,11 +104,28 @@ TITLE_CXXFLAGS   := $(CXXFLAGS) -ffunction-sections -fdata-sections
 # and its vendored miniz. The same list platform/ps5/bench/Makefile links.
 TITLE_EXTRA_LIBS := $(BUILD)/libsplat_core_ps5.a $(BUILD)/libsplat_ps5_glue.a \
                     $(BUILD)/libsplat_miniz.a \
+                    $(BUILD)/libsplat_zstd.a \
+                    $(BUILD)/third_party/libwebp/libwebp.a \
+                    $(BUILD)/third_party/libtiff/libtiff.a \
+                    $(BUILD)/third_party/libsmb2/libsmb2.a \
+                    $(BUILD)/third_party/libnfs/libnfs.a \
+                    $(CODECS_PREFIX)/lib/libheif.a $(CODECS_PREFIX)/lib/libde265.a \
+                    $(CODECS_PREFIX)/lib/libaom.a \
+                    $(BUILD)/libsplat_libraw.a \
                     $(GGML_LIB)/ggml-vulkan/libggml-vulkan.a \
                     $(GGML_LIB)/libggml.a $(GGML_LIB)/libggml-base.a $(GGML_LIB)/libggml-cpu.a \
                     -lSceHttp -lSceSsl -lSceNet -lSceNetCtl
 # core/recon/sharp submits its graphs through ggml_backend_graph_compute, and
 # the glue's submit counter is the only definition of the wrapped name.
+# getaddrinfo/freeaddrinfo (console pass 3, P1): libsmb2 and libnfs are
+# submodules and resolve every server name through getaddrinfo, which inside this
+# title is libps5platform's ps5_getaddrinfo stub - `return EAI_FAIL` for every
+# input, a dotted quad included. ../net/resolve_glue.cpp DEFINES the two names
+# (not --wrap: radv-link.mk binds getaddrinfo through --defsym, and with both in
+# place lld points __wrap_getaddrinfo at the defsym target and drops the wrapper
+# - measured on this link) and answers a literal from its own bytes.
+# TITLE_DEFSYM_SKIP removes those two --defsyms so the definitions here are the
+# ones that bind.
 TITLE_EXTRA_LDFLAGS := --wrap=ggml_backend_graph_compute
 # Every Vulkan entry point the shims define stays local: a title exports
 # nothing, and the converter refuses anything that does. The glue archive's
@@ -113,6 +134,14 @@ TITLE_EXTRA_LDFLAGS := --wrap=ggml_backend_graph_compute
 # does not depend on that. The grep also picks up names mentioned only in
 # comments; an unused local: entry is harmless. klog_puts is convert_session.cpp's
 # title-side bridge for the glue's log line -- also not an export.
+# The resolver shim's getaddrinfo/freeaddrinfo are this title's own definitions
+# of a libc name (resolve_glue.cpp); a title exports nothing, and radv-link.mk's
+# local list already carries both names. TITLE_DEFSYM_SKIP keeps their --defsym
+# out of the link, so no other definition of them exists.
+# The shim's delegate is the SDK's ps5_getaddrinfo stub, which is what a console
+# has: the probe reports "no name service" and the location's offline line says
+# to enter the IP address.
+TITLE_DEFSYM_SKIP := getaddrinfo freeaddrinfo
 TITLE_EXTRA_LOCAL := $(shell grep -ohE '\bvk[A-Z][A-Za-z0-9_]*' vk_entrypoints.cpp \
                         ../ggml/ps5_vulkan.cpp | sort -u) klog_puts
 
@@ -218,7 +247,11 @@ check-core:
 	    exit 1; }
 
 # Relink when the cross-built archives change, not only when the program does.
-$(TITLE_PIE): $(CORE_ARCHIVE) $(MINIZ_ARCHIVE) $(GLUE_ARCHIVE) $(GGML_ARCHIVES) | check-core
+$(TITLE_PIE): $(CORE_ARCHIVE) $(MINIZ_ARCHIVE) $(GLUE_ARCHIVE) $(GGML_ARCHIVES) \
+              $(BUILD)/third_party/libwebp/libwebp.a $(BUILD)/third_party/libtiff/libtiff.a \
+              $(BUILD)/third_party/libsmb2/libsmb2.a $(BUILD)/third_party/libnfs/libnfs.a \
+              $(CODECS_PREFIX)/lib/libheif.a $(CODECS_PREFIX)/lib/libde265.a \
+              $(CODECS_PREFIX)/lib/libaom.a $(BUILD)/libsplat_libraw.a | check-core
 
 # The local-symbol list is computed from this Makefile (TITLE_EXTRA_LOCAL), but
 # build-title.mk only makes the map depend on itself; rebuild the map when this
@@ -237,6 +270,9 @@ viewer-package: title-package $(SHADERS) $(PACKAGE_HELPER) samples-package
 	    "$$(du -sk $(TITLE_DIR) | awk '{print $$1 * 1024}')"
 
 $(CORE_ARCHIVE) $(MINIZ_ARCHIVE) $(GLUE_ARCHIVE) $(GGML_ARCHIVES) \
+$(BUILD)/third_party/libwebp/libwebp.a $(BUILD)/third_party/libtiff/libtiff.a \
+$(CODECS_PREFIX)/lib/libheif.a $(CODECS_PREFIX)/lib/libde265.a $(CODECS_PREFIX)/lib/libaom.a \
+$(BUILD)/libsplat_libraw.a \
 $(RADV_LIB) $(RADV_BUILTINS) \
 $(RADV_SDK)/target/lib/libps5platform.a:
 	@echo "missing $@" >&2

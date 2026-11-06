@@ -1,8 +1,6 @@
 #include "jobs/job_queue.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -10,10 +8,8 @@
 
 #include <nlohmann/json.hpp>
 
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <unistd.h>
-#endif
+#include "vfs/atomic_write.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -24,52 +20,6 @@ std::string job_id_for(uint64_t sequence) {
     std::ostringstream out;
     out << "job-" << std::setw(6) << std::setfill('0') << sequence;
     return out.str();
-}
-
-// Flushes a directory entry so a rename survives a power cut, not just a
-// process crash. Best effort: a filesystem that cannot do it still gets the
-// atomic rename.
-void sync_directory(const Path& directory) {
-#if !defined(_WIN32)
-    if (directory.empty()) return;
-    const int fd = ::open(directory.string().c_str(), O_RDONLY);
-    if (fd >= 0) {
-        ::fsync(fd);
-        ::close(fd);
-    }
-#else
-    (void)directory;
-#endif
-}
-
-// Writes text to `path` and flushes it to the device, so the following rename
-// publishes complete data even if the console loses power.
-bool write_file_durably(const Path& path, const std::string& text, std::string& error) {
-    std::FILE* file = std::fopen(path.string().c_str(), "wb");
-    if (file == nullptr) {
-        error = "cannot open " + path.string() + " for writing";
-        return false;
-    }
-    const size_t written = std::fwrite(text.data(), 1, text.size(), file);
-    bool ok = written == text.size();
-    if (!ok) error = "failed while writing " + path.string();
-    if (std::fflush(file) != 0) {
-        ok = false;
-        if (error.empty()) error = "failed while flushing " + path.string();
-    }
-#if !defined(_WIN32)
-    // fflush only reaches the OS; fsync reaches the device, which is what makes
-    // the rename below safe across a power cut.
-    if (::fsync(::fileno(file)) != 0) {
-        ok = false;
-        if (error.empty()) error = "cannot sync " + path.string();
-    }
-#endif
-    if (std::fclose(file) != 0) {
-        ok = false;
-        if (error.empty()) error = "failed while closing " + path.string();
-    }
-    return ok;
 }
 
 }  // namespace
@@ -94,47 +44,180 @@ std::optional<JobState> job_state_from_name(const std::string& name) {
     return std::nullopt;
 }
 
+const char* job_kind_name(JobKind kind) {
+    switch (kind) {
+        case JobKind::convert: return "convert";
+        case JobKind::import: return "import";
+        case JobKind::rotate: return "rotate";
+    }
+    return "convert";
+}
+
+std::optional<JobKind> job_kind_from_name(const std::string& name) {
+    if (name == "convert") return JobKind::convert;
+    if (name == "import") return JobKind::import;
+    if (name == "rotate") return JobKind::rotate;
+    return std::nullopt;
+}
+
 Result<JobQueue> JobQueue::open(const Path& state_file) {
     JobQueue queue;
     queue.state_file_ = state_file;
 
-    std::error_code error;
-    if (!std::filesystem::exists(state_file, error)) {
-        if (error) {
-            return Result<JobQueue>::failure("cannot inspect " + state_file.string() + ": " +
-                                             error.message());
-        }
-        return Result<JobQueue>::success(std::move(queue));
+    vfs::FileStat inspected;
+    if (!vfs::stat(state_file, &inspected).ok()) {
+        return Result<JobQueue>::failure("cannot inspect " + state_file.string());
+    }
+    if (!inspected.exists) return Result<JobQueue>::success(std::move(queue));
+
+    // The size on disk is checked before the bytes are read: a file that is not
+    // a queue cannot be allowed to decide how much memory this process asks for.
+    if (inspected.size > kMaxFileBytes) {
+        return Result<JobQueue>::failure(
+            "job queue " + state_file.string() + " is " + std::to_string(inspected.size) +
+            " bytes, more than the " + std::to_string(kMaxFileBytes) +
+            " byte limit; not a queue file this build wrote");
     }
 
-    std::ifstream file(state_file, std::ios::binary);
-    if (!file) return Result<JobQueue>::failure("cannot open " + state_file.string());
-    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const Result<std::vector<uint8_t>> bytes = vfs::read_file(state_file, kMaxFileBytes);
+    if (!bytes.ok()) return Result<JobQueue>::failure(bytes.message());
+    const std::string text(bytes.value().begin(), bytes.value().end());
+    // A write that stopped halfway leaves a prefix of valid JSON that no parser
+    // accepts; the parser's message names it, and nothing is kept.
+    if (text.size() != inspected.size) {
+        return Result<JobQueue>::failure(
+            "job queue " + state_file.string() + " read " + std::to_string(text.size()) +
+            " of " + std::to_string(inspected.size) + " bytes: the file is truncated");
+    }
 
     try {
         const nlohmann::json root = nlohmann::json::parse(text);
         if (!root.is_object()) return Result<JobQueue>::failure("job queue root is not an object");
+        if (!root.contains("jobs") || !root.at("jobs").is_array()) {
+            return Result<JobQueue>::failure("job queue has no \"jobs\" array in " +
+                                             state_file.string());
+        }
+        // The row count is the first thing read and the first thing validated:
+        // every allocation below (the vector, its rows' strings) follows from
+        // it, so an impossible count is refused here, not walked later.
+        const std::size_t rows = root.at("jobs").size();
+        if (rows > kMaxJobs) {
+            return Result<JobQueue>::failure(
+                "job queue " + state_file.string() + " holds " + std::to_string(rows) +
+                " row(s), more than the " + std::to_string(kMaxJobs) +
+                " row limit; not a queue file this build wrote");
+        }
+
+        // One string field, bounded: a path or a message this title wrote is far
+        // under the limit, and a truncated or foreign file produces longer ones.
+        const auto bounded = [&state_file](const nlohmann::json& entry, const char* key,
+                                           std::string fallback) -> Result<std::string> {
+            if (!entry.contains(key) || entry.at(key).is_null()) {
+                return Result<std::string>::success(std::move(fallback));
+            }
+            if (!entry.at(key).is_string()) {
+                return Result<std::string>::failure(std::string("job queue field \"") + key +
+                                                    "\" is not a string in " + state_file.string());
+            }
+            std::string value = entry.at(key).get<std::string>();
+            if (value.size() > kMaxFieldChars) {
+                return Result<std::string>::failure(
+                    std::string("job queue field \"") + key + "\" is " +
+                    std::to_string(value.size()) + " characters, more than the " +
+                    std::to_string(kMaxFieldChars) + " character limit in " +
+                    state_file.string());
+            }
+            return Result<std::string>::success(std::move(value));
+        };
+        // The same for a field the file must carry.
+        const auto required = [&](const nlohmann::json& entry,
+                                  const char* key) -> Result<std::string> {
+            if (!entry.contains(key)) {
+                return Result<std::string>::failure(std::string("job queue row has no \"") + key +
+                                                    "\" in " + state_file.string());
+            }
+            return bounded(entry, key, std::string());
+        };
 
         uint64_t max_sequence = 0;
         for (const nlohmann::json& entry : root.at("jobs")) {
-            Job job;
-            job.id = entry.at("id").get<std::string>();
-            job.photo = Path(entry.at("photo").get<std::string>());
-            job.backend = entry.value("backend", std::string());
-            // Queues written before albums existed have no "album" key.
-            job.album = entry.value("album", std::string());
-            job.sequence = entry.value("sequence", uint64_t{0});
-            job.message = entry.value("message", std::string());
-            job.seconds_taken = entry.value("seconds_taken", 0.0);
-
-            const std::string scene_folder = entry.value("scene_folder", std::string());
-            if (!scene_folder.empty()) job.scene_folder = Path(scene_folder);
-
-            const std::string state_name = entry.at("state").get<std::string>();
-            const std::optional<JobState> state = job_state_from_name(state_name);
-            if (!state) {
-                return Result<JobQueue>::failure("unknown job state '" + state_name + "' in " +
+            if (!entry.is_object()) {
+                return Result<JobQueue>::failure("job queue row is not an object in " +
                                                  state_file.string());
+            }
+            Job job;
+            const Result<std::string> id = required(entry, "id");
+            if (!id.ok()) return Result<JobQueue>::failure(id.message());
+            job.id = id.value();
+            const Result<std::string> photo = required(entry, "photo");
+            if (!photo.ok()) return Result<JobQueue>::failure(photo.message());
+            job.photo = Path(photo.value());
+            const Result<std::string> backend = bounded(entry, "backend", std::string());
+            if (!backend.ok()) return Result<JobQueue>::failure(backend.message());
+            job.backend = backend.value();
+            // Queues written before albums existed have no "album" key.
+            const Result<std::string> album = bounded(entry, "album", std::string());
+            if (!album.ok()) return Result<JobQueue>::failure(album.message());
+            job.album = album.value();
+            // Queues written before imports existed have no "kind" key.
+            const Result<std::string> kind_name = bounded(entry, "kind", std::string("convert"));
+            if (!kind_name.ok()) return Result<JobQueue>::failure(kind_name.message());
+            const std::optional<JobKind> kind = job_kind_from_name(kind_name.value());
+            if (!kind) {
+                return Result<JobQueue>::failure("unknown job kind '" + kind_name.value() +
+                                                 "' in " + state_file.string());
+            }
+            job.kind = *kind;
+            job.rotate_quarters = entry.value("rotate", 0);
+            // Three quarter turns either way is a whole rotation; anything else
+            // is a corrupt field, not a rotation.
+            if (job.rotate_quarters < -3 || job.rotate_quarters > 3) {
+                return Result<JobQueue>::failure(
+                    "job " + job.id + " has rotate " + std::to_string(job.rotate_quarters) +
+                    ", outside -3..3, in " + state_file.string());
+            }
+            // Older queues have no destination override: they go to the
+            // runner's local root.
+            const Result<std::string> output_root = bounded(entry, "output_root", std::string());
+            if (!output_root.ok()) return Result<JobQueue>::failure(output_root.message());
+            if (!output_root.value().empty()) job.output_root = Path(output_root.value());
+            // Queues written before stage H have no source folder: the row and
+            // the scene's meta.json stay as they were (JobRunner derives one).
+            const Result<std::string> source_folder = bounded(entry, "source_folder", std::string());
+            if (!source_folder.ok()) return Result<JobQueue>::failure(source_folder.message());
+            job.source_folder = source_folder.value();
+            job.sequence = entry.value("sequence", uint64_t{0});
+            // The id is job-<sequence>; a sequence past the id space (6 digits
+            // in a live queue, far below this) is not one this title wrote. The
+            // largest row is one below the limit so that its successor,
+            // next_sequence, is still a value the reader accepts.
+            if (job.sequence >= kMaxSequence) {
+                return Result<JobQueue>::failure(
+                    "job " + job.id + " has sequence " + std::to_string(job.sequence) +
+                    ", not below " + std::to_string(kMaxSequence) + ", in " +
+                    state_file.string());
+            }
+            const Result<std::string> message = bounded(entry, "message", std::string());
+            if (!message.ok()) return Result<JobQueue>::failure(message.message());
+            job.message = message.value();
+            job.seconds_taken = entry.value("seconds_taken", 0.0);
+            // A duration is finite and non-negative; a NaN or an infinity is a
+            // corrupt field that would poison every comparison that reads it.
+            if (!(job.seconds_taken >= 0.0) || job.seconds_taken > 1e9) {
+                return Result<JobQueue>::failure("job " + job.id + " has an implausible duration in " +
+                                                 state_file.string());
+            }
+
+            const Result<std::string> scene_folder = bounded(entry, "scene_folder", std::string());
+            if (!scene_folder.ok()) return Result<JobQueue>::failure(scene_folder.message());
+            if (!scene_folder.value().empty()) job.scene_folder = Path(scene_folder.value());
+
+            const Result<std::string> state_name = required(entry, "state");
+            if (!state_name.ok()) return Result<JobQueue>::failure(state_name.message());
+            const std::optional<JobState> state = job_state_from_name(state_name.value());
+            if (!state) {
+                return Result<JobQueue>::failure("unknown job state '" + state_name.value() +
+                                                 "' in " + state_file.string());
             }
             // A process that died mid-conversion cannot still be converting.
             job.state = *state == JobState::Running ? JobState::Queued : *state;
@@ -146,13 +229,52 @@ Result<JobQueue> JobQueue::open(const Path& state_file) {
             max_sequence = std::max(max_sequence, queue.jobs_.back().sequence);
         }
 
-        queue.next_sequence_ = std::max(root.value("next_sequence", uint64_t{1}), max_sequence + 1);
+        const uint64_t stored_next = root.value("next_sequence", uint64_t{1});
+        if (stored_next > kMaxSequence) {
+            return Result<JobQueue>::failure(
+                "job queue next_sequence " + std::to_string(stored_next) + " is more than " +
+                std::to_string(kMaxSequence) + " in " + state_file.string());
+        }
+        // Every row's sequence is below kMaxSequence (checked above), so the
+        // value written back is at most kMaxSequence: open() accepts a file
+        // save() produced, including the one at the end of the id space.
+        queue.next_sequence_ = std::max(stored_next, max_sequence + 1);
     } catch (const std::exception& parse_error) {
         return Result<JobQueue>::failure("invalid job queue JSON in " + state_file.string() + ": " +
                                          parse_error.what());
     }
 
     return Result<JobQueue>::success(std::move(queue));
+}
+
+JobQueue JobQueue::open_or_empty(const Path& state_file, std::string* notice) {
+    if (notice != nullptr) notice->clear();
+    Result<JobQueue> opened = open(state_file);
+    if (opened.ok()) return opened.take();
+
+    std::string reason = opened.message();
+    // Keep the evidence: the operator can still inspect what the title refused,
+    // and the empty queue that replaces it is written to a fresh file. A rename
+    // that fails (a read-only folder) is not a second failure: the reason says
+    // the file is still in place.
+    vfs::FileStat inspected;
+    if (vfs::stat(state_file, &inspected).ok() && inspected.exists) {
+        const Path rejected = Path(state_file.string() + ".rejected");
+        const Status moved = vfs::rename_file(state_file, rejected);
+        if (moved.ok()) {
+            reason += "; kept as " + rejected.string();
+        } else {
+            reason += "; could not move it aside (" + moved.message() + ")";
+        }
+    }
+    if (notice != nullptr) *notice = reason;
+    return empty(state_file);
+}
+
+JobQueue JobQueue::empty(const Path& state_file) {
+    JobQueue queue;
+    queue.state_file_ = state_file;
+    return queue;
 }
 
 const Job* JobQueue::find(const std::string& id) const {
@@ -170,21 +292,59 @@ Job* JobQueue::mutable_find(const std::string& id) {
 }
 
 Path JobQueue::normalize(const Path& photo) {
+    // A location path is already its own absolute form ("smb0:/photos/x.jpg");
+    // normal_absolute() would treat "smb0:" as a relative component and glue
+    // the working directory in front of it.
+    if (vfs::is_remote(photo)) return photo.lexically_normal();
     Path normalized;
     if (!normal_absolute(photo, normalized)) return Path();
     return normalized;
 }
 
-Result<std::string> JobQueue::enqueue(const Path& photo, std::string backend, std::string album) {
-    if (photo.empty()) return Result<std::string>::failure("photo path is empty");
+Result<std::string> JobQueue::enqueue(const Path& photo, std::string backend, std::string album,
+                                     int rotate_quarters, const Path& output_root,
+                                     std::string source_folder) {
     if (backend.empty()) return Result<std::string>::failure("backend name is empty");
+    return add_job(photo, JobKind::convert, std::move(backend), std::move(album), rotate_quarters,
+                   output_root, std::move(source_folder));
+}
+
+Result<std::string> JobQueue::enqueue_import(const Path& splat_file, std::string album,
+                                             const Path& output_root,
+                                             std::string source_folder) {
+    return add_job(splat_file, JobKind::import, std::string(), std::move(album), 0, output_root,
+                   std::move(source_folder));
+}
+
+Result<std::string> JobQueue::enqueue_rotate(const Path& scene_folder, int quarters,
+                                            std::string album) {
+    return add_job(scene_folder, JobKind::rotate, std::string(), std::move(album), quarters,
+                   Path(), std::string());
+}
+
+Result<std::string> JobQueue::add_job(const Path& photo, JobKind kind, std::string backend,
+                                      std::string album, int rotate_quarters,
+                                      const Path& output_root, std::string source_folder) {
+    if (photo.empty()) return Result<std::string>::failure("photo path is empty");
+    // The reader's limits are also the writer's: a queue this build full of rows
+    // it cannot read back would be discarded on the next boot. A full queue is
+    // refused here, with the previous (readable) file still in place.
+    if (jobs_.size() >= kMaxJobs) {
+        return Result<std::string>::failure("job queue is full (" + std::to_string(jobs_.size()) +
+                                            " row(s), limit " + std::to_string(kMaxJobs) + ")");
+    }
+    if (next_sequence_ >= kMaxSequence) {
+        return Result<std::string>::failure(
+            "job queue id space is exhausted (next sequence " + std::to_string(next_sequence_) +
+            ", limit " + std::to_string(kMaxSequence) + ")");
+    }
 
     const Path normalized = normalize(photo);
     // The lexical normal form is the only trusted answer: weakly_canonical()
     // returns "" with no error on a PS5 title when the path exists but
     // realpath() is refused (libc++ 18), which is exactly how the panel used to
     // enqueue an empty photo path.
-    if (normalized.empty() || !normalized.is_absolute()) {
+    if (normalized.empty() || (!vfs::is_remote(normalized) && !normalized.is_absolute())) {
         return Result<std::string>::failure("photo path is empty");
     }
     for (const Job& existing : jobs_) {
@@ -197,8 +357,15 @@ Result<std::string> JobQueue::enqueue(const Path& photo, std::string backend, st
     Job job;
     job.id = job_id_for(next_sequence_);
     job.photo = normalized;
+    job.kind = kind;
     job.backend = std::move(backend);
     job.album = std::move(album);
+    job.rotate_quarters = ((rotate_quarters % 4) + 4) % 4;
+    // A location path is not an OS path: normal_absolute() would prepend the
+    // working directory. It is a destination, not a source, so it is validated
+    // by its grammar instead.
+    job.output_root = output_root;
+    job.source_folder = std::move(source_folder);
     job.state = JobState::Queued;
     job.sequence = next_sequence_;
     ++next_sequence_;
@@ -235,7 +402,8 @@ Result<std::optional<Job>> JobQueue::take_next() {
     return Result<std::optional<Job>>::success(std::optional<Job>(std::move(taken)));
 }
 
-Status JobQueue::mark_done(const std::string& id, const Path& scene_folder, double seconds_taken) {
+Status JobQueue::mark_done(const std::string& id, const Path& scene_folder, double seconds_taken,
+                          std::string message) {
     Job* job = mutable_find(id);
     if (job == nullptr) return Status::error("no such job: " + id);
     if (job->state != JobState::Running) {
@@ -245,7 +413,7 @@ Status JobQueue::mark_done(const std::string& id, const Path& scene_folder, doub
     job->state = JobState::Done;
     job->scene_folder = scene_folder;
     job->seconds_taken = seconds_taken;
-    job->message.clear();
+    job->message = std::move(message);
     return save();
 }
 
@@ -283,8 +451,12 @@ Status JobQueue::save() const {
         nlohmann::json entry;
         entry["id"] = job.id;
         entry["photo"] = job.photo.string();
+        entry["kind"] = job_kind_name(job.kind);
         entry["backend"] = job.backend;
         entry["album"] = job.album;
+        entry["rotate"] = job.rotate_quarters;
+        if (!job.output_root.empty()) entry["output_root"] = job.output_root.string();
+        if (!job.source_folder.empty()) entry["source_folder"] = job.source_folder;
         entry["state"] = job_state_name(job.state);
         entry["message"] = job.message;
         entry["scene_folder"] = job.scene_folder.string();
@@ -293,30 +465,25 @@ Status JobQueue::save() const {
         root["jobs"].push_back(std::move(entry));
     }
     const std::string text = root.dump(2) + "\n";
+    // The same limit open() checks from stat: never leave behind a file this
+    // build would refuse to read. The caller's change is rolled back by
+    // add_job(); the file on disk keeps its last readable state.
+    if (text.size() > kMaxFileBytes) {
+        return Status::error("job queue would be " + std::to_string(text.size()) +
+                             " bytes, more than the " + std::to_string(kMaxFileBytes) +
+                             " byte limit");
+    }
 
-    std::error_code error;
     const Path parent = state_file_.parent_path();
     if (!parent.empty()) {
-        std::filesystem::create_directories(parent, error);
-        if (error) return Status::error("cannot create " + parent.string() + ": " + error.message());
+        const Status made = vfs::make_dirs(parent);
+        if (!made.ok()) return made;
     }
 
-    Path temporary = state_file_;
-    temporary += ".tmp";
     std::string write_error;
-    if (!write_file_durably(temporary, text, write_error)) {
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
+    if (!vfs::write_text_atomically(state_file_, text, &write_error)) {
         return Status::error(write_error);
     }
-
-    std::filesystem::rename(temporary, state_file_, error);
-    if (error) {
-        std::error_code ignored;
-        std::filesystem::remove(temporary, ignored);
-        return Status::error("cannot replace " + state_file_.string() + ": " + error.message());
-    }
-    sync_directory(parent);
     return Status::success();
 }
 

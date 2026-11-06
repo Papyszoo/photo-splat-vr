@@ -58,10 +58,10 @@ UiState load_ui_state(const Path& state_dir) {
         if (scale != root.end()) {
             if (scale->is_number_integer()) {
                 const int value = scale->get<int>();
-                state.scale_around = value == 1 ? 1 : (value == 2 ? 2 : 0);
+                state.scale_around = value == 0 ? 0 : (value == 1 ? 1 : 2);
             } else if (scale->is_string()) {
                 const std::string value = scale->get<std::string>();
-                state.scale_around = value == "centre" ? 1 : (value == "maquette" ? 2 : 0);
+                state.scale_around = value == "front" ? 0 : (value == "centre" ? 1 : 2);
             }
         }
         const auto move = root.find("move_speed");
@@ -87,6 +87,12 @@ UiState load_ui_state(const Path& state_dir) {
                 state.blend_linear = blend->get<bool>();
             }
         }
+        const auto thumbnail = root.find("thumbnail_size");
+        if (thumbnail != root.end() && thumbnail->is_number()) {
+            // Out of range is clamped, never rejected: a hand-edited 9 is the
+            // largest, a -3 the smallest, and neither can break a grid.
+            state.thumbnail_size = thumbnail_size_from_number(thumbnail->get<double>());
+        }
     } catch (const std::exception&) {
         return UiState{};  // garbage: defaults, never a failure
     }
@@ -105,13 +111,14 @@ Status save_ui_state(const Path& state_dir, const UiState& state) {
     root["selected_model"] = state.selected_model;
     root["last_album"] = state.last_album;
     root["tooltips"] = state.tooltips;
-    root["scale_around"] = state.scale_around == 1
-                               ? "centre"
-                               : (state.scale_around == 2 ? "maquette" : "front");
+    root["scale_around"] = state.scale_around == 0
+                               ? "front"
+                               : (state.scale_around == 1 ? "centre" : "capture");
     root["move_speed"] = state.move_speed;
     root["turn_speed"] = state.turn_speed;
     root["edge_softness"] = state.edge_softness;
     root["blending"] = state.blend_linear ? "linear" : "srgb";
+    root["thumbnail_size"] = clamp_thumbnail_size(state.thumbnail_size);
     const std::string text = root.dump(2) + "\n";
 
     const Path path = ui_state_path(state_dir);

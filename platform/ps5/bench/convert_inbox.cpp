@@ -110,10 +110,8 @@ std::vector<InboxPhoto> list_photos(const Path& dir) {
         std::error_code entry_error;
         if (!it->is_regular_file(entry_error) || entry_error) continue;
         const std::string name = it->path().filename().string();
-        const bool wanted = splat::bench::has_suffix(name, ".jpg") ||
-                            splat::bench::has_suffix(name, ".jpeg") ||
-                            splat::bench::has_suffix(name, ".png");
-        if (wanted) photos.push_back({name, it->path()});
+        // The one photo format list (core/image/format.h), shared with the app.
+        if (splat::is_photo_file(it->path())) photos.push_back({name, it->path()});
     }
     std::sort(photos.begin(), photos.end(),
               [](const InboxPhoto& a, const InboxPhoto& b) { return a.name < b.name; });
@@ -244,13 +242,18 @@ convert_inbox_run(int argc, char** argv) {
 
         // Both image outputs are made before the RGB buffer moves into the
         // backend, as the job runner does.
-        const Result<std::vector<uint8_t>> read = splat::read_file_bytes(photo.path);
+        const Result<std::vector<uint8_t>> read =
+            splat::read_file_bytes(photo.path, splat::image::DecodeOptions{}.max_bytes);
         if (!read.ok()) {
             fail("cannot read the photo: " + read.message());
             continue;
         }
         const std::vector<uint8_t>& file_bytes = read.value();
-        Result<Image> decoded = splat::decode_image(file_bytes.data(), file_bytes.size());
+        splat::image::DecodeOptions decode_options;
+        decode_options.hint = splat::image_format_from_extension(photo.path);
+        splat::image::DecodeInfo decode_info;
+        Result<Image> decoded = splat::image::decode_photo(file_bytes.data(), file_bytes.size(),
+                                                           decode_options, &decode_info);
         if (!decoded.ok()) {
             fail("cannot decode the photo: " + decoded.message());
             continue;
@@ -258,7 +261,10 @@ convert_inbox_run(int argc, char** argv) {
         Image image = decoded.take();
         const int width = image.width;
         const int height = image.height;
-        const bool source_is_jpeg = splat::looks_like_jpeg(file_bytes.data(), file_bytes.size());
+        // Verbatim only when the pixels are the file's own (see job_runner).
+        const bool source_is_jpeg =
+            splat::looks_like_jpeg(file_bytes.data(), file_bytes.size()) &&
+            decode_info.exif_orientation == 1;
 
         const Result<float> focal =
             splat::focal_px_from_photo(file_bytes.data(), file_bytes.size(), width, height);

@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <system_error>
+
+#include "gallery/visibility.h"
 
 namespace splat {
 
@@ -11,6 +14,8 @@ PlaylistEntry playlist_entry(const SceneEntry& scene) {
 }
 
 std::vector<PlaylistEntry> playlist_entries(const std::vector<SceneEntry>& scenes) {
+    // `scenes` comes from list_scenes(), which already applies the policy; this
+    // copy keeps the rule in one place for the entries a caller built by hand.
     std::vector<PlaylistEntry> entries;
     entries.reserve(scenes.size());
     for (const SceneEntry& scene : scenes) entries.push_back(playlist_entry(scene));
@@ -23,15 +28,18 @@ Result<ScenePlaylist> ScenePlaylist::from_folder(const Path& directory) {
         return Result<ScenePlaylist>::failure("not a directory: " + directory.string());
     }
 
+    // A hidden scene is not a playlist entry: an L1/R1 step or a boot open must
+    // never reach one, whatever folder the caller walked.
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
     std::vector<PlaylistEntry> entries;
     for (const auto& item : std::filesystem::directory_iterator(directory, error)) {
         if (error) break;
         std::error_code item_error;
         if (!item.is_directory(item_error) || item_error) continue;
         const Path scene_file = item.path() / "scene.psplat";
-        if (std::filesystem::exists(scene_file, item_error) && !item_error) {
-            entries.push_back({item.path(), scene_file});
-        }
+        if (!std::filesystem::exists(scene_file, item_error) || item_error) continue;
+        if (!visibility->allows_scene_folder(item.path())) continue;
+        entries.push_back({item.path(), scene_file});
     }
     if (error) {
         return Result<ScenePlaylist>::failure("cannot read " + directory.string() + ": " +
@@ -42,7 +50,8 @@ Result<ScenePlaylist> ScenePlaylist::from_folder(const Path& directory) {
     if (entries.empty()) {
         const Path scene_file = directory / "scene.psplat";
         std::error_code exists_error;
-        if (std::filesystem::exists(scene_file, exists_error) && !exists_error) {
+        if (std::filesystem::exists(scene_file, exists_error) && !exists_error &&
+            visibility->allows_scene_folder(directory)) {
             entries.push_back({directory, scene_file});
         }
     }
@@ -61,6 +70,16 @@ Result<ScenePlaylist> ScenePlaylist::from_folder(const Path& directory) {
 }
 
 Result<ScenePlaylist> ScenePlaylist::from_entries(std::vector<PlaylistEntry> entries) {
+    // Filter here too: a stale TV/VR playlist (built before the passcode was
+    // set) must not open a hidden scene either.
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
+    if (visibility->enabled) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                     [&visibility](const PlaylistEntry& entry) {
+                                         return !visibility->allows_scene_folder(entry.folder);
+                                     }),
+                      entries.end());
+    }
     if (entries.empty()) return Result<ScenePlaylist>::failure("no scene entries");
     ScenePlaylist playlist;
     playlist.entries_ = std::move(entries);

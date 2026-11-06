@@ -4,7 +4,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <random>
 #include <sstream>
@@ -12,33 +11,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "image/format.h"
+
 namespace splat {
 namespace {
 
-bool starts_with(const std::string& data, const unsigned char* magic, size_t size) {
-    if (data.size() < size) return false;
-    return std::memcmp(data.data(), magic, size) == 0;
-}
-
-const unsigned char kJpegMagic[] = {0xff, 0xd8, 0xff};
-const unsigned char kPngMagic[] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
-
-std::string lowercase(std::string text) {
-    for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return text;
-}
-
 // The stem without a known photo extension, so the stored name does not grow
-// IMG_0001.jpg-...jpg. The extension is chosen from the sniffed format anyway.
+// IMG_0001.jpg-...jpg. The extension is chosen from the sniffed format anyway,
+// and "known" is the one format list (core/image/format.h).
 std::string stem_of(const std::string& safe_name) {
-    const std::string lowered = lowercase(safe_name);
-    for (const char* extension : {".jpeg", ".jpg", ".png"}) {
-        const size_t length = std::strlen(extension);
-        if (lowered.size() > length && lowered.compare(lowered.size() - length, length, extension) == 0) {
-            return safe_name.substr(0, safe_name.size() - length);
-        }
-    }
-    return safe_name;
+    const Path as_path(safe_name);
+    if (image_format_from_extension(as_path) == ImageFormat::unknown) return safe_name;
+    return as_path.stem().string();
 }
 
 std::string random_suffix() {
@@ -78,13 +62,27 @@ UploadStore::UploadStore(Path inbox, uint64_t max_bytes)
     : inbox_(std::move(inbox)), max_bytes_(max_bytes) {}
 
 std::optional<UploadStore::Format> UploadStore::detect_format(const std::string& data) {
-    if (starts_with(data, kPngMagic, sizeof(kPngMagic))) return Format::Png;
-    if (starts_with(data, kJpegMagic, sizeof(kJpegMagic))) return Format::Jpeg;
-    return std::nullopt;
+    switch (sniff_image_format(reinterpret_cast<const uint8_t*>(data.data()), data.size())) {
+        case ImageFormat::jpeg: return Format::Jpeg;
+        case ImageFormat::png: return Format::Png;
+        case ImageFormat::webp: return Format::Webp;
+        case ImageFormat::heif: return Format::Heif;
+        case ImageFormat::avif: return Format::Avif;
+        case ImageFormat::tiff: return Format::Tiff;
+        default: return std::nullopt;
+    }
 }
 
 const char* UploadStore::extension_for(Format format) {
-    return format == Format::Png ? ".png" : ".jpg";
+    switch (format) {
+        case Format::Jpeg: return ".jpg";
+        case Format::Png: return ".png";
+        case Format::Webp: return ".webp";
+        case Format::Heif: return ".heic";
+        case Format::Avif: return ".avif";
+        case Format::Tiff: return ".tif";
+    }
+    return ".jpg";
 }
 
 std::string UploadStore::safe_filename(const std::string& original) {
@@ -114,7 +112,8 @@ Result<std::string> UploadStore::store(const std::string& original_name, const s
     }
     const std::optional<Format> format = detect_format(data);
     if (!format) {
-        return Result<std::string>::failure("not a JPEG or PNG image (magic bytes do not match)");
+        return Result<std::string>::failure(
+            "not a JPEG, PNG, WebP, HEIF, AVIF or TIFF image (magic bytes do not match)");
     }
     if (data.size() > max_bytes_) {
         return Result<std::string>::failure("image is larger than the " + std::to_string(max_bytes_) +

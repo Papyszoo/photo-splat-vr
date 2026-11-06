@@ -112,6 +112,7 @@ TEST_CASE("the model name comes from meta.json, else the folder suffix") {
     CHECK(scene_model_name("ply", "photo03-da2-small") == "DA2-Small");
     CHECK(scene_model_name("fallback", "photo03-da2-large") == "DA2-Large");
     CHECK(scene_model_name("mystery", "scene-x") == "SHARP");
+    CHECK(scene_model_name("import", "robot") == "Imported");  // L2: an imported splat scene
 
     // The models compared next to SHARP in runs/compare_models write a
     // meta.json backend this label does not map, so the folder suffix names

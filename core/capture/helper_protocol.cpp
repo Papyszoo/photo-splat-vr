@@ -15,6 +15,8 @@
 #include <system_error>
 #include <utility>
 
+#include "image/format.h"
+
 #include <nlohmann/json.hpp>
 
 #include <sys/stat.h>
@@ -164,16 +166,19 @@ CaptureInfo make_capture(const Path& path, const std::string& format) {
 }  // namespace
 
 std::string capture_format(const Path& path) {
-    const std::string extension = lowercase(path.extension().string());
-    if (extension == ".jpg" || extension == ".jpeg") return "jpg";
-    if (extension == ".png") return "png";
-    if (extension == ".jxr") return "jxr";
-    return std::string();
+    // HDR captures are .jxr, which the decoder does not read: listed as "jxr"
+    // so the screen can say so. Everything else comes from the one format list.
+    if (lowercase(path.extension().string()) == ".jxr") return "jxr";
+    const ImageFormat format = image_format_from_extension(path);
+    if (format == ImageFormat::unknown) return std::string();
+    return format == ImageFormat::jpeg ? "jpg" : image_format_name(format);
 }
 
 bool is_supported_capture(const Path& path) {
-    const std::string format = capture_format(path);
-    return format == "jpg" || format == "png";
+    // The capture helper only produces JPEG and PNG screenshots; .jxr is HDR
+    // and stays listed-but-refused.
+    const ImageFormat format = image_format_from_extension(path);
+    return format == ImageFormat::jpeg || format == ImageFormat::png;
 }
 
 HelperRequest parse_request(const std::string& text) {

@@ -535,6 +535,14 @@ TEST_CASE("gallery lists photos by extension, depth and mtime") {
     write_file(dir / "sub" / "sub2" / "g.png", "gg");
     write_file(dir / "sub" / "sub2" / "sub3" / "h.jpeg", "hhh");
     write_file(dir / "sub" / "sub2" / "sub3" / "sub4" / "i.jpg", "too deep");
+    // A folder served by macOS File Sharing carries these: the system writes
+    // ".DS_Store" and one "._<name>" AppleDouble per file, and "._a.jpg" ends
+    // in .jpg. Shown as photos, the first tile of every shared folder would be
+    // an entry that can never open (mac-share PROBE.md, item 3).
+    write_file(dir / ".DS_Store", "store");
+    write_file(dir / "._a.jpg", "apple double");
+    write_file(dir / "sub" / "._f.jpg", "apple double");
+    write_file(dir / ".Spotlight-V100", "volume index");
 
     set_mtime(dir / "a.jpg", 60);
     set_mtime(dir / "B.JPEG", 50);
@@ -548,6 +556,10 @@ TEST_CASE("gallery lists photos by extension, depth and mtime") {
     REQUIRE(photos.size() == 6);
     CHECK(names(photos) == std::vector<std::string>{"a.jpg", "B.JPEG", "c.PnG", "f.jpg", "g.png",
                                                    "h.jpeg"});
+    for (const splat::PhotoEntry& photo : photos) {
+        CHECK(photo.name.rfind("._", 0) != 0);
+        CHECK(photo.name.rfind(".", 0) != 0);
+    }
     CHECK(photos[0].path == dir / "a.jpg");
     CHECK(photos[0].size == 4);
     CHECK(photos[0].mtime > 0);
@@ -701,4 +713,28 @@ TEST_CASE("gallery playlist from album scene entries") {
     CHECK(source.current().folder.filename() == "a-scene");
 
     CHECK_FALSE(splat::ScenePlaylist::from_entries({}).ok());
+}
+
+TEST_CASE("a network location refuses every folder mutation by name") {
+    // The refusal happens before any path is touched, so no adapter is needed:
+    // the root's location id decides. All six mutations must say the one thing
+    // the docs and the screens promise, or the user gets "not a scene folder".
+    const Path root("smb0:/scenes");
+    const Path scene = root / "trip" / "one";
+    const std::vector<splat::Status> refusals = {
+        splat::create_album(root, "trip"),
+        splat::rename_album(root, "trip", "trip2"),
+        splat::delete_album(root, "trip"),
+        splat::move_scene(root, scene, ""),
+        splat::rename_scene(root, scene, "two"),
+        splat::delete_scene(root, scene),
+    };
+    for (const splat::Status& status : refusals) {
+        REQUIRE_FALSE(status.ok());
+        CHECK(status.message() == std::string(splat::kRemoteMutationRefusal));
+    }
+    // The same call on a local root is not refused by that rule.
+    splat_test::TempDir dir("gallery-local-mutation");
+    CHECK(splat::delete_album(dir.path(), "nothing").message() !=
+          std::string(splat::kRemoteMutationRefusal));
 }

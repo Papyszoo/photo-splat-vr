@@ -104,6 +104,135 @@ distributed with this repository.
   key-value mode, indirect element count) behind `core/render/radix_sort.h`.
   The header is unmodified apart from an attribution comment.
 
+### libwebp
+
+- Version: `v1.6.0` (git submodule, `third_party/libwebp`)
+- Upstream: <https://github.com/webmproject/libwebp>
+- License: BSD-3-Clause (Copyright (c) 2010, Google Inc.; full text in
+  `third_party/LICENSES/libwebp.txt`)
+- Used for: decoding WebP photos in `core/image/webp_decoder.cpp` (lossy,
+  lossless, alpha composited on white). Built as a CMake subproject with every
+  tool and the muxer off.
+
+### libtiff
+
+- Version: `v4.7.2` (git submodule, `third_party/libtiff`)
+- Upstream: <https://gitlab.com/libtiff/libtiff>
+- License: libtiff licence (BSD-like, Copyright (c) 1988-1997 Sam Leffler,
+  Copyright (c) 1991-1997 Silicon Graphics; full text in
+  `third_party/LICENSES/libtiff.txt`)
+- Used for: decoding baseline TIFF photos in `core/image/tiff_decoder.cpp`
+  (none, LZW, PackBits). Built as a CMake subproject with
+  jpeg/zlib/lzma/zstd/webp/lerc/jbig and the C++ stream API off, because the
+  payload SDK ships no zlib; a deflate or JPEG TIFF is refused by name at
+  decode time.
+
+### libheif
+
+- Version: `v1.23.7` (git submodule, `third_party/libheif`)
+- Upstream: <https://github.com/strukturag/libheif>
+- License: GNU Lesser General Public License v3.0 or later (full text in
+  `third_party/LICENSES/libheif.txt`)
+- Used for: the HEIC/HEIF and AVIF container (`core/image/heif_decoder.cpp`):
+  item parsing, the container's irot/imir transforms, the Exif metadata block
+  and the conversion to interleaved RGB. Built with plugin loading off, no
+  encoders and libsharpyuv off, so the two decoders below are linked in.
+  Static linking into this GPL-3.0-or-later work is allowed because the
+  complete source is here and `third_party/build_codecs.sh` rebuilds it; the
+  library is unmodified.
+
+### libde265
+
+- Version: `v1.1.3` (git submodule, `third_party/libde265`)
+- Upstream: <https://github.com/strukturag/libde265>
+- License: GNU Lesser General Public License v3.0 or later (full text in
+  `third_party/LICENSES/libde265.txt`)
+- Used for: the HEVC decoder behind HEIC, through libheif. Built without the
+  SDL player and the `dec265` tool (`ENABLE_SDL=OFF`, `ENABLE_DEC265=OFF`).
+
+### libaom
+
+- Version: `v3.15.1` (git submodule, `third_party/libaom`)
+- Upstream: <https://aomedia.googlesource.com/aom>
+- License: BSD-2-Clause (Copyright (c) 2016, Alliance for Open Media; full text
+  in `third_party/LICENSES/libaom.txt`) **plus the AOM Patent License 1.0**
+  (`third_party/LICENSES/libaom-patents.txt`): a royalty-free patent licence for
+  the AV1 codec that terminates for a party that brings a patent suit alleging
+  that AV1 infringes.
+- Used for: the AV1 decoder behind AVIF, through libheif. Built decode-only
+  (`CONFIG_AV1_ENCODER=0`), no tests/examples/tools; cross builds use
+  `AOM_TARGET_CPU=generic`.
+
+### LibRaw
+
+- Version: `0.22.3` (git submodule, `third_party/libraw`)
+- Upstream: <https://github.com/LibRaw/LibRaw>
+- License: GNU Lesser General Public License v2.1 (full text in
+  `third_party/LICENSES/LibRaw.txt`). LibRaw also offers the CDDL-1.0 as an
+  alternative; **we take the LGPL-2.1 and not the CDDL**.
+- Used for: decoding camera RAW files (`.dng` `.cr2` `.cr3` `.nef` `.arw`
+  `.raf` `.orf` `.rw2` `.pef` `.srw`) in `core/image/raw_decoder.cpp`: the
+  embedded JPEG preview first, a half-size demosaic second. There is no CMake
+  project upstream, so `third_party/libraw_sources.cmake` lists the sources
+  (buildfiles/libraw.pro's list) once and both builds compile them with
+  `-DLIBRAW_NOTHREADS` and without `USE_ZLIB`/`USE_JPEG`/`USE_LCMS`. The
+  library is unmodified, and static linking into this GPL-3.0-or-later work is
+  allowed because its complete source is here.
+
+### zstd
+
+- Version: `v1.5.7` (git submodule, `third_party/zstd`)
+- Upstream: <https://github.com/facebook/zstd>
+- License: BSD-3-Clause (Copyright (c) Meta Platforms, Inc. and affiliates;
+  full text in `third_party/LICENSES/zstd.txt`). The upstream `COPYING` also
+  offers GPL-2.0 as an alternative; **we take the BSD-3-Clause**.
+- Used for: decompressing the attribute streams of an spz v4 splat file
+  (`core/splat_import/splat_spz.cpp`). Only the decompressor and the common
+  code are compiled (`third_party/zstd_sources.cmake`) with
+  `ZSTD_LEGACY_SUPPORT=0`, `ZSTD_MULTITHREAD=0` and `ZSTD_DISABLE_ASM=1`; the
+  compressor, the dictionary builder and the tools are not built.
+
+### libsmb2
+
+- Version: `libsmb2-6.3` (2026-10-21; git submodule, `third_party/libsmb2`)
+- Upstream: <https://github.com/sahlberg/libsmb2>
+- License: GNU Lesser General Public License v2.1 or later (Copyright (C)
+  2014-2026 Ronnie Sahlberg; full text in
+  `third_party/LICENSES/libsmb2.txt`, upstream `LICENCE-LGPL-2.1.txt`). The
+  `examples/` directory is BSD-2-Clause; **we build no example** (the library
+  only, with `ENABLE_EXAMPLES=OFF`).
+- Used for: the SMB2/SMB3 client behind `core/vfs/smb.cpp` - listing, ranged
+  reads, writes, mkdir, unlink and rmdir for a location mounted from
+  `Settings > Network locations`. NTLMv2 only (`ENABLE_LIBKRB5=OFF`,
+  `ENABLE_GSSAPI=OFF`); SMB3 sealing (AES-128-CCM) is available through
+  `smb2_set_seal`. The library is unmodified, and static linking into this
+  GPL-3.0-or-later work is allowed because its complete source is here and
+  `CMakeLists.txt` rebuilds it.
+
+### libnfs
+
+- Version: `libnfs-8.0.0` (2026; git submodule, `third_party/libnfs`)
+- Upstream: <https://github.com/sahlberg/libnfs>
+- License: GNU Lesser General Public License v2.1 or later for the library
+  (Copyright (C) 2010-2026 Ronnie Sahlberg and contributors; full text in
+  `third_party/LICENSES/libnfs.txt`, upstream `LICENCE-LGPL-2.1.txt`). The
+  rpcgen-derived `libnfs-raw-*.c`/`.h` files under `mount/`, `nfs/`, `nfs4/`,
+  `nlm/`, `nsm/`, `portmap/` and `rquota/` carry the BSD-3-Clause notice
+  (full text in `third_party/LICENSES/libnfs-bsd.txt`, upstream
+  `LICENCE-BSD.txt`) and **are** compiled into the library here.
+  `examples/` is GPL-3 and is **not** built (`ENABLE_EXAMPLES=OFF`, with
+  `ENABLE_UTILS=OFF`, `ENABLE_TESTS=OFF`, `ENABLE_DOCUMENTATION=OFF`).
+- Used for: the NFSv3/NFSv4 client behind `core/vfs/nfs.cpp` - listing, ranged
+  reads, writes (create/pwrite/fsync), mkdir, unlink and rmdir for a location
+  mounted from `Settings > Network locations`. AUTH_SYS only (uid/gid; there is
+  no password in NFS), NFSv3 by default with NFSv4 selectable per location, and
+  `?nfsport=&mountport=` so a server with fixed ports needs no rpcbind. RPC-with-
+  TLS is off (`ENABLE_TLS=OFF`), as is libnfs's own threading
+  (`ENABLE_MULTITHREADING=OFF`: the adapter serialises one context under its
+  own mutex). The library is unmodified, and static linking into this
+  GPL-3.0-or-later work is allowed because its complete source is here and
+  `CMakeLists.txt` rebuilds it.
+
 ## Ported into the PS5 payloads and titles (source in this repository)
 
 The payload libraries, payloads and titles are GPL-3.0-or-later like this

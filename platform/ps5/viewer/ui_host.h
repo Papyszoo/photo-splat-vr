@@ -10,10 +10,13 @@
 // with; there is no palette and no per-colour mask. An opaque 1x1 RGBA
 // backdrop quad sits behind it so the panel reads over the scene.
 //
-// In VR the quad is the lazy follower of render/hmd_view.h (PanelFollower): it
-// stays parallel to the view plane (yaw and pitch, never roll) and re-centres
-// with a ~0.3 s ease when the head turns more than ~17 deg away, so it never
-// keystones the way the old yaw-only world-locked plane did.
+// In VR the quad is a world-fixed window (render/hmd_view.h PanelAnchor): it is
+// latched 1.6 m in front of the pose the panel opened from, parallel to that
+// pose's view plane (yaw and pitch, never roll), and left exactly there - it
+// never follows the head, so it cannot keystone while the user reads through it
+// and cannot keep sliding out of the headset's small sweet spot. Cross held for
+// one second with the panel open re-latches it in front of the user
+// (recenter_panel()); a Cross tap is still the panel's Select.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
@@ -57,22 +60,31 @@ public:
     // One frame: update the content, upload when it changed, rebuild the quads.
     void frame(const splat::UiInput& input, const splat::CameraPose& camera);
 
-    // VR only: advances the lazy panel follower with this frame's head pose and
-    // dt. Call once per frame before panel_quad()/frame(), so the pointer ray,
-    // the drawn quad and the follower state all agree. TV mode ignores it.
-    void update_panel(const splat::CameraPose& camera, double dt);
+    // VR only: latch the panel's anchor if it is not latched yet (the first
+    // visible frame after set_visible(true)). Call once per frame before
+    // panel_quad()/frame(), so the pointer ray, the drawn quad and the anchor
+    // agree. A latched anchor is never moved here - only set_visible(true) and
+    // recenter_panel() change it. TV mode ignores it.
+    void update_panel(const splat::CameraPose& camera);
 
     bool visible() const { return visible_; }
-    // Showing the panel again (a menu reopening in VR) re-faces the reference.
+    // Showing the panel again (a menu reopening in VR) clears the anchor, so
+    // the window opens where the user is looking now.
     void set_visible(bool visible);
 
     // The panel's quad this frame, without the backdrop: the same geometry
     // quads() returns, for the pointer ray to test against before frame()
-    // rebuilds the list. In VR it latches the world reference exactly as
-    // frame() would (the first visible frame included), so the ray and the
-    // drawn panel share one reference pose. Empty (width 0) when hidden or
-    // before init().
+    // rebuilds the list. In VR it latches the world anchor when it is not
+    // latched yet (the first visible frame included), so the ray and the drawn
+    // panel are one and the same quad; a latched anchor is returned unchanged,
+    // whatever the head does. Empty (width 0) when hidden or before init().
     splat::OverlayQuad panel_quad(const splat::CameraPose& camera);
+
+    // VR only: put the window back in front of this pose (the panel-open Cross
+    // hold). This is the anchor's latch at the current head pose - 1.6 m ahead,
+    // parallel to that pose's view plane - and the one thing besides a fresh
+    // open that moves a latched window. TV mode ignores it.
+    void recenter_panel(const splat::CameraPose& camera);
 
     uint32_t canvas_width() const { return canvas_.width(); }
     uint32_t canvas_height() const { return canvas_.height(); }
@@ -106,10 +118,10 @@ private:
     bool backdrop_ready_ = false;
     bool initialised_ = false;
     bool visible_ = true;
-    // VR: the panel's lazy follower (hmd_view.h). It starts ahead of the pose
-    // that raised the panel and re-centres when the head turns away.
-    bool panel_reset_ = true;
-    splat::PanelFollower panel_follower_;
+    // VR: the window's world-fixed anchor (hmd_view.h). It is latched on the
+    // first visible frame and stays put; set_visible(true) and
+    // recenter_panel() are the only things that move it.
+    splat::PanelAnchor panel_anchor_;
     std::vector<splat::OverlayQuad> quads_;
     // The cursor's saved pixels and position; `cursor_saved_` says the patch is
     // the canvas under a ring that is currently drawn.

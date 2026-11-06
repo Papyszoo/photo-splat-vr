@@ -1,0 +1,44 @@
+# A2: import already-converted splats from local storage.
+#
+# This runs before the format case, so on a fresh console the album it imports
+# into holds only imported scenes and "open the first scene" (imported-view.txt)
+# really opens an import. The driver also names the fixtures so the imports sort
+# first ("0a-big", ...) - that is what keeps the first tile an import on a
+# console that already holds converted scenes from an earlier sitting.
+#
+# Home (Albums) -> 00_v02_console (focus lands on its first scene) -> Left
+# ("+ Add photos") -> Photos, Inbox tab -> the nine splat fixtures in the order
+# the driver uploaded them: five good (0a..0e), then four malformed (0f..0i).
+# Cross on a splat tile imports it immediately (no dialog; an import needs no
+# model), so the nine Crosses queue nine imports and the four malformed ones
+# fail on their own without stopping the queue.
+#
+# Asserted from the klog by console-run.sh:
+#   viewer: jobs: 0b-tiny.spz done: imported N splats   (one per good file)
+#   thinned 3,000,000 to 2,000,000 splats               (the 3 M .splat)
+#   the four malformed files fail with a specific message and the queue goes on
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+3.0  press Left
+3.6  press Cross
+5.0  press Cross
+5.6  press Right
+6.0  press Cross
+6.6  press Right
+7.0  press Cross
+7.6  press Right
+8.0  press Cross
+8.6  press Right
+9.0  press Cross
+9.6  press Right
+10.0 press Cross
+10.6 press Right
+11.0 press Cross
+11.6 press Right
+12.0 press Cross
+12.6 press Right
+13.0 press Cross
+40.0 shot 00-importing
+55.0 shot 01-done
+56.0 quit

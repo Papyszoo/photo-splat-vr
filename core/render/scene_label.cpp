@@ -71,6 +71,9 @@ std::string model_from_folder_suffix(const std::string& folder_name) {
 
 std::string scene_model_name(const std::string& backend, const std::string& folder_name) {
     const std::string name = lowercase(backend);
+    // An imported scene has no model; the row and the label say where it came
+    // from instead of guessing a reconstruction backend.
+    if (name == "import") return "Imported";
     if (name.find("sharp") != std::string::npos) return "SHARP";
     if (name.find("depth-anything") != std::string::npos || name.find("da2") != std::string::npos) {
         // Spelled as the Models screen names them ("DA2-Small"); the pinned

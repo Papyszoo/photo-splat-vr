@@ -1,0 +1,56 @@
+# A1: nine photo formats through the real panel, plus the 70 MP guard.
+#
+# Home (Albums) -> 00_v02_console -> + Add photos -> the format fixtures in the
+# Inbox (select all: six on the first row, four on the second) -> Square ->
+# Convert dialog -> Start.
+#
+# The 70 MP PNG is in the batch and must fail without stopping the queue. Every
+# assertion is in the klog, which console-run.sh reads:
+#   viewer: jobs: <name> done          one per format
+#   photo is 70000x1000 (70.0 MP)      the guard
+#   the queue is idle again (peak RSS)  the run reached the end of the queue
+0.5  mark home
+1.0  press Right
+1.6  press Cross
+2.6  shot 00-album
+# Entering an album puts the focus on its first scene (scenes.cpp: first_scene_cell),
+# so Left is needed to reach tile 0, "+ Add photos". Without it Cross opens the
+# scene (this pass did: "tv scene 1/5 0a-big") and the case converts nothing.
+3.0  press Left
+3.6  press Cross
+4.2  shot 01-photos
+4.6  press Cross
+5.2  press Right
+5.6  press Cross
+6.2  press Right
+6.6  press Cross
+7.2  press Right
+7.6  press Cross
+8.2  press Right
+8.6  press Cross
+9.2  press Right
+9.6  press Cross
+10.2 press Left
+10.6 press Left
+11.0 press Left
+11.4 press Left
+11.8 press Left
+12.4 press Down
+13.0 press Cross
+13.6 press Right
+14.0 press Cross
+14.6 press Right
+15.0 press Cross
+15.6 press Right
+16.0 press Cross
+17.0 shot 02-selected
+17.6 press Square
+18.6 shot 03-dialog
+19.2 press Cross
+20.2 shot 04-started
+50.0 shot 05-done
+51.0 press Circle
+52.0 press Circle
+53.0 press Circle
+54.0 shot 06-home
+55.0 quit

@@ -43,7 +43,7 @@ INCLUDES := -I$(REPO)/core -I$(REPO)/third_party -I$(REPO)/third_party/json \
 # Statically linked project + ggml, scanned as one group: the reconstruction
 # code, the two ggml backends and the core reference each reference the other.
 SPLAT_LIBS := $(BUILD)/libsplat_core_ps5.a $(BUILD)/libsplat_ps5_glue.a \
-              $(BUILD)/libsplat_miniz.a \
+              $(BUILD)/libsplat_miniz.a $(BUILD)/libsplat_zstd.a \
               $(GGML_LIB)/ggml-vulkan/libggml-vulkan.a \
               $(GGML_LIB)/libggml.a $(GGML_LIB)/libggml-base.a $(GGML_LIB)/libggml-cpu.a
 

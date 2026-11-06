@@ -2,6 +2,7 @@
 //
 //   ui_preview <out.png> [pattern]
 //   ui_preview --all <dir>        every panel screen as <dir>/<name>.png
+//   ui_preview --help             print this usage; other -options write nothing
 //
 // Each pattern names its canvas and theme scale (patterns.h), so the VR
 // previews are drawn at the headset's 896x504 with the 0.7 theme. The pattern
@@ -18,7 +19,8 @@ namespace {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: ui_preview <out.png> [pattern]\n       ui_preview --all <dir>\n\n"
+                 "usage: ui_preview <out.png> [pattern]\n       ui_preview --all <dir>\n"
+                 "       ui_preview --help\n\n"
                  "  patterns:\n");
     for (const auto& entry : splat::ui_preview::registry()) {
         std::fprintf(stderr, "    %-12s %ux%u%s\n", entry.first.c_str(), entry.second.width,
@@ -30,6 +32,25 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // -h/--help prints the usage and succeeds. Any other word that starts with
+    // '-' (except "--all" with its directory) is a mistyped option, not an
+    // output path: report it and write nothing.
+    if (argc >= 2) {
+        const std::string first = argv[1];
+        if (first == "-h" || first == "--help") {
+            usage();
+            return 0;
+        }
+        if (first == "--all" && argc != 3) {
+            usage();
+            return 2;
+        }
+        if (first.size() > 1 && first[0] == '-' && first != "--all") {
+            std::fprintf(stderr, "ui_preview: unknown option '%s'\n", first.c_str());
+            usage();
+            return 2;
+        }
+    }
     if (argc < 2 || argc > 3) {
         usage();
         return 2;

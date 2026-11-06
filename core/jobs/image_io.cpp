@@ -2,19 +2,21 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <system_error>
 
 #include "common/exif.h"
+#include "image/orientation.h"
+#include "vfs/io.h"
 
 // Static implementations keep the stb symbols local to this translation unit;
 // tests and other components may include the same headers with their own
-// implementation.
-#define STB_IMAGE_STATIC
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb/stb_image.h>
-
+// implementation. Decoding itself is core/image/decode.cpp.
 #define STB_IMAGE_RESIZE_STATIC
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include <stb/stb_image_resize2.h>
@@ -34,13 +36,10 @@ void append_bytes(void* context, void* data, int size) {
 
 }  // namespace
 
-Result<std::vector<uint8_t>> read_file_bytes(const Path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return Result<std::vector<uint8_t>>::failure("cannot open " + path.string());
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)),
-                               std::istreambuf_iterator<char>());
-    if (file.bad()) return Result<std::vector<uint8_t>>::failure("failed while reading " + path.string());
-    return Result<std::vector<uint8_t>>::success(std::move(bytes));
+Result<std::vector<uint8_t>> read_file_bytes(const Path& path, size_t max_bytes) {
+    // One reader for the whole app (L3): the VFS picks the local disk or a
+    // network location, and its size guard runs before anything is allocated.
+    return vfs::read_file(path, max_bytes);
 }
 
 bool looks_like_jpeg(const uint8_t* data, size_t size) {
@@ -48,34 +47,13 @@ bool looks_like_jpeg(const uint8_t* data, size_t size) {
 }
 
 Result<Image> decode_image(const uint8_t* data, size_t size) {
-    if (data == nullptr || size == 0) return Result<Image>::failure("image buffer is empty");
-    if (size > static_cast<size_t>(INT32_MAX)) return Result<Image>::failure("image is too large");
-
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    stbi_uc* pixels = stbi_load_from_memory(data, static_cast<int>(size), &width, &height, &channels, 3);
-    if (pixels == nullptr) {
-        const char* reason = stbi_failure_reason();
-        return Result<Image>::failure(std::string("cannot decode image: ") +
-                                      (reason != nullptr ? reason : "unknown format"));
-    }
-    if (width <= 0 || height <= 0) {
-        stbi_image_free(pixels);
-        return Result<Image>::failure("decoded image has no pixels");
-    }
-
-    Image image;
-    image.resize(width, height);
-    std::copy(pixels, pixels + image.byte_size(), image.rgb.begin());
-    stbi_image_free(pixels);
-    return Result<Image>::success(std::move(image));
+    return image::decode_photo(data, size, image::DecodeOptions{}, nullptr);
 }
 
-Result<Image> decode_image(const Path& path) {
-    const Result<std::vector<uint8_t>> bytes = read_file_bytes(path);
-    if (!bytes.ok()) return Result<Image>::failure(bytes.message());
-    return decode_image(bytes.value().data(), bytes.value().size());
+Result<Image> decode_image(const Path& path) { return image::decode_photo(path, {}, nullptr); }
+
+Result<Image> decode_image(const Path& path, image::DecodeInfo* info) {
+    return image::decode_photo(path, {}, info);
 }
 
 Result<std::vector<uint8_t>> encode_jpeg(const Image& image, int quality) {
@@ -129,6 +107,59 @@ Result<float> focal_px_from_photo(const uint8_t* data, size_t size, int width, i
         if (exif.ok()) return exif;
     }
     return focal_px_from_exif(ExifFocal{}, width, height);
+}
+
+Result<Intrinsics> photo_intrinsics(const uint8_t* data, size_t size,
+                                    const image::DecodeInfo& info) {
+    if (info.width <= 0 || info.height <= 0) {
+        return Result<Intrinsics>::failure("decoded photo has no size");
+    }
+    const int source_w = info.source_width > 0 ? info.source_width : info.width;
+    const int source_h = info.source_height > 0 ? info.source_height : info.height;
+
+    // A malformed Exif segment falls back to the 30 mm default, exactly as
+    // focal_px_from_photo() does for the console convert mode.
+    ExifFocal focal_data;
+    const Result<ExifData> exif = parse_exif(data, size);
+    if (exif.ok()) focal_data = exif.value().focal;
+    const Result<float> focal = focal_px_from_exif(focal_data, source_w, source_h);
+    if (!focal.ok()) return Result<Intrinsics>::failure(focal.message());
+
+    image::ImageIntrinsics in;
+    in.width = source_w;
+    in.height = source_h;
+    in.fx = focal.value();
+    in.fy = focal.value();
+    in.cx = static_cast<float>(source_w) / 2.0f;
+    in.cy = static_cast<float>(source_h) / 2.0f;
+
+    // The same map the pixels went through; no resampling happens, so a scale
+    // of 1 is the normal case and only a decoder that resized needs the ratio.
+    image::ImageIntrinsics out =
+        image::orient_intrinsics(in, info.exif_orientation, info.rotate_quarters);
+    if (out.width != info.width || out.height != info.height) {
+        // A decoder applied a transform of its own (libheif's irot/imir). The
+        // decoded size is then the truth, and the map above was computed for a
+        // frame it did not know about: use the centre of the decoded image,
+        // which is where a centred capture's principal point lands under any
+        // 90-degree turn (within a pixel).
+        out.width = info.width;
+        out.height = info.height;
+        out.cx = static_cast<float>(info.width) / 2.0f;
+        out.cy = static_cast<float>(info.height) / 2.0f;
+    }
+    const float long_source = static_cast<float>(std::max(source_w, source_h));
+    const float long_out = static_cast<float>(std::max(info.width, info.height));
+    const float scale = long_source > 0.0f ? long_out / long_source : 1.0f;
+
+    Intrinsics intrinsics;
+    intrinsics.width = static_cast<uint32_t>(info.width);
+    intrinsics.height = static_cast<uint32_t>(info.height);
+    intrinsics.fx = out.fx * scale;
+    intrinsics.fy = out.fy * scale;
+    intrinsics.cx = out.cx * scale;
+    intrinsics.cy = out.cy * scale;
+    return Result<Intrinsics>::success(intrinsics);
 }
 
 }  // namespace splat

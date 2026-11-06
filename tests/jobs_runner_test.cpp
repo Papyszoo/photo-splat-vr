@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,10 +18,12 @@
 
 #include "common/exif.h"
 #include "common/image.h"
+#include "gallery/photo_turns.h"
 #include "jobs/gpu_phase_guard.h"
 #include "jobs/image_io.h"
 #include "jobs/job_queue.h"
 #include "jobs/job_runner.h"
+#include "scene/ply.h"
 #include "scene/scene_folder.h"
 #include "test_util.h"
 
@@ -84,7 +87,7 @@ private:
     std::shared_ptr<FakeState> state_;
 };
 
-splat::Path write_test_jpeg(const splat::Path& path, int width, int height) {
+std::vector<uint8_t> encode_test_jpeg(int width, int height) {
     splat::Image image;
     image.resize(width, height);
     for (int y = 0; y < height; ++y) {
@@ -97,12 +100,63 @@ splat::Path write_test_jpeg(const splat::Path& path, int width, int height) {
     }
     const auto encoded = splat::encode_jpeg(image, 90);
     REQUIRE_MESSAGE(encoded.ok(), encoded.message());
+    return encoded.value();
+}
+
+splat::Path write_bytes(const splat::Path& path, const std::vector<uint8_t>& bytes) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     REQUIRE(out.good());
-    out.write(reinterpret_cast<const char*>(encoded.value().data()),
-              static_cast<std::streamsize>(encoded.value().size()));
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
     REQUIRE(out.good());
     return path;
+}
+
+splat::Path write_test_jpeg(const splat::Path& path, int width, int height) {
+    return write_bytes(path, encode_test_jpeg(width, height));
+}
+
+std::vector<uint8_t> read_bytes(const splat::Path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+// The JPEG plus an Exif APP1 segment right after SOI with one IFD0 entry:
+// Orientation = `orientation`. This is what a portrait phone photo carries.
+std::vector<uint8_t> with_exif_orientation(const std::vector<uint8_t>& jpeg, int orientation) {
+    std::vector<uint8_t> tiff = {'I', 'I', 0x2A, 0x00, 8, 0, 0, 0};  // II, 42, IFD0 at 8
+    tiff.push_back(1);  // one entry
+    tiff.push_back(0);
+    tiff.push_back(0x12);  // tag 0x0112 Orientation
+    tiff.push_back(0x01);
+    tiff.push_back(3);  // SHORT
+    tiff.push_back(0);
+    tiff.push_back(1);  // count 1
+    tiff.push_back(0);
+    tiff.push_back(0);
+    tiff.push_back(0);
+    tiff.push_back(static_cast<uint8_t>(orientation));
+    tiff.push_back(0);
+    tiff.push_back(0);
+    tiff.push_back(0);
+    tiff.push_back(0);  // no next IFD
+    tiff.push_back(0);
+    tiff.push_back(0);
+    tiff.push_back(0);
+
+    std::vector<uint8_t> app1 = {0xFF, 0xE1};
+    const auto length = static_cast<uint16_t>(2 + 6 + tiff.size());
+    app1.push_back(static_cast<uint8_t>(length >> 8));
+    app1.push_back(static_cast<uint8_t>(length));
+    const char exif_header[] = {'E', 'x', 'i', 'f', 0, 0};
+    app1.insert(app1.end(), exif_header, exif_header + 6);
+    app1.insert(app1.end(), tiff.begin(), tiff.end());
+
+    std::vector<uint8_t> out(jpeg.begin(), jpeg.begin() + 2);
+    out.insert(out.end(), app1.begin(), app1.end());
+    out.insert(out.end(), jpeg.begin() + 2, jpeg.end());
+    return out;
 }
 
 splat::JobRunner make_runner(splat::JobQueue& queue, splat::GpuPhaseGuard& guard,
@@ -474,6 +528,44 @@ TEST_CASE("jobs: a job lands in its album with the photo stem as folder name") {
     CHECK(root_run.value().value().scene_folder == dir.path() / "scenes" / "loose.png");
 }
 
+TEST_CASE("jobs: the runner writes the job's source folder into meta.json") {
+    splat_test::TempDir dir("jobs-source-folder");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    std::filesystem::create_directories(dir.path() / "inbox");
+    const splat::Path photo = write_test_jpeg(dir.path() / "inbox" / "a.jpg", 32, 32);
+    // The picker's key travels through the queue into the scene's meta.json, so
+    // hiding the source folder later hides the scene wherever it now lives.
+    const auto converted = queue.enqueue(photo, "fake", "Family A", 0, splat::Path(),
+                                        "folder:/data/Photos");
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    const auto run = runner.run_next();
+    REQUIRE(run.ok());
+    REQUIRE(run.value().has_value());
+    const auto scene = splat::read_scene_folder(run.value()->scene_folder);
+    REQUIRE(scene.ok());
+    CHECK(scene.value().meta.source_folder == "folder:/data/Photos");
+
+    // The import path writes it too.
+    const splat::SplatScene source = splat_test::make_test_scene(4);
+    REQUIRE(splat::export_ply(dir.path() / "inbox" / "cloud.ply", source).ok());
+    const auto imported = queue.enqueue_import(dir.path() / "inbox" / "cloud.ply", "Family A",
+                                               splat::Path(), "source:usb0");
+    REQUIRE_MESSAGE(imported.ok(), imported.message());
+    const auto imported_run = runner.run_next();
+    REQUIRE(imported_run.ok());
+    REQUIRE(imported_run.value().has_value());
+    REQUIRE(imported_run.value()->state == splat::JobState::Done);
+    const auto imported_scene = splat::read_scene_folder(imported_run.value()->scene_folder);
+    REQUIRE(imported_scene.ok());
+    CHECK(imported_scene.value().meta.source_folder == "source:usb0");
+    CHECK(imported_scene.value().meta.origin_present);
+}
+
 TEST_CASE("jobs: a repeated photo name gets -2 and -3 folders, and long names are cut to 48") {
     splat_test::TempDir dir("jobs-collision");
     JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
@@ -516,4 +608,272 @@ TEST_CASE("jobs: a repeated photo name gets -2 and -3 folders, and long names ar
     CHECK(splat::scene_folder_base(splat::Path("/a/.hidden.jpg")) == "_hidden");
     CHECK(splat::scene_folder_base(splat::Path("/a/....jpg")) == "_..");
     CHECK(splat::scene_folder_base(splat::Path("")) == "photo");
+}
+
+TEST_CASE("jobs: an EXIF orientation 6 photo writes the swapped dimensions") {
+    splat_test::TempDir dir("jobs-orientation");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    // 64x32 as stored, orientation 6 (rotate 90 clockwise on display).
+    const std::vector<uint8_t> file = with_exif_orientation(encode_test_jpeg(64, 32), 6);
+    const splat::Path photo = write_bytes(dir.path() / "portrait.jpg", file);
+    REQUIRE_MESSAGE(queue.enqueue(photo, "fake").ok(), "enqueue");
+
+    const auto result = runner.run_next();
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    REQUIRE(result.value().has_value());
+    const splat::JobOutcome& outcome = result.value().value();
+    REQUIRE(outcome.state == splat::JobState::Done);
+
+    // The scene and the backend saw the oriented image, not the stored one.
+    CHECK(state->width == 32);
+    CHECK(state->height == 64);
+
+    const auto loaded = splat::read_scene_folder(outcome.scene_folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().meta.intrinsics.width == 32);
+    CHECK(loaded.value().meta.intrinsics.height == 64);
+    // cx' = (source height - 1) - cy, cy' = cx: the same map as the pixels.
+    CHECK(loaded.value().meta.intrinsics.cx == doctest::Approx(15.0f));
+    CHECK(loaded.value().meta.intrinsics.cy == doctest::Approx(32.0f));
+    CHECK(loaded.value().meta.intrinsics.fx == doctest::Approx(loaded.value().meta.intrinsics.fy));
+
+    // An oriented JPEG is not the file's own pixels: it is re-encoded, so the
+    // stored original.jpg must differ from the bytes that were read.
+    const splat::SceneFiles files = splat::scene_files(outcome.scene_folder);
+    CHECK(read_bytes(files.original) != file);
+    const auto original = splat::decode_image(files.original);
+    REQUIRE_MESSAGE(original.ok(), original.message());
+    CHECK(original.value().width == 32);
+    CHECK(original.value().height == 64);
+}
+
+TEST_CASE("jobs: manual quarter turns rotate the scene and rewrite original.jpg") {
+    splat_test::TempDir dir("jobs-rotate");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    const std::vector<uint8_t> file = encode_test_jpeg(64, 32);
+    const splat::Path photo = write_bytes(dir.path() / "sideways.jpg", file);
+    REQUIRE_MESSAGE(queue.enqueue(photo, "fake", "", 1).ok(), "enqueue");
+
+    const auto result = runner.run_next();
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    REQUIRE(result.value().has_value());
+    REQUIRE(result.value().value().state == splat::JobState::Done);
+
+    CHECK(state->width == 32);
+    CHECK(state->height == 64);
+
+    const auto loaded = splat::read_scene_folder(result.value().value().scene_folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().meta.intrinsics.width == 32);
+    CHECK(loaded.value().meta.intrinsics.height == 64);
+    CHECK(loaded.value().meta.intrinsics.cx == doctest::Approx(15.0f));
+    CHECK(loaded.value().meta.intrinsics.cy == doctest::Approx(32.0f));
+
+    const splat::SceneFiles files = splat::scene_files(result.value().value().scene_folder);
+    CHECK(read_bytes(files.original) != file);
+    const auto original = splat::decode_image(files.original);
+    REQUIRE_MESSAGE(original.ok(), original.message());
+    CHECK(original.value().width == 32);
+    CHECK(original.value().height == 64);
+}
+
+TEST_CASE("jobs: EXIF orientation 6 is applied before the manual quarter turn") {
+    splat_test::TempDir dir("jobs-orientation-rotate");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    // 64x32 as stored, EXIF orientation 6 (90 clockwise on display). The manual
+    // quarter turn is applied after it, exactly the order decode_photo() and
+    // orient_intrinsics() document: 64x32 -> 32x64 -> 64x32.
+    const std::vector<uint8_t> file = with_exif_orientation(encode_test_jpeg(64, 32), 6);
+    const splat::Path photo = write_bytes(dir.path() / "portrait-turned.jpg", file);
+    REQUIRE_MESSAGE(queue.enqueue(photo, "fake", "", 1).ok(), "enqueue");
+
+    const auto result = runner.run_next();
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    REQUIRE(result.value().has_value());
+    REQUIRE(result.value().value().state == splat::JobState::Done);
+
+    // The backend saw EXIF first and then the turn: the stored 64x32 is portrait
+    // after orientation 6, and the turn brings it back to landscape.
+    CHECK(state->width == 64);
+    CHECK(state->height == 32);
+
+    const auto loaded = splat::read_scene_folder(result.value().value().scene_folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().meta.intrinsics.width == 64);
+    CHECK(loaded.value().meta.intrinsics.height == 32);
+    // Source intrinsics were cx 32 / cy 16. EXIF 6 maps them to cx 15 / cy 32;
+    // the clockwise quarter then maps that to cx 63-32 = 31 / cy 15.
+    CHECK(loaded.value().meta.intrinsics.cx == doctest::Approx(31.0f));
+    CHECK(loaded.value().meta.intrinsics.cy == doctest::Approx(15.0f));
+    CHECK(loaded.value().meta.intrinsics.fx ==
+          doctest::Approx(loaded.value().meta.intrinsics.fy));
+
+    // The written original.jpg is the fully oriented and turned image.
+    const splat::SceneFiles files = splat::scene_files(result.value().value().scene_folder);
+    CHECK(read_bytes(files.original) != file);
+    const auto original = splat::decode_image(files.original);
+    REQUIRE_MESSAGE(original.ok(), original.message());
+    CHECK(original.value().width == 64);
+    CHECK(original.value().height == 32);
+}
+
+TEST_CASE("jobs: a turned photo converts with exactly one turn on both routes") {
+    splat_test::TempDir dir("jobs-photo-turn");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+    splat::PhotoTurnStore turns(dir.path() / "state");
+
+    SUBCASE("the source's Orientation tag was rewritten") {
+        // 64x32 stored, a right turn rewrites the file to EXIF 6. The job is
+        // enqueued with the store's turn (0), so the file's tag is the only
+        // turn: 32x64, not the 64x32 a second turn would produce.
+        const splat::Path photo =
+            write_bytes(dir.path() / "rewritten.jpg", encode_test_jpeg(64, 32));
+        const auto turned = splat::rotate_photo_file(photo, 1, turns, true);
+        REQUIRE_MESSAGE(turned.ok(), turned.message());
+        REQUIRE(turned.value().route == splat::PhotoTurnResult::Route::rewritten);
+        REQUIRE_MESSAGE(queue.enqueue(photo, "fake", "", turns.load(photo)).ok(), "enqueue");
+        const auto result = runner.run_next();
+        REQUIRE_MESSAGE(result.ok(), result.message());
+        REQUIRE(result.value().has_value());
+        REQUIRE(result.value().value().state == splat::JobState::Done);
+        CHECK(state->width == 32);
+        CHECK(state->height == 64);
+        const auto loaded = splat::read_scene_folder(result.value().value().scene_folder);
+        REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+        CHECK(loaded.value().meta.intrinsics.width == 32);
+        CHECK(loaded.value().meta.intrinsics.height == 64);
+        const auto original = splat::decode_image(splat::scene_files(
+            result.value().value().scene_folder).original);
+        REQUIRE_MESSAGE(original.ok(), original.message());
+        CHECK(original.value().width == 32);
+        CHECK(original.value().height == 64);
+    }
+
+    SUBCASE("the turn was saved because the file cannot be rewritten") {
+        // A PNG: the source is untouched and the quarter goes to the job.
+        std::vector<uint8_t> rgba(64 * 32 * 4, 128);
+        const auto encoded = splat::encode_png(rgba.data(), 64, 32);
+        REQUIRE_MESSAGE(encoded.ok(), encoded.message());
+        const splat::Path photo = write_bytes(dir.path() / "saved.png", encoded.value());
+        const auto turned = splat::rotate_photo_file(photo, 1, turns, true);
+        REQUIRE_MESSAGE(turned.ok(), turned.message());
+        REQUIRE(turned.value().route == splat::PhotoTurnResult::Route::saved);
+        REQUIRE(turned.value().quarters == 1);
+        CHECK(read_bytes(photo) == encoded.value());
+        REQUIRE_MESSAGE(queue.enqueue(photo, "fake", "", turns.load(photo)).ok(), "enqueue");
+        const auto result = runner.run_next();
+        REQUIRE_MESSAGE(result.ok(), result.message());
+        REQUIRE(result.value().has_value());
+        REQUIRE(result.value().value().state == splat::JobState::Done);
+        CHECK(state->width == 32);
+        CHECK(state->height == 64);
+        const auto loaded = splat::read_scene_folder(result.value().value().scene_folder);
+        REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+        CHECK(loaded.value().meta.intrinsics.width == 32);
+        CHECK(loaded.value().meta.intrinsics.height == 64);
+    }
+}
+
+TEST_CASE("jobs: a scene turn runs without a model and rewrites the folder") {
+    splat_test::TempDir dir("jobs-rotate-run");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    // A 64x32 scene folder, written the way a conversion writes one.
+    const splat::SplatScene scene = splat_test::make_test_scene(8);
+    splat::SceneMeta meta;
+    meta.backend = "sharp";
+    meta.intrinsics.width = 64;
+    meta.intrinsics.height = 32;
+    meta.intrinsics.fx = 80.0f;
+    meta.intrinsics.fy = 80.0f;
+    meta.intrinsics.cx = 32.0f;
+    meta.intrinsics.cy = 16.0f;
+    const std::vector<uint8_t> jpeg = encode_test_jpeg(64, 32);
+    const splat::Path folder = dir.path() / "scenes" / "s1";
+    REQUIRE_MESSAGE(
+        splat::write_scene_folder(folder, scene, meta, jpeg, jpeg).ok(), "write scene");
+
+    const auto id = queue.enqueue_rotate(folder, 1);
+    REQUIRE_MESSAGE(id.ok(), id.message());
+    const auto result = runner.run_next();
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    REQUIRE(result.value().has_value());
+    CHECK(result.value().value().state == splat::JobState::Done);
+    CHECK(result.value().value().scene_folder == folder);
+
+    const auto loaded = splat::read_scene_folder(folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().meta.intrinsics.width == 32);
+    CHECK(loaded.value().meta.intrinsics.height == 64);
+    const auto original = splat::decode_image(splat::scene_files(folder).original);
+    REQUIRE_MESSAGE(original.ok(), original.message());
+    CHECK(original.value().width == 32);
+    CHECK(original.value().height == 64);
+    // No model was loaded for a turn.
+    CHECK(state->loads == 0);
+}
+
+TEST_CASE("jobs: a scene turn is refused while the viewer holds that scene") {
+    splat_test::TempDir dir("jobs-rotate-open");
+    JobQueue queue = JobQueue::open(dir.path() / "state" / "jobs.json").value();
+    splat::GpuPhaseGuard guard;
+    auto state = std::make_shared<FakeState>();
+    state->guard = &guard;
+    splat::JobRunner runner = make_runner(queue, guard, state, dir.path());
+
+    const splat::SplatScene scene = splat_test::make_test_scene(8);
+    splat::SceneMeta meta;
+    meta.backend = "sharp";
+    meta.intrinsics.width = 64;
+    meta.intrinsics.height = 32;
+    meta.intrinsics.fx = 80.0f;
+    meta.intrinsics.fy = 80.0f;
+    meta.intrinsics.cx = 32.0f;
+    meta.intrinsics.cy = 16.0f;
+    const std::vector<uint8_t> jpeg = encode_test_jpeg(64, 32);
+    const splat::Path folder = dir.path() / "scenes" / "s1";
+    REQUIRE_MESSAGE(
+        splat::write_scene_folder(folder, scene, meta, jpeg, jpeg).ok(), "write scene");
+
+    // The turn is queued, then the user opens the scene (it sat behind another
+    // job). The runner must not rewrite the folder under the renderer.
+    REQUIRE_MESSAGE(queue.enqueue_rotate(folder, 1).ok(), "enqueue");
+    runner.set_scene_open(
+        [folder](const splat::Path& open) { return open.lexically_normal() == folder; });
+
+    const auto result = runner.run_next();
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    REQUIRE(result.value().has_value());
+    CHECK(result.value().value().state == splat::JobState::Failed);
+    CHECK(result.value().value().message.find("close the scene") != std::string::npos);
+
+    // The scene the viewer holds is untouched.
+    const auto loaded = splat::read_scene_folder(folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().meta.intrinsics.width == 64);
+    CHECK(loaded.value().meta.intrinsics.height == 32);
+    CHECK(state->loads == 0);
 }

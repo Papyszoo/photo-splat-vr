@@ -6,8 +6,16 @@ if(NOT SPLAT_HAVE_VULKAN)
     list(REMOVE_ITEM SPLAT_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gpu_probe_test.cpp")
 endif()
 
+# resolver_shim.cpp defines getaddrinfo()/freeaddrinfo() for this binary: the
+# title DEFINES the same two names in platform/ps5/net/resolve_glue.cpp (the
+# payload's libc exports them, so a definition in the title wins over the SDK
+# archive; stage T replaced the earlier --wrap), and the definition here binds
+# the references from the libsmb2/libnfs archives so the live SMB/NFS cases run
+# the title's numeric path and not the Mac's working resolver. See the file's
+# header.
 add_executable(splat_tests
     test_main.cpp
+    resolver_shim.cpp
     ${SPLAT_TEST_SOURCES}
 )
 

@@ -21,6 +21,17 @@ namespace {
 // plate, not the 3D scene behind the panel.
 constexpr uint8_t kBackdropSrgb[3] = {16, 18, 22};
 
+// The "no panel" quad: width and height 0, the same empty convention as
+// tv_panel_quad()'s no-viewport path and an unlatched PanelAnchor. A default
+// OverlayQuad is a 1 x 1 m quad at the world origin, so returning one would
+// make build_quads() draw a panel and a ray test hit one where there is none.
+splat::OverlayQuad empty_panel_quad() {
+    splat::OverlayQuad quad;
+    quad.width = 0.0f;
+    quad.height = 0.0f;
+    return quad;
+}
+
 // The Sense laser cursor: a 12 px white ring on the canvas, drawn after the
 // screens' draw() so no screen has to know about the pointer.
 constexpr int kCursorDiameter = 12;
@@ -128,7 +139,9 @@ bool UiHost::init(uint32_t width, uint32_t height,
 }
 
 void UiHost::set_visible(bool visible) {
-    if (visible && !visible_) panel_reset_ = true;
+    // The window opens where the user is looking: the next visible frame
+    // latches the anchor afresh, at whatever pose the head has then.
+    if (visible && !visible_) panel_anchor_ = splat::PanelAnchor{};
     visible_ = visible;
     if (!visible_) quads_.clear();
 }
@@ -169,7 +182,7 @@ void UiHost::build_quads(const splat::CameraPose& camera) {
 }
 
 splat::OverlayQuad UiHost::panel_quad(const splat::CameraPose& camera) {
-    if (!initialised_ || !visible_ || !backdrop_ready_) return splat::OverlayQuad{};
+    if (!initialised_ || !visible_ || !backdrop_ready_) return empty_panel_quad();
 
     splat::OverlayQuad panel;
     if (mode_ == Mode::Tv) {
@@ -177,24 +190,27 @@ splat::OverlayQuad UiHost::panel_quad(const splat::CameraPose& camera) {
             tv_camera(intrinsics_, renderer_.eye_width(), renderer_.eye_height(), camera),
             canvas_.width(), canvas_.height());
     } else {
-        if (panel_reset_ || !panel_follower_.initialised()) {
-            panel_follower_.reset(camera.yaw, camera.pitch);
-            panel_reset_ = false;
+        if (!panel_anchor_.latched()) {
+            panel_anchor_.latch(camera.position, camera.yaw, camera.pitch);
         }
-        panel = panel_follower_.quad(camera.position, camera.yaw, camera.pitch);
+        panel = panel_anchor_.quad();
     }
-    if (!(panel.width > 0.0f) || !(panel.height > 0.0f)) return splat::OverlayQuad{};
+    if (!(panel.width > 0.0f) || !(panel.height > 0.0f)) return empty_panel_quad();
     return panel;
 }
 
-void UiHost::update_panel(const splat::CameraPose& camera, double dt) {
+void UiHost::update_panel(const splat::CameraPose& camera) {
     if (mode_ != Mode::Vr || !visible_) return;
-    if (panel_reset_ || !panel_follower_.initialised()) {
-        panel_follower_.reset(camera.yaw, camera.pitch);
-        panel_reset_ = false;
-        return;
+    // Latch only when needed: a latched window is world-fixed and this call
+    // must never move it.
+    if (!panel_anchor_.latched()) {
+        panel_anchor_.latch(camera.position, camera.yaw, camera.pitch);
     }
-    panel_follower_.update(camera.yaw, camera.pitch, dt);
+}
+
+void UiHost::recenter_panel(const splat::CameraPose& camera) {
+    if (mode_ != Mode::Vr || !visible_) return;
+    panel_anchor_.recenter(camera.position, camera.yaw, camera.pitch);
 }
 
 void UiHost::restore_cursor() {

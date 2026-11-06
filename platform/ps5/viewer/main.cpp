@@ -79,15 +79,19 @@
 #include "common/progress.h"
 #include "gallery/gallery.h"
 #include "gallery/samples.h"
+#include "image/format.h"
 #include "jobs/image_io.h"
 #include "render/scene_playlist.h"
 #include "render/splat_renderer.h"
 #include "render/viewer_state.h"
 #include "render/vulkan_context.h"
 #include "scene/scene_folder.h"
+#include "scene/scene_view.h"
+#include "gallery/visibility.h"
 #include "ui/app.h"
 #include "ui/input_script.h"
 #include "ui/pad_bits.h"
+#include "vfs/io.h"
 
 // The W18 convert spike's second Vulkan user: ggml-vulkan's own device and the
 // conversion chain W4 linked into this title. platform/ps5/ggml is on the
@@ -307,13 +311,14 @@ struct SourceProbe {
 };
 
 bool probe_is_image(const char* name) {
-    const char* dot = std::strrchr(name, '.');
-    if (dot == nullptr) return false;
-    // The inbox pipeline takes jpg/jpeg/png (core/jobs/inbox_watcher.cpp:20-23,
-    // browse-ui.md section 1.5); .jxr stays listed because captures use it.
-    std::string ext;
-    for (const char* c = dot; *c != '\0'; ++c) ext.push_back(static_cast<char>(std::tolower(*c)));
-    return ext == ".jxr" || ext == ".png" || ext == ".jpg" || ext == ".jpeg";
+    // The one photo format list (core/image/format.h, which lowercases the
+    // extension itself); .jxr stays listed because HDR captures use it even
+    // though the decoder refuses it.
+    const splat::Path path(name);
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return extension == ".jxr" || splat::is_photo_file(path);
 }
 
 // Returns this level's opendir errno (0 = ok); depth_left is how many levels
@@ -1388,7 +1393,12 @@ int main(int, char**) {
             // that is on screen (a job ended behind the scene).
             if (ui_app != nullptr) ui_app->invalidate();
         },
-        [] { line("viewer: jobs: the queue is idle again"); }});
+        [] {
+            // The run's high-water RSS, for the console pass's per-format
+            // memory figures: the panel job path has no other memory line.
+            line("viewer: jobs: the queue is idle again (peak RSS %s)",
+                 splat::bench::human_bytes(splat::bench::peak_rss_bytes()).c_str());
+        }});
 
     // ---- the loop ---------------------------------------------------------
     // Seated at the capture point, swaying sideways inside 60 % of the comfort
@@ -1397,6 +1407,33 @@ int main(int, char**) {
     // frame stays comfortably visible while moving.
     splat::ViewerState state;
     state.set_comfort_radius(options.comfort_radius);
+    // The viewer has no scene rotation to change or save (DECISIONS.md, "Change
+    // 2026-11-05"). The TV path still applies an imported scene's own scale,
+    // which is the one view member that survives; a legacy "view"."rotation" is
+    // ignored here and dropped by the next save.
+    splat::SceneViewStore view_store{splat::Path(viewer::data_path("state"))};
+    // Called by every route that puts a scene on screen - the album player and
+    // the panel's OpenPath (a file on a network location, opened in place).
+    auto apply_stored_view = [&](const splat::Path& folder) {
+        const splat::Result<splat::SceneView> view = view_store.load(folder);
+        if (!view.ok()) {
+            line("viewer: tv view: %s; the scene opens at the session scale",
+                 view.message().c_str());
+        }
+        const splat::SceneView stored = view.value_or(splat::SceneView{});
+        if (splat::scene_view_has_scale(stored)) state.set_world_scale(stored.scale);
+        // The Scenes shelf refuses to turn the scene the viewer holds; the host
+        // is the only place that knows which folder that is.
+        if (ui_runtime != nullptr) {
+            ui_runtime->services.open_scene = folder;
+            // The runner checks the same rule from its own thread (a turn may
+            // have been queued before the scene was opened).
+            if (ui_runtime->services.jobs != nullptr) {
+                ui_runtime->services.jobs->set_open_scene(folder);
+            }
+        }
+        line("viewer: tv view %s scale %.3f", folder.filename().c_str(), state.world_scale());
+    };
     const float sway_amplitude = 0.6f * state.comfort_radius();
     const float ipd = 0.063f;
 
@@ -1429,6 +1466,24 @@ int main(int, char**) {
     std::unique_ptr<splat::ScenePlaylist> ui_playlist;
     std::unique_ptr<TvSwitchSlot> ui_slot;
     bool menu_quit = false;
+    // Stage H: the visible-folders policy, from the host's side. A scene the
+    // viewer holds that is no longer allowed is dropped here (the panel stays
+    // up, the picture does not), and every open path checks before loading.
+    auto scene_allowed = [&](const splat::Path& folder) {
+        return folder.empty() || splat::current_visibility()->allows_scene_folder(folder);
+    };
+    auto clear_hidden_scene = [&]() {
+        ui_slot.reset();
+        ui_playlist.reset();
+        renderer->clear_scene();
+        if (ui_app != nullptr) ui_app->set_scene_loaded(false);
+        if (ui_runtime != nullptr) {
+            ui_runtime->services.open_scene.clear();
+            if (ui_runtime->services.jobs != nullptr) {
+                ui_runtime->services.jobs->set_open_scene(splat::Path());
+            }
+        }
+    };
     // W18 spike state (main thread): the worker, its verdict and the shot and
     // clock bookkeeping. The worker's own state is the SpikePanel's atomics.
     std::thread spike_thread;
@@ -1477,6 +1532,9 @@ int main(int, char**) {
         // The scene is on screen now: render it with its own capture camera, not
         // the renderer's boot intrinsics (W18 9.2, the converted scene included).
         apply_scene_intrinsics(*renderer, probe.meta(), display.width(), display.height());
+        // The scene's own stored scale (the viewer has no rotation), before its
+        // first frame.
+        apply_stored_view(next->current().folder);
         const std::size_t position = next->index() + 1;
         const std::size_t count = next->size();
         const std::string name = next->current().folder.filename().string();
@@ -1714,17 +1772,85 @@ int main(int, char**) {
                         }
                         break;
                     }
-                    case splat::UiCommand::ResumeScene:
-                        // Circle at the panel's root: back to the scene that
-                        // is still loaded (the panel stays where it was).
+                    case splat::UiCommand::ResumeScene: {
+                        // Circle at the panel's root: back to the scene that is
+                        // still loaded (the panel stays where it was) - unless
+                        // the visible-folders policy hid it while the panel was
+                        // open.
+                        const splat::Path held = ui_runtime != nullptr
+                                                     ? ui_runtime->services.open_scene
+                                                     : splat::Path();
+                        if (!scene_allowed(held)) {
+                            clear_hidden_scene();
+                            line("viewer: hidden scene refused");
+                            ui_app->toast("That scene is no longer visible");
+                            break;
+                        }
                         ui_host->set_visible(false);
                         break;
+                    }
+                    case splat::UiCommand::HideScene: {
+                        // The owner ticked or unticked a folder, set a
+                        // passcode (an empty allow-list) or turned it off.
+                        const splat::Path held = ui_runtime != nullptr
+                                                     ? ui_runtime->services.open_scene
+                                                     : splat::Path();
+                        if (scene_allowed(held)) break;
+                        clear_hidden_scene();
+                        line("viewer: hidden scene closed");
+                        break;
+                    }
                     case splat::UiCommand::Quit:
                         // The one quit route a title has: the same LoadExec
                         // path as SECONDS and the quit file (below).
                         line("viewer: quit from the menu");
                         menu_quit = true;
                         break;
+                    case splat::UiCommand::OpenPath: {
+                        // A scene on a network location (L3): read it from
+                        // where it lies, through the VFS, as a one-entry
+                        // playlist. No copy into the local library.
+                        if (!splat::current_visibility()->allows_scene_path(command->path)) {
+                            // A stale file path from a screen that was listed
+                            // before the passcode was set: never open it.
+                            line("viewer: hidden scene refused");
+                            ui_app->toast("That scene is no longer visible");
+                            break;
+                        }
+                        if (ui_jobs != nullptr && !viewer::scene_loading_allowed(*ui_jobs)) {
+                            ui_app->toast("Converting... scene switch in a moment");
+                            break;
+                        }
+                        auto built = splat::ScenePlaylist::from_entries(
+                            {splat::PlaylistEntry{command->path.parent_path(), command->path}});
+                        if (!built.ok()) {
+                            ui_app->toast("No scene at " + command->path.string());
+                            break;
+                        }
+                        auto next = std::make_unique<splat::ScenePlaylist>(built.take());
+                        TvSwitchSlot probe(*renderer, *next);
+                        const viewer::SwitchReport report = viewer::switch_scene(probe, 0);
+                        if (!report.switched) {
+                            ui_app->toast("Cannot load " + command->path.string());
+                            line("viewer: FAIL open path %s", command->path.string().c_str());
+                            break;
+                        }
+                        apply_scene_intrinsics(*renderer, probe.meta(), display.width(),
+                                               display.height());
+                        // v0.2 RC: a network scene opened in place carries its
+                        // own stored view too, so an imported scene's scale
+                        // shows here without a copy (the viewer has no
+                        // rotation to restore).
+                        apply_stored_view(command->path.parent_path());
+                        ui_playlist = std::move(next);
+                        ui_slot = std::make_unique<TvSwitchSlot>(*renderer, *ui_playlist);
+                        ui_host->set_visible(false);
+                        ui_app->set_scene_loaded(true);
+                        line("viewer: tv scene %s (opened from %s)",
+                             command->path.parent_path().filename().string().c_str(),
+                             splat::vfs::location_id(command->path).c_str());
+                        break;
+                    }
                 }
             }
             if (menu_quit) break;

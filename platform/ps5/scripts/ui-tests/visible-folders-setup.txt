@@ -1,0 +1,154 @@
+# Stage H, part 1; stage U1 updated the scope.
+#
+# This script is driven by visible-folders-check.sh, which puts two converted
+# scenes on the console first (family-a/scene-a and family-b/scene-b) and reads
+# the klog afterwards. Nothing here is chosen by hand.
+#
+# What it proves: a scene is open when the passcode is set (the allow-list starts
+# empty), so the viewer closes it (viewer: hidden scene closed); ticking one album
+# publishes that album only. The photo picker stays open, with every source
+# (stage U1): the "photos-open" shot is the picker listing its sources, not an
+# empty one.
+#
+# Settings: the focus starts on Scale; the System rows are Models, Conversions,
+# Network locations, Visible folders, Quit, so Visible folders is nine Downs
+# (stage T added the Thumbnail size row in Display).
+# Home: the tiles are Unsorted first, then the folders by name (gallery.cpp's
+# list_albums_all), and the check installs family-a and family-b, so family-a is
+# tile 1 and one Right opens it. (The old one Down assumed four columns; with the
+# stage T tile sizes the columns differ per step, and Right is the same move at
+# every one.)
+# The Visible folders screen's only action without a passcode is "Set a
+# passcode": Cross, type 2468, OK, type 2468 again, OK.
+# The unlocked list starts with "Scene folders" (a heading), then Unsorted,
+# family-a, family-b, "Network", the scene locations, "Other" and "Other
+# scenes". One Down from Unsorted is family-a; no photo row exists any more.
+0.5   mark setup-start
+0.6   shot home
+1.4   press Right
+2.0   press Cross
+2.6   shot family-a
+3.4   press Cross
+4.0   shot scene-open
+4.8   press Options
+5.7   shot settings
+6.5   press Down
+6.9   press Down
+7.3   press Down
+7.7   press Down
+8.1   press Down
+8.5   press Down
+8.9   press Down
+9.3   press Down
+9.7   press Down
+10.1  press Cross
+10.7  shot visible-folders-intro
+11.1  press Cross
+11.7  shot keyboard-set
+12.5  press Right
+12.9  press Cross
+13.5  press Right
+13.9  press Right
+14.3  press Cross
+14.9  press Right
+15.3  press Right
+15.7  press Cross
+16.3  press Right
+16.7  press Right
+17.1  press Cross
+17.7  press Down
+18.1  press Down
+18.5  press Down
+18.9  press Down
+19.3  press Right
+19.7  press Right
+20.1  press Right
+20.5  press Right
+20.9  press Cross
+21.5  shot keyboard-repeat
+22.3  press Right
+22.7  press Cross
+23.3  press Right
+23.7  press Right
+24.1  press Cross
+24.7  press Right
+25.1  press Right
+25.5  press Cross
+26.1  press Right
+26.5  press Right
+26.9  press Cross
+27.5  press Down
+27.9  press Down
+28.3  press Down
+28.7  press Down
+29.1  press Right
+29.5  press Right
+29.9  press Right
+30.3  press Right
+30.7  press Cross
+31.3  shot visible-folders-list
+32.1  press Down
+32.5  press Cross
+33.1  shot family-a-ticked
+33.9  press Circle
+34.5  press Circle
+35.1  shot family-a-scenes
+35.9  press Circle
+36.5  shot home-one-album
+37.3  press Cross
+37.9  press Left
+38.3  press Cross
+38.9  shot photos-open
+39.7  press Circle
+40.3  press Circle
+40.9  press Options
+41.8  press Down
+42.2  press Down
+42.6  press Down
+43.0  press Down
+43.4  press Down
+43.8  press Down
+44.2  press Down
+44.6  press Cross
+45.0  shot queue-hidden
+45.8  press Circle
+46.2  press Down
+46.6  press Down
+47.0  press Down
+47.4  press Down
+47.8  press Down
+48.2  press Down
+48.6  press Down
+49.0  press Down
+49.4  press Down
+49.8  press Down
+50.2  press Down
+50.6  press Down
+51.0  press Down
+51.4  press Down
+51.8  press Down
+52.2  press Down
+52.6  press Down
+53.0  press Down
+53.4  press Down
+53.8  press Down
+54.2  press Down
+54.6  press Down
+55.0  press Down
+55.4  press Down
+55.8  press Down
+56.2  press Down
+56.6  press Down
+57.0  press Down
+57.4  press Down
+57.8  press Down
+58.2  press Down
+58.6  press Down
+59.0  press Down
+59.4  press Down
+59.8  press Down
+60.2  press Down
+60.6  press Down
+61.0  press Down
+61.4  press Down
+61.8  press Cross

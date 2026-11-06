@@ -59,6 +59,11 @@ TEST_CASE("ui_settings lists the rows in order") {
     CHECK(rows[splat::SettingsScreen::SystemHeader].header);
     CHECK(rows[splat::SettingsScreen::Models].label == "Models");
     CHECK(rows[splat::SettingsScreen::Conversions].label == "Conversions");
+    CHECK(rows[splat::SettingsScreen::Locations].label == "Network locations");
+    // Stage H: one row between Locations and Quit, "Off" without a passcode.
+    CHECK(splat::SettingsScreen::VisibleFolders == splat::SettingsScreen::Quit - 1);
+    CHECK(rows[splat::SettingsScreen::VisibleFolders].label == "Visible folders");
+    CHECK(rows[splat::SettingsScreen::VisibleFolders].right == "Off");
     CHECK(rows[splat::SettingsScreen::Quit].label == "Quit");
     CHECK(fixture.settings.title() == "Settings");
     // The first frame's focus is the first real row, not the heading.
@@ -119,9 +124,10 @@ TEST_CASE("ui_settings rows open their screens and quit") {
         commands.push_back(command);
     };
 
-    // From ScaleAround down to Models: the three comfort rows and the two
-    // display rows, with the headings skipped by ListView.
-    for (int i = 0; i < 5; ++i) fixture.settings.update(fixture.context, press(splat::Down));
+    // From ScaleAround down to Models: the three comfort rows and the three
+    // display rows (stage T added Thumbnail size), with the headings skipped by
+    // ListView.
+    for (int i = 0; i < 6; ++i) fixture.settings.update(fixture.context, press(splat::Down));
     CHECK(fixture.settings.list().focus() == splat::SettingsScreen::Models);
     fixture.settings.update(fixture.context, press(splat::Select));
     CHECK(fixture.stack.top_id() == splat::ScreenId::Models);
@@ -132,6 +138,12 @@ TEST_CASE("ui_settings rows open their screens and quit") {
     CHECK(fixture.stack.top_id() == splat::ScreenId::Queue);
     fixture.stack.pop();
 
+    // Network locations (L3) sits between Conversions and Visible folders;
+    // Quit is the row after that (stage H).
+    fixture.settings.update(fixture.context, press(splat::Down));
+    CHECK(fixture.settings.list().focus() == splat::SettingsScreen::Locations);
+    fixture.settings.update(fixture.context, press(splat::Down));
+    CHECK(fixture.settings.list().focus() == splat::SettingsScreen::VisibleFolders);
     fixture.settings.update(fixture.context, press(splat::Down));
     fixture.settings.update(fixture.context, press(splat::Select));
     REQUIRE(commands.size() == 1);
@@ -141,8 +153,8 @@ TEST_CASE("ui_settings rows open their screens and quit") {
 
 TEST_CASE("ui_settings cycles the comfort and display values") {
     Fixture fixture;
-    // Scale: Maquette (the default) -> Front -> Centre by Cross (or Right).
-    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Maquette");
+    // Scale: Capture (the default) -> Front -> Centre by Cross (or Right).
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Capture");
     fixture.settings.update(fixture.context, press(splat::Select));
     CHECK(fixture.settings.values().scale_around == 0);
     CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Front");
@@ -151,7 +163,25 @@ TEST_CASE("ui_settings cycles the comfort and display values") {
     CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Centre");
     fixture.settings.update(fixture.context, press(splat::Select));
     CHECK(fixture.settings.values().scale_around == 2);
-    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Maquette");
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Capture");
+
+    // Left walks the same ring backwards: Capture -> Centre -> Front -> Capture,
+    // and Right goes forward again.
+    CHECK(fixture.settings.list().focus() == splat::SettingsScreen::ScaleAround);
+    fixture.settings.update(fixture.context, press(splat::Left));
+    CHECK(fixture.settings.values().scale_around == 1);
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Centre");
+    fixture.settings.update(fixture.context, press(splat::Left));
+    CHECK(fixture.settings.values().scale_around == 0);
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Front");
+    fixture.settings.update(fixture.context, press(splat::Left));
+    CHECK(fixture.settings.values().scale_around == 2);
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Capture");
+    fixture.settings.update(fixture.context, press(splat::Right));
+    CHECK(fixture.settings.values().scale_around == 0);
+    CHECK(fixture.settings.list().rows()[splat::SettingsScreen::ScaleAround].right == "Front");
+    fixture.settings.update(fixture.context, press(splat::Left));
+    CHECK(fixture.settings.values().scale_around == 2);
 
     // Move speed: 2.5 -> 4.0 m/s with Right, and back with Left.
     fixture.settings.update(fixture.context, press(splat::Down));

@@ -26,7 +26,8 @@
 # --env-extra KEY=VALUE adds one line to the generated viewer.env, for a run
 # that selects its own mode keys instead of a script (W18's CONVERT_SPIKE).
 # --end-regex RE is the log line that counts as the run's own end; the default
-# is W8's `viewer: script done`. --pass-regex RE is the line that counts as
+# is `viewer: (script done|PASS, exit 0)` (W17: a Quit row ends the title through
+# LoadExec, so it never prints "script done"). --pass-regex RE is the line that counts as
 # PASS (default: --end-regex), so a run that ends on its own verdict
 # (W18: `viewer: PASS, exit 0`) passes on that exact line only. A log with any
 # `viewer: FAIL` line is a failure whatever those two match.
@@ -57,7 +58,10 @@ dry=0
 seconds=""
 script=""
 extras=()
-end_regex='viewer: script done'
+# W17: a script that quits from Settings > Quit ends on "viewer: PASS, exit 0"
+# and never reaches "viewer: script done" (that path leaves through LoadExec), so
+# the default accepts either end line instead of reporting a good run as failed.
+end_regex='viewer: (script done|PASS, exit 0)'
 pass_regex=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -214,6 +218,13 @@ remote_pngs() {  # remote_pngs DIR -> names, one per line, empty when absent
     ps5_ftp_files "$1" "$dry" | awk -F'\t' '$1 ~ /\.png$/ { print $1 }'
 }
 
+# name<TAB>size for every PNG in DIR: the before/after diff below is what keeps
+# a run's folder to its own shots (W17 / Runs-W17: /data/.../shots is never
+# cleaned, so every run used to pull every earlier run's PNGs too).
+remote_png_sizes() {
+    ps5_ftp_files "$1" "$dry" | awk -F'\t' '$1 ~ /\.png$/ { print $1 "\t" $2 }'
+}
+
 install_if_needed() {  # install_if_needed [NOTE]
     if [ "$dry" = 1 ]; then
         if [ -d "$package" ] && [ -f "$package/eboot.bin" ]; then
@@ -318,8 +329,40 @@ fi
 ensure_remote_dir "$remote_bench"
 note "writing $remote_env (MODE=tv UI=1 SCRIPT=$remote_script SECONDS=$run_seconds${extras[0]:+ +env-extra})"
 "$title_sh" put "$viewer_env" "$remote_env" || die "writing viewer.env failed" 4
+
+# From here on the console's viewer.env is ours, so every exit path puts the
+# saved copy back - including a killed run held past its window and an error
+# after this line. The console pass's last run was cut off and left the dev
+# title booting into a scripted TV run (MODE=tv UI=1); a normal exit restores it
+# below and marks that done, so the trap only fires on the other paths.
+#
+# This handler also removes $tmp_dir. bash keeps one EXIT trap, so replacing the
+# early `rm -rf "$tmp_dir"` trap (installed beside mktemp) with this one used to
+# leak a ps5splat-uitest.XXXXXX folder - the saved viewer.env and shots.before -
+# on every run.
+viewer_restore_done=0
+restore_viewer_env_on_exit() {
+    local rc=$?
+    if [ "$viewer_restore_done" != 1 ] && [ "$viewer_present_before" = 1 ]; then
+        note "exit $rc before the normal restore: putting the saved viewer.env back"
+        "$title_sh" put "$viewer_before" "$remote_env" >/dev/null 2>&1 || true
+        if ps5_ftp_get_text "$remote_env" "$tmp_dir/viewer.env.exit" 0 2>/dev/null &&
+            [ "$(ps5_sha256 "$tmp_dir/viewer.env.exit")" = "$viewer_sha_before" ]; then
+            note "viewer.env restored on exit (sha256 $viewer_sha_before)"
+        else
+            note "viewer.env NOT restored on exit: the console still runs the test selector"
+        fi
+    fi
+    rm -rf "$tmp_dir"
+}
+trap restore_viewer_env_on_exit EXIT
 note "uploading $script -> $remote_script"
 "$title_sh" put "$script" "$remote_script" || die "uploading the script failed" 4
+
+# The PNGs already on the console, so this run pulls only the shots it wrote
+# (same name and size means an earlier run's file).
+shots_before="$tmp_dir/shots.before"
+remote_png_sizes "$remote_shots" >"$shots_before" 2>/dev/null || : >"$shots_before"
 
 # ---- 4/5. install, launch and wait ------------------------------------------
 install_if_needed || die "the viewer is not installed" 4
@@ -351,19 +394,26 @@ if [ "$viewer_present_before" = 1 ]; then
         ps5_ftp_get_text "$remote_env" "$viewer_after" "$dry" &&
             [ "$(ps5_sha256 "$viewer_after")" = "$viewer_sha_before" ] ||
             die "viewer.env still differs from the saved copy after the restore" 6
+        viewer_restore_done=1
         note "viewer.env restored (sha256 $viewer_sha_before)"
     fi
+    viewer_restore_done=1
 elif [ -n "$viewer_sha_after" ]; then
     note "warning: viewer.env did not exist before this run and exists now; no copy to restore"
 fi
 
 # ---- 7. the shots (read-only) -----------------------------------------------
 pulled=0
-while IFS= read -r name; do
+skipped_foreign=0
+while IFS=$'\t' read -r name size; do
     [ -n "$name" ] || continue
     case "$name" in
         */*) note "skipping $name (not a file name)"; continue ;;
     esac
+    if grep -Fxq "$name\t$size" "$shots_before" 2>/dev/null; then
+        skipped_foreign=$((skipped_foreign + 1))
+        continue
+    fi
     if fetch_binary "$remote_shots/$name" "$out_dir/$name"; then
         note "pulled $out_dir/$name ($(wc -c <"$out_dir/$name" | tr -d ' ') bytes)"
         printf '%s\n' "$out_dir/$name"
@@ -372,8 +422,11 @@ while IFS= read -r name; do
         note "could not pull $remote_shots/$name"
     fi
 done <<EOF
-$(remote_pngs "$remote_shots")
+$(remote_png_sizes "$remote_shots")
 EOF
+if [ "$skipped_foreign" -gt 0 ]; then
+    note "skipped $skipped_foreign shot(s) that were already there before this run"
+fi
 if [ "$pulled" -eq 0 ]; then
     note "no PNG was pulled from $remote_shots"
 fi

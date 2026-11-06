@@ -4,15 +4,21 @@
 #include <cstddef>
 
 // font8x8_basic.h is the verbatim upstream public-domain header (C). Its
-// 0xFF glyph bytes narrow to char, which clang rejects in C++11 mode; the
-// bytes are read back as unsigned char below, so the values are preserved.
+// 0xFF glyph bytes narrow to char, which clang rejects in C++11 mode and GCC
+// rejects under -Wnarrowing (an error for braced initialisation); the bytes
+// are read back as unsigned char below, so the values are preserved.
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc++11-narrowing"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnarrowing"
 #endif
 #include "font8x8/font8x8_basic.h"
 #if defined(__clang__)
 #pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 namespace splat {

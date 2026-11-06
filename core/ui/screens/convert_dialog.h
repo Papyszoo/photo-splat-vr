@@ -36,24 +36,44 @@ public:
     // For the tests and the preview.
     const ListView& list() const { return list_; }
     const std::vector<Path>& photos() const { return photos_; }
+    // The same photos with their quarter turns, which is what the job service
+    // is given.
+    const std::vector<PhotoPick>& picks() const { return picks_; }
     // The folder the jobs go to ("" = the loose-scene album).
     const std::string& album() const { return album_; }
     // The Ready models in list order; empty when none is ready.
     const std::vector<ModelView>& models() const { return ready_; }
     // The model the focused row would queue with ("" when none is ready).
     std::string model_id() const;
-    // "Conversion is not available on this build" without a job service.
+    // "Conversion is not available on this build" without a job service, or
+    // "That folder is not visible" when the visible-folders policy hides the
+    // album, the destination or one of the picks (stage H).
     std::string message() const;
+    // Re-read each frame: a passcode may be set while this dialog is open.
+    bool blocked() const { return blocked_; }
+    // The destination line the left column draws; empty while blocked, so a
+    // hidden album's name is never drawn.
+    std::string folder_line() const;
+    // False while blocked: the first pick's thumbnail is not held (a hidden
+    // photo must not stay on screen through a dialog left open).
+    bool preview_ready() const { return !preview_.empty(); }
 
 private:
     Rect list_area(const Rect& content) const;
     void refresh_rows(UiContext& ctx);
     void start(UiContext& ctx);
+    // Re-evaluates the policy for this dialog's album, destination and picks.
+    void refresh_blocked();
 
     std::vector<Path> photos_;
+    std::vector<PhotoPick> picks_;
     std::string album_;
+    // Set when the folder is on a network location (ScreenArgs::b): the runner
+    // builds the scene locally and uploads it to this root.
+    Path output_root_;
     std::vector<ModelView> ready_;
     bool jobs_available_ = false;
+    bool blocked_ = false;
     ListView list_;
     ThumbCache thumbs_{4, 4};
     UiImage preview_;

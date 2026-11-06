@@ -307,6 +307,8 @@ void project_point(const splat::FrameView& view, const splat::HeadsetProjection&
         right[i] = cr * s0[i] + sr * d0[i];
         down[i] = cr * d0[i] - sr * s0[i];
     }
+    // The scene transform first (Track R): display = scale * R * p, the same
+    // order the shader applies, then the camera.
     const double q[3] = {world[0] - view.midpoint.position[0],
                          world[1] - view.midpoint.position[1],
                          world[2] - view.midpoint.position[2]};
@@ -322,6 +324,17 @@ void project_point(const splat::FrameView& view, const splat::HeadsetProjection&
     const double cx = projection.intrinsics.cx + projection.eye_shift[eye == 0 ? 0 : 1];
     px = cx + projection.intrinsics.fx * x / z;
     py = projection.intrinsics.cy + projection.intrinsics.fy * y / z;
+}
+
+// Where the renderer draws a scene point: display = scale * p, then the camera
+// projection above.
+void project_scene_point(const splat::FrameView& view,
+                         const splat::HeadsetProjection& projection, int eye,
+                         const float scene_point[3], double& px, double& py) {
+    const float display[3] = {static_cast<float>(scene_point[0] * view.scene_scale),
+                              static_cast<float>(scene_point[1] * view.scene_scale),
+                              static_cast<float>(scene_point[2] * view.scene_scale)};
+    project_point(view, projection, eye, display, px, py);
 }
 
 // Intensity-weighted centroid of the content in an image (backdrop excluded):
@@ -1269,32 +1282,37 @@ TEST_CASE("the sticks walk, rise and turn the viewer") {
     // y is -0.2), and a point straight ahead moves down in the picture.
     double before_x = 0.0, before_y = 0.0, after_x = 0.0, after_y = 0.0;
     const float point[3] = {0.0f, 0.0f, 3.0f};
-    project_point(walking.frame(), projection, 0, point, before_x, before_y);
+    project_scene_point(walking.frame(), projection, 0, point, before_x, before_y);
     walking.move_viewer(0.0f, 0.0f, 0.2f);
     CHECK(walking.frame().midpoint.position[1] == doctest::Approx(-0.2f).epsilon(1e-5));
-    project_point(walking.frame(), projection, 0, point, after_x, after_y);
+    project_scene_point(walking.frame(), projection, 0, point, after_x, after_y);
     MESSAGE("rise 0.2 m: a point ahead moves from y " << before_y << " to " << after_y);
     CHECK(after_y > before_y + 5.0);
 
-    // Right stick right: the viewer turns to their right. The renderer's camera
-    // yaw rises (view_yaw = scene yaw - turn), the content moves left, and the
-    // CSV's turn_deg records the scene's own turn, the opposite sign.
+    // Right stick right: the viewer turns to their right. The scene's
+    // accumulated turn is subtracted from the head's yaw (view_yaw), so the
+    // camera yaws +10 deg, the content moves left, and `turn_deg` records the
+    // -10 deg scene turn. There is no scene rotation other than this yaw.
     splat::HmdView turning;
     turning.set_comfort_radius(2.0f);
     REQUIRE(turning.place(head_with_eyes(make_head_pose(0.0f, 0.0f, 0.0f, 0.0f, 0.0f), 0.063f)));
-    project_point(turning.frame(), projection, 0, point, before_x, before_y);
+    project_scene_point(turning.frame(), projection, 0, point, before_x, before_y);
     turning.turn_viewer(10.0 * deg);
-    project_point(turning.frame(), projection, 0, point, after_x, after_y);
+    project_scene_point(turning.frame(), projection, 0, point, after_x, after_y);
     MESSAGE("turn right 10 deg: content x " << before_x << " -> " << after_x);
     CHECK(after_x < before_x - 5.0);
     CHECK(turning.frame().midpoint.yaw == doctest::Approx(10.0 * deg).epsilon(1e-5));
     CHECK(turning.view_yaw() == doctest::Approx(10.0 * deg).epsilon(1e-5));
     CHECK(turning.scene_turn() == doctest::Approx(-10.0 * deg).epsilon(1e-5));
     CHECK(turning.scene_yaw() == doctest::Approx(0.0).epsilon(1e-5));
+    // The rotation about the eye keeps the camera where it was: turning the
+    // scene must not move the viewer.
+    CHECK(turning.frame().midpoint.position[0] == doctest::Approx(0.0f).epsilon(1e-5));
+    CHECK(turning.frame().midpoint.position[1] == doctest::Approx(0.0f).epsilon(1e-5));
+    CHECK(turning.frame().midpoint.position[2] == doctest::Approx(0.0f).epsilon(1e-5));
 
-    // With the head yawed 30 degrees and the viewer turned 10 right, the logged
-    // yaw is 40 degrees (scene yaw 30 minus the -10 turn) and turn_deg is -10:
-    // the columns still describe the renderer's camera and the turn.
+    // With the head yawed 30 degrees and the scene turned 10 right, the camera
+    // yaw is the head's 30 minus the scene's -10, i.e. 40, and turn_deg is -10.
     REQUIRE(turning.update(head_with_eyes(
         make_head_pose(0.0f, 0.0f, 0.0f, 30.0 * deg, 0.0), 0.063f)));
     CHECK(turning.scene_yaw() == doctest::Approx(30.0 * deg).epsilon(1e-5));

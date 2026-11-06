@@ -80,20 +80,28 @@ Result<ConvertOutcome> ConvertSession::run(const Path& photo, const Path& out_sc
 
     const Clock::time_point started = Clock::now();
 
-    const Result<std::vector<uint8_t>> read = splat::read_file_bytes(photo);
+    const Result<std::vector<uint8_t>> read =
+        splat::read_file_bytes(photo, splat::image::DecodeOptions{}.max_bytes);
     if (!read.ok()) {
         return Result<ConvertOutcome>::failure("cannot read the photo: " + read.message());
     }
     const std::vector<uint8_t>& file_bytes = read.value();
 
-    Result<Image> decoded = splat::decode_image(file_bytes.data(), file_bytes.size());
+    splat::image::DecodeOptions decode_options;
+    decode_options.hint = splat::image_format_from_extension(photo);
+    splat::image::DecodeInfo decode_info;
+    Result<Image> decoded = splat::image::decode_photo(file_bytes.data(), file_bytes.size(),
+                                                       decode_options, &decode_info);
     if (!decoded.ok()) {
         return Result<ConvertOutcome>::failure("cannot decode the photo: " + decoded.message());
     }
     Image image = decoded.take();
     const int width = image.width;
     const int height = image.height;
-    const bool source_is_jpeg = splat::looks_like_jpeg(file_bytes.data(), file_bytes.size());
+    // Verbatim only when the pixels are the file's own: an EXIF-oriented JPEG
+    // would otherwise leave a sideways original.jpg beside an upright scene.
+    const bool source_is_jpeg = splat::looks_like_jpeg(file_bytes.data(), file_bytes.size()) &&
+                                decode_info.exif_orientation == 1;
 
     const Result<float> focal =
         splat::focal_px_from_photo(file_bytes.data(), file_bytes.size(), width, height);

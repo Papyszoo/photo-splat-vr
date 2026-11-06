@@ -5,29 +5,130 @@
 #include <algorithm>
 #include <utility>
 
+#include "gallery/visibility.h"
+#include "ui/job_service.h"
+
 namespace splat {
 
-Status FakeJobService::enqueue(const std::vector<Path>& photos, const std::string& backend,
-                               const std::string& album) {
+Status FakeJobService::enqueue(const std::vector<PhotoPick>& photos, const std::string& backend,
+                               const std::string& album, const Path& output_root) {
     if (photos.empty()) return Status::error("no photos to convert");
-    for (const Path& photo : photos) {
+    last_enqueue_ = photos;
+    last_output_root_ = output_root;
+    for (const PhotoPick& photo : photos) {
         JobView job;
         job.id = "fake-job-" + std::to_string(next_id_++);
-        job.name = photo.filename().string();
-        job.photo = photo;
-        if (job.name.empty()) job.name = photo.string();
+        job.name = photo.path.filename().string();
+        job.photo = photo.path;
+        if (job.name.empty()) job.name = photo.path.string();
         job.backend = backend;
         job.album = album;
+        job.kind = "convert";
         job.state = "queued";
         job.stage = "queued";
+        job.source_folder = photo.source_folder;
+        job.output_root = output_root;
         jobs_.push_back(std::move(job));
     }
     start_next();
     return Status::success();
 }
 
-void FakeJobService::start_next() {
-    if (busy()) return;
+Status FakeJobService::enqueue_import(const std::vector<Path>& splats, const std::string& album,
+                                     std::size_t* queued, const Path& output_root,
+                                     const std::string& source_folder) {
+    if (splats.empty()) return Status::error("no splat files to import");
+    last_import_ = splats;
+    last_import_album_ = album;
+    last_import_source_ = source_folder;
+    last_output_root_ = output_root;
+    std::size_t added = 0;
+    for (const Path& splat : splats) {
+        // The real service skips a file that is already queued or running; the
+        // fake does the same so a picker test can check the toast's count.
+        const bool duplicate =
+            std::any_of(jobs_.begin(), jobs_.end(), [&splat](const JobView& job) {
+                return job.photo.lexically_normal() == splat.lexically_normal() &&
+                       (job.state == "queued" || job.state == "running");
+            });
+        if (duplicate) continue;
+        JobView job;
+        job.id = "fake-job-" + std::to_string(next_id_++);
+        job.name = splat.filename().string();
+        job.photo = splat;
+        if (job.name.empty()) job.name = splat.string();
+        job.backend = "import";
+        job.album = album;
+        job.kind = "import";
+        job.state = "queued";
+        job.stage = "queued";
+        job.source_folder = source_folder;
+        job.output_root = output_root;
+        jobs_.push_back(std::move(job));
+        ++added;
+    }
+    if (queued != nullptr) *queued = added;
+    start_next();
+    return added == 0 ? Status::error("already queued") : Status::success();
+}
+
+Status FakeJobService::enqueue_rotate(const Path& scene_folder, int quarters,
+                                      const std::string& album) {
+    if (scene_folder.empty()) return Status::error("no scene folder to rotate");
+    last_rotate_scene_ = scene_folder;
+    last_rotate_quarters_ = ((quarters % 4) + 4) % 4;
+    last_rotate_album_ = album;
+    const bool duplicate =
+        std::any_of(jobs_.begin(), jobs_.end(), [&scene_folder](const JobView& job) {
+            return job.kind == "rotate" &&
+                   job.photo.lexically_normal() == scene_folder.lexically_normal() &&
+                   (job.state == "queued" || job.state == "running");
+        });
+    if (duplicate) return Status::error("the scene is already being rotated");
+    JobView job;
+    job.id = "fake-job-" + std::to_string(next_id_++);
+    job.name = scene_folder.filename().string();
+    job.photo = scene_folder;
+    if (job.name.empty()) job.name = scene_folder.string();
+    job.backend = "rotate";
+    job.album = album;
+    job.kind = "rotate";
+    job.state = "queued";
+    job.stage = "queued";
+    jobs_.push_back(std::move(job));
+    start_next();
+    return Status::success();
+}
+
+std::vector<JobView> FakeJobService::snapshot() const {
+    // The same rule the real JobService applies (job_visible): the fake must not
+    // leak what the console would hide.
+    if (!current_visibility()->enabled) return jobs_;
+    std::vector<JobView> visible;
+    visible.reserve(jobs_.size());
+    for (const JobView& job : jobs_) {
+        if (job_visible(job)) visible.push_back(job);
+    }
+    return visible;
+}
+
+void FakeJobService::inject_job(JobView job) {
+    if (job.id.empty()) job.id = "fake-job-" + std::to_string(next_id_++);
+    jobs_.push_back(std::move(job));
+}
+
+void FakeJobService::set_job_state(const std::string& id, const std::string& state,
+                                   std::string message) {
+    for (JobView& job : jobs_) {
+        if (job.id != id) continue;
+        job.state = state;
+        job.stage = state;
+        job.message = std::move(message);
+        return;
+    }
+}
+
+void FakeJobService::start_next() {    if (busy()) return;
     for (JobView& job : jobs_) {
         if (job.state == "queued") {
             job.state = "running";
@@ -223,5 +324,92 @@ Status FakeCaptureService::copy_to_inbox(const std::vector<Path>& paths) {
     state_ = "copied " + std::to_string(copied);
     return Status::success();
 }
+
+namespace {
+
+splat::LocationView make_row(const std::string& id, const std::string& host,
+                             const std::string& share, const std::string& path,
+                             const std::string& state, bool photo_source) {
+    splat::LocationView view;
+    view.id = id;
+    view.name = host + "/" + share;
+    view.protocol = "smb";
+    view.host = host;
+    view.share = share;
+    view.path = path;
+    view.state = state;
+    view.photo_source = photo_source;
+    view.splat_library = true;
+    return view;
+}
+
+}  // namespace
+
+FakeLocationService::FakeLocationService() {
+    locations_.push_back(make_row("smb0", "nas.local", "Photos", "scenes", "ready", true));
+    locations_.push_back(make_row("smb1", "192.168.1.20", "Scenes", "",
+                                  "offline: connect timed out", false));
+    next_id_ = 2;
+}
+
+std::string FakeLocationService::status(const std::string& id) const {
+    for (const LocationView& location : locations_) {
+        if (location.id == id) return location.state;
+    }
+    return "";
+}
+
+LocationView* FakeLocationService::find(const std::string& id) {
+    for (LocationView& location : locations_) {
+        if (location.id == id) return &location;
+    }
+    return nullptr;
+}
+
+Status FakeLocationService::add(const LocationView& location, std::string* id) {
+    if (location.host.empty() || location.share.empty()) {
+        return Status::error("a location needs a host and a share");
+    }
+    LocationView stored = location;
+    stored.id = "smb" + std::to_string(next_id_++);
+    stored.state = "mounting";
+    locations_.push_back(stored);
+    if (id != nullptr) *id = stored.id;
+    return Status::success();
+}
+
+Status FakeLocationService::update(const LocationView& location) {
+    LocationView* existing = find(location.id);
+    if (existing == nullptr) return Status::error("no such location: " + location.id);
+    const std::string state = existing->state;
+    *existing = location;
+    existing->state = state;
+    return Status::success();
+}
+
+Status FakeLocationService::remove(const std::string& id) {
+    for (auto it = locations_.begin(); it != locations_.end(); ++it) {
+        if (it->id != id) continue;
+        locations_.erase(it);
+        return Status::success();
+    }
+    return Status::error("no such location: " + id);
+}
+
+Status FakeLocationService::mount(const std::string& id) {
+    LocationView* location = find(id);
+    if (location == nullptr) return Status::error("no such location: " + id);
+    mounted_.push_back(id);
+    // The fake's one failure mode: a host that cannot be reached, reported the
+    // way the SMB adapter words it.
+    location->state = location->host == "unreachable" ? "offline: connect timed out" : "ready";
+    return Status::success();
+}
+
+void FakeLocationService::unmount(const std::string& id) {
+    mounted_.erase(std::remove(mounted_.begin(), mounted_.end(), id), mounted_.end());
+}
+
+void FakeLocationService::tick(double /*dt*/) { ++tick_count_; }
 
 }  // namespace splat

@@ -11,13 +11,24 @@
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <chrono>
+#include <cmath>
+#include <thread>
+
+#include <nlohmann/json.hpp>
+
+#include "common/image.h"
 #include "common/path.h"
+#include "jobs/image_io.h"
 #include "scene/scene_folder.h"
+#include "scene/scene_view.h"
 #include "test_util.h"
 #include "ui/fakes.h"
 #include "ui/screens/placeholder.h"
@@ -28,12 +39,47 @@ using splat::Path;
 
 namespace {
 
+std::string read_text(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+void write_text(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+
+// A real JPEG thumbnail of one colour, so a test can tell the old image from
+// the new one after a turn rewrote the file on disk.
+void write_solid_thumb(const Path& folder, uint8_t r, uint8_t g, uint8_t b) {
+    splat::Image image;
+    image.resize(16, 16);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            uint8_t* pixel = image.pixel(x, y);
+            pixel[0] = r;
+            pixel[1] = g;
+            pixel[2] = b;
+        }
+    }
+    const auto encoded = splat::encode_jpeg(image, 95);
+    REQUIRE_MESSAGE(encoded.ok(), encoded.message());
+    std::ofstream out(splat::scene_files(folder).thumbnail, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(encoded.value().data()),
+              static_cast<std::streamsize>(encoded.value().size()));
+    REQUIRE(static_cast<bool>(out));
+}
+
 void write_scene(const Path& folder, const char* backend, size_t splats, double seconds,
-                 bool thumb) {
+                 bool thumb, bool imported = false) {
     std::filesystem::create_directories(folder);
     splat::SceneMeta meta;
     meta.backend = backend;
     meta.seconds_taken = seconds;
+    if (imported) {
+        meta.origin_format = "splat";
+        meta.origin_count = static_cast<uint32_t>(splats);
+    }
     const splat::SplatScene scene = splat_test::make_test_scene(splats);
     const std::vector<uint8_t> jpeg{0xFF, 0xD8, 0xFF, 0xD9};
     const splat::Status status = splat::write_scene_folder(folder, scene, meta, jpeg, jpeg);
@@ -65,6 +111,7 @@ struct Fixture {
     splat_test::TempDir temp{"ui-scenes"};
     Path root = temp.path() / "scenes";
     splat::UiServices services;
+    splat::FakeJobService jobs;
     splat::UiTheme theme = splat::default_theme();
     splat::ScreenRegistry registry;
     splat::ScreenStack stack{registry};
@@ -78,6 +125,7 @@ struct Fixture {
     Fixture() {
         std::filesystem::create_directories(root);
         services.paths.scenes = root;
+        services.jobs = &jobs;
         context.content = splat::Rect{16, 78, 1248, 586};
         context.command_sink = [this](splat::UiCommand command) {
             commands.push_back(std::move(command));
@@ -148,17 +196,25 @@ TEST_CASE("ui_scenes lists an album in folder order with model, splats and secon
     CHECK(cells[2].sublabel == "DA2-Small");
     CHECK(cells[3].sublabel == "SHARP");
     CHECK(fixture.scenes->grid().sublabel_focus_only);
-    // A long name of the focused scene gets three lines in a fixed label area.
-    CHECK(fixture.scenes->grid().caption_lines == 3);
+    // A long name gets two lines in a fixed label area (one label rule: the
+    // same number of lines focused or not).
+    CHECK(fixture.scenes->grid().caption_lines == splat::kThumbnailCaptionLines);
+    CHECK(fixture.scenes->grid().caption_lines == 2);
 
     const std::vector<splat::Hint> hints = fixture.scenes->hints();
-    REQUIRE(hints.size() == 3);
+    // A scene entry turns with the same two keys as a photo entry (L3/R3); the
+    // row keeps View, More and Back around them.
+    REQUIRE(hints.size() == 5);
     CHECK(hints[0].button == "Cross");
     CHECK(hints[0].label == "View");
     CHECK(hints[1].button == "Triangle");
     CHECK(hints[1].label == "More");
-    CHECK(hints[2].button == "Circle");
-    CHECK(hints[2].label == "Back");
+    CHECK(hints[2].button == "L3");
+    CHECK(hints[2].label == "Rotate left");
+    CHECK(hints[3].button == "R3");
+    CHECK(hints[3].label == "Rotate right");
+    CHECK(hints[4].button == "Circle");
+    CHECK(hints[4].label == "Back");
 }
 
 TEST_CASE("ui_scenes titles the loose scene album Unsorted") {
@@ -275,6 +331,187 @@ TEST_CASE("ui_scenes renames and deletes a scene from its menu") {
     CHECK(fixture.scenes->names()[0] == "s2");
     REQUIRE_FALSE(toasts.empty());
     CHECK(toasts.back() == "Deleted s1");
+}
+
+// An imported splat has no conversion step, so it keeps the saved rotation
+// (DECISIONS.md): Square turns it a quarter, writes the scene's own meta.json
+// and toasts the angle it landed on, so the VR viewer and the next TV run show
+// the scene turned. Pressing it again cycles, and nothing else on the row
+// (view, menu) fires.
+TEST_CASE("ui_scenes offers the same L3/R3 turn on a converted and an imported scene") {
+    // The turn is a file action for every entry, not an imported-scene feature
+    // (DECISIONS.md, "Change 2026-11-05"): the same two keys and the same hint
+    // on both, and Square is no longer an action on a scene row.
+    Fixture fixture;
+    write_scene(fixture.root / "trip" / "a-import", "import", 4, 1.0, true, true);
+    write_scene(fixture.root / "trip" / "b-converted", "sharp", 4, 1.0, true);
+    fixture.enter("trip");
+
+    const std::vector<splat::Hint> imported = fixture.scenes->hints();
+    bool left = false;
+    bool right = false;
+    for (const splat::Hint& hint : imported) {
+        if (hint.button == "L3" && hint.label == "Rotate left") left = true;
+        if (hint.button == "R3" && hint.label == "Rotate right") right = true;
+        CHECK(hint.button != "Square");
+    }
+    CHECK(left);
+    CHECK(right);
+
+    fixture.stack.update(fixture.context, press(splat::Right));
+    CHECK(fixture.scenes->names()[static_cast<std::size_t>(fixture.scenes->focused_scene())] ==
+          "b-converted");
+    const std::vector<splat::Hint> converted = fixture.scenes->hints();
+    left = right = false;
+    for (const splat::Hint& hint : converted) {
+        if (hint.button == "L3" && hint.label == "Rotate left") left = true;
+        if (hint.button == "R3" && hint.label == "Rotate right") right = true;
+    }
+    CHECK(left);
+    CHECK(right);
+}
+
+TEST_CASE("ui_scenes queues a left or right scene turn as a background job") {
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    const Path folder = fixture.root / "trip" / "s1";
+    write_scene(folder, "sharp", 4, 1.0, true);
+    fixture.enter("trip");
+
+    // L3 is a quarter turn left: three clockwise quarters, the queue's signed
+    // range (job_queue.h normalises to 0..3).
+    fixture.stack.update(fixture.context, press(splat::RotateLeft));
+    CHECK(fixture.jobs.last_rotate_quarters() == 3);
+    CHECK(fixture.jobs.last_rotate_scene() == folder);
+    REQUIRE_FALSE(toasts.empty());
+    CHECK(toasts.back().rfind("Rotating s1", 0) == 0);
+    // The tile says the entry is being written, and the top bar is not told
+    // this is a conversion.
+    const splat::GridView& grid = fixture.scenes->grid();
+    REQUIRE(grid.cells().size() >= 2);
+    CHECK(grid.cells()[1].badge == "Rotating");
+
+    // R3 is the other direction; the queue refuses a second turn of the same
+    // scene while the first is active, so let it finish first.
+    fixture.jobs.tick(splat::FakeJobService::kSecondsPerJob + 0.1);
+    fixture.stack.update(fixture.context, press(0));
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    CHECK(fixture.jobs.last_rotate_quarters() == 1);
+}
+
+TEST_CASE("ui_scenes refuses a turn while the scene is open or already being turned") {
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    const Path folder = fixture.root / "trip" / "s1";
+    write_scene(folder, "sharp", 4, 1.0, true);
+    fixture.enter("trip");
+
+    // Open in the viewer: the renderer holds the version it read, so a rewrite
+    // under it would leave the picture and the file disagreeing.
+    fixture.services.open_scene = folder;
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    REQUIRE_FALSE(toasts.empty());
+    CHECK(toasts.back() == "Close the scene before rotating it");
+    CHECK(fixture.jobs.last_rotate_scene().empty());
+
+    // Busy: the same scene already has a turn queued or running.
+    fixture.services.open_scene.clear();
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    REQUIRE(fixture.jobs.last_rotate_scene() == folder);
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    REQUIRE_FALSE(toasts.empty());
+    CHECK(toasts.back() == "This scene is already being rotated");
+}
+
+TEST_CASE("ui_scenes reports a finished turn and drops the stale thumbnail") {
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    write_scene(fixture.root / "trip" / "s1", "sharp", 4, 1.0, true);
+    fixture.enter("trip");
+
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    fixture.jobs.tick(splat::FakeJobService::kSecondsPerJob + 0.1);
+    fixture.stack.update(fixture.context, press(0));
+    bool said = false;
+    for (const std::string& toast : toasts) said = said || toast == "Rotated s1";
+    CHECK(said);
+    // The entry is no longer marked busy.
+    const splat::GridView& grid = fixture.scenes->grid();
+    REQUIRE(grid.cells().size() >= 2);
+    CHECK(grid.cells()[1].badge.empty());
+}
+
+TEST_CASE("ui_scenes refuses to open a scene whose turn is still queued") {
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    const Path folder = fixture.root / "trip" / "s1";
+    write_scene(folder, "sharp", 4, 1.0, true);
+    fixture.enter("trip");
+
+    // The turn is queued behind another job; Cross would load the folder the
+    // runner is about to rewrite, which is the state the task forbids. The
+    // runner has its own guard for the queue-behind-a-conversion case; this is
+    // the shelf's half of it.
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    REQUIRE(fixture.jobs.last_rotate_scene() == folder);
+    fixture.stack.update(fixture.context, press(splat::Select));
+    CHECK(fixture.commands.empty());
+    REQUIRE_FALSE(toasts.empty());
+    CHECK(toasts.back() == "This scene is being rotated");
+}
+
+TEST_CASE("ui_scenes reloads a thumbnail when a turn finished under another screen") {
+    // A turn that ends while the shelf is covered leaves the cached pre-turn
+    // image: on_enter()/apply_scenes() reset the busy mark without an observer
+    // seeing the transition. The returned shelf must read the new file, not the
+    // cache.
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    const Path folder = fixture.root / "trip" / "s1";
+    write_scene(folder, "sharp", 4, 1.0, true);
+    write_solid_thumb(folder, 250, 20, 20);
+    fixture.enter("trip");
+
+    const auto settle = [&fixture]() -> const splat::UiImage* {
+        for (int attempt = 0; attempt < 400; ++attempt) {
+            fixture.stack.update(fixture.context, press(0));
+            const std::vector<splat::GridCell>& cells = fixture.scenes->grid().cells();
+            if (cells.size() >= 2 && cells[1].thumb != nullptr && !cells[1].thumb->empty()) {
+                return cells[1].thumb;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return nullptr;
+    };
+
+    const splat::UiImage* before = settle();
+    REQUIRE(before != nullptr);
+    const uint8_t before_red = before->pixel(0, 0)[0];
+
+    fixture.stack.update(fixture.context, press(splat::RotateRight));
+    // Cover the shelf; the job finishes while it is not the top screen.
+    splat::ScreenArgs args;
+    REQUIRE(fixture.stack.push(splat::ScreenId::Keyboard, args));
+    fixture.jobs.tick(splat::FakeJobService::kSecondsPerJob + 0.1);
+    // The real runner rewrote the file; the fake does not touch it, so the test
+    // makes the visible change itself.
+    write_solid_thumb(folder, 20, 20, 250);
+    REQUIRE(fixture.stack.pop());
+
+    const splat::UiImage* after = settle();
+    REQUIRE(after != nullptr);
+    CHECK(after->pixel(0, 0)[2] > 200);   // the new blue file
+    CHECK(after->pixel(0, 0)[0] < 60);
+    CHECK(before_red > 200);              // the old file really was red
+    // The completion is announced on the way back.
+    bool said = false;
+    for (const std::string& toast : toasts) said = said || toast == "Rotated s1";
+    CHECK(said);
 }
 
 TEST_CASE("ui_scenes keeps the focused scene after returning") {

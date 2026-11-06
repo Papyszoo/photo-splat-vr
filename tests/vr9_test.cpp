@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -401,22 +402,125 @@ TEST_CASE("vr9 a held direction reaches every screen through UiApp") {
     CHECK(counter->presses == after_release);
 }
 
-TEST_CASE("vr9 the scale mode is Maquette by default and persists") {
+TEST_CASE("vr9 the Capture zoom mode is the default and persists") {
     splat::UiState defaults;
     CHECK(defaults.scale_around == 2);
-    CHECK(std::string(splat::scale_mode_name(defaults.scale_around)) == "Maquette");
+    CHECK(std::string(splat::scale_mode_name(defaults.scale_around)) == "Capture");
     CHECK(std::string(splat::scale_mode_name(0)) == "Front");
     CHECK(std::string(splat::scale_mode_name(1)) == "Centre");
+    CHECK(std::string(splat::scale_mode_name(2)) == "Capture");
 
     const std::filesystem::path dir =
         std::filesystem::temp_directory_path() / "splat-vr9-ui-state-test";
     std::error_code error;
     std::filesystem::remove_all(dir, error);
+    // A fresh state (no ui.json at all) resolves to Capture before anything is
+    // stored: the default, not a persisted value.
+    CHECK(splat::load_ui_state(splat::Path(dir.string())).scale_around == 2);
     REQUIRE(splat::save_ui_state(splat::Path(dir.string()), defaults).ok());
     CHECK(splat::load_ui_state(splat::Path(dir.string())).scale_around == 2);
+
+    // A value the user stored explicitly is kept, whichever one it is.
+    defaults.scale_around = 1;
+    REQUIRE(splat::save_ui_state(splat::Path(dir.string()), defaults).ok());
+    CHECK(splat::load_ui_state(splat::Path(dir.string())).scale_around == 1);
 
     defaults.scale_around = 0;
     REQUIRE(splat::save_ui_state(splat::Path(dir.string()), defaults).ok());
     CHECK(splat::load_ui_state(splat::Path(dir.string())).scale_around == 0);
+
     std::filesystem::remove_all(dir, error);
+}
+
+TEST_CASE("vr9 the default and legacy ui.json values resolve to the viewer's pivot mode") {
+    // The mapping the viewer applies at load and every frame.
+    CHECK(splat::pivot_mode_from_setting(0) == splat::ScalePivotMode::front);
+    CHECK(splat::pivot_mode_from_setting(1) == splat::ScalePivotMode::centre);
+    CHECK(splat::pivot_mode_from_setting(2) == splat::ScalePivotMode::capture);
+
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "splat-vr9-pivot-mode-test";
+    std::error_code error;
+    std::filesystem::remove_all(dir, error);
+    const splat::Path state_dir(dir.string());
+
+    // Default end to end: no ui.json at all -> UiState -> pivot mode -> a
+    // headset that scales about the capture point (its offset stays at zero).
+    {
+        const splat::UiState loaded = splat::load_ui_state(state_dir);
+        splat::HmdView view;
+        view.set_scale_pivot_mode(splat::pivot_mode_from_setting(loaded.scale_around));
+        CHECK(view.scale_pivot_mode() == splat::ScalePivotMode::capture);
+        REQUIRE(view.place(identity_head()));
+        view.begin_scale_gesture();
+        view.scale_scene(0.5f);
+        CHECK(view.world_scale() == doctest::Approx(0.5f).epsilon(1e-4));
+        CHECK(view.scene_offset()[0] == doctest::Approx(0.0f));
+        CHECK(view.scene_offset()[1] == doctest::Approx(0.0f));
+        CHECK(view.scene_offset()[2] == doctest::Approx(0.0f));
+    }
+
+    // Files an earlier build wrote: front/centre keep their meaning; the retired
+    // table model (2 or "maquette") and anything unknown land on Capture.
+    struct Legacy {
+        const char* json;
+        splat::ScalePivotMode mode;
+    };
+    const Legacy cases[] = {
+        {"{\"scale_around\": 0}", splat::ScalePivotMode::front},
+        {"{\"scale_around\": 1}", splat::ScalePivotMode::centre},
+        {"{\"scale_around\": 2}", splat::ScalePivotMode::capture},
+        {"{\"scale_around\": 7}", splat::ScalePivotMode::capture},
+        {"{\"scale_around\": \"front\"}", splat::ScalePivotMode::front},
+        {"{\"scale_around\": \"centre\"}", splat::ScalePivotMode::centre},
+        {"{\"scale_around\": \"maquette\"}", splat::ScalePivotMode::capture},
+        {"{\"scale_around\": \"nonsense\"}", splat::ScalePivotMode::capture},
+        {"{\"scale_around\": true}", splat::ScalePivotMode::capture},
+        {"{\"tooltips\": true}", splat::ScalePivotMode::capture},
+    };
+    for (const Legacy& legacy : cases) {
+        CAPTURE(legacy.json);
+        std::filesystem::create_directories(dir, error);
+        {
+            std::ofstream out(splat::ui_state_path(state_dir), std::ios::binary | std::ios::trunc);
+            REQUIRE(out.is_open());
+            out << legacy.json;
+        }
+        const splat::UiState loaded = splat::load_ui_state(state_dir);
+        CHECK(splat::pivot_mode_from_setting(loaded.scale_around) == legacy.mode);
+    }
+
+    std::filesystem::remove_all(dir, error);
+}
+
+TEST_CASE("vr9 capture scaling keeps the capture point and changes only size") {
+    splat::HmdView view;
+    REQUIRE(view.place(identity_head()));
+    view.set_scale_pivot_mode(splat::ScalePivotMode::capture);
+    view.begin_scale_gesture();
+    view.scale_scene(0.5f);
+    CHECK(view.world_scale() == doctest::Approx(0.5f).epsilon(1e-4));
+    CHECK(view.hud_scale() == doctest::Approx(0.5f).epsilon(1e-4));
+    // The scene origin is the pivot: the offset (the capture point's display
+    // position) does not move; only the scene's size changes.
+    CHECK(view.scene_offset()[0] == doctest::Approx(0.0f));
+    CHECK(view.scene_offset()[1] == doctest::Approx(0.0f));
+    CHECK(view.scene_offset()[2] == doctest::Approx(0.0f));
+    view.scale_scene(0.2f);
+    CHECK(view.world_scale() == doctest::Approx(0.1f).epsilon(1e-4));
+    view.reset_scene_adjust();
+    CHECK(view.world_scale() == doctest::Approx(1.0f));
+}
+
+TEST_CASE("vr9 centre scaling reaches far below the immersive floor") {
+    splat::HmdView view;
+    REQUIRE(view.place(identity_head()));
+    view.set_scale_pivot_mode(splat::ScalePivotMode::centre);
+    view.set_pivot_samples(two_depth_cloud(0.8f, 100, 4.0f, 900));
+    // No press yet: the centre pivot is taken from the cloud.
+    view.begin_scale_gesture();
+    // A 160 m scene has to be able to become small; 0.05x is far below the
+    // old 0.25 floor and must be accepted.
+    view.scale_scene(0.05f);
+    CHECK(view.world_scale() == doctest::Approx(0.05f).epsilon(1e-4));
 }

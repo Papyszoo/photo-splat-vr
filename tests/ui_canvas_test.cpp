@@ -298,6 +298,99 @@ TEST_CASE("ui_canvas blit_cover crops to fill the box") {
     CHECK(pixel_at(rounded, 5, 5).a == 255);
 }
 
+TEST_CASE("ui_canvas turns a thumbnail and fits it without stretching") {
+    // 40x20, one solid colour per quadrant: red top-left, green top-right,
+    // blue bottom-left, white bottom-right.
+    splat::UiImage source;
+    source.resize(40, 20);
+    for (uint32_t y = 0; y < 20; ++y) {
+        for (uint32_t x = 0; x < 40; ++x) {
+            const bool right = x >= 20;
+            const bool bottom = y >= 10;
+            const splat::Rgba color = bottom ? (right ? kWhite : kBlue) : (right ? kGreen : kRed);
+            set_pixel(source, x, y, color);
+        }
+    }
+
+    // A 40x40 box: the turned image is 20x40 at scale 1, centred at x=10. The
+    // quarter turn sends source bottom-left (blue) to the top-left, red to the
+    // top-right, white to the bottom-left and green to the bottom-right.
+    constexpr splat::Rgba kPlate{10, 20, 30, 255};
+    splat::UiCanvas canvas(40, 40);
+    canvas.clear(kNone);
+    canvas.blit_turned_fit(0, 0, 40, 40, 1, source, 0, kPlate);
+    CHECK(pixel_at(canvas, 12, 5) == kBlue);
+    CHECK(pixel_at(canvas, 27, 5) == kRed);
+    CHECK(pixel_at(canvas, 12, 34) == kWhite);
+    CHECK(pixel_at(canvas, 27, 34) == kGreen);
+    // The letterbox on both sides is the plate, so no stretched photo: the
+    // turned 40x20 keeps its 1:2 aspect instead of filling the square.
+    CHECK(pixel_at(canvas, 2, 20) == kPlate);
+    CHECK(pixel_at(canvas, 37, 20) == kPlate);
+
+    // A second turn keeps the 40x20 aspect (no axis swap), letterboxed top and
+    // bottom: source bottom-right (white) is now top-left and source top-left
+    // (red) is now bottom-right.
+    splat::UiCanvas half(40, 40);
+    half.clear(kNone);
+    half.blit_turned_fit(0, 0, 40, 40, 2, source, 0, kPlate);
+    CHECK(pixel_at(half, 12, 12) == kWhite);
+    CHECK(pixel_at(half, 27, 12) == kBlue);
+    CHECK(pixel_at(half, 27, 27) == kRed);
+
+    splat::UiCanvas three(40, 40);
+    three.clear(kNone);
+    three.blit_turned_fit(0, 0, 40, 40, 3, source, 0, kPlate);
+    CHECK(pixel_at(three, 12, 5) == kGreen);
+    CHECK(pixel_at(three, 27, 5) == kWhite);
+    CHECK(pixel_at(three, 27, 34) == kBlue);
+
+    // Four quarter turns are no turn: the original corners, still fitted.
+    splat::UiCanvas whole(40, 20);
+    whole.clear(kNone);
+    whole.blit_turned_fit(0, 0, 40, 20, 4, source, 0, kPlate);
+    CHECK(pixel_at(whole, 5, 5) == kRed);
+    CHECK(pixel_at(whole, 35, 15) == kWhite);
+
+    // The dirty contract (canvas.h: "even one that is fully clipped"): a draw
+    // call marks the canvas dirty although it changes no pixel. Every sibling
+    // blit does it first; this one used to return before setting it.
+    const splat::UiImage nothing;
+    splat::UiCanvas untouched(8, 8);
+    untouched.clear_dirty();
+    untouched.blit_turned_fit(0, 0, 8, 8, 1, nothing, 0, kPlate);
+    CHECK(untouched.dirty());
+    untouched.clear_dirty();
+    untouched.blit_turned_fit(0, 0, 0, 8, 1, source, 0, kPlate);
+    CHECK(untouched.dirty());
+}
+
+TEST_CASE("ui_canvas blit_fit contains the whole picture on a plate") {
+    // A 4x2 picture (2:1) in a 20x20 box: contained it is 20x10, centred at
+    // y=5, with the plate showing above and below - the whole frame, never a
+    // centre crop. A picture that already has the box's shape fills it.
+    splat::UiImage source = solid_image(4, 2, kRed);
+    constexpr splat::Rgba kPlate{10, 20, 30, 255};
+    splat::UiCanvas canvas(20, 20);
+    canvas.clear(kNone);
+    canvas.blit_fit(0, 0, 20, 20, source, 0, kPlate);
+    CHECK(pixel_at(canvas, 10, 2) == kPlate);
+    CHECK(pixel_at(canvas, 10, 10) == kRed);
+    CHECK(pixel_at(canvas, 10, 17) == kPlate);
+    // The bar is symmetric: the picture starts at y=5 and ends at y=14.
+    CHECK(pixel_at(canvas, 10, 4) == kPlate);
+    CHECK(pixel_at(canvas, 10, 5) == kRed);
+    CHECK(pixel_at(canvas, 10, 14) == kRed);
+    CHECK(pixel_at(canvas, 10, 15) == kPlate);
+
+    splat::UiCanvas filled(20, 10);
+    filled.clear(kNone);
+    filled.blit_fit(0, 0, 20, 10, source, 0, kPlate);
+    for (int x : {1, 10, 18}) {
+        for (int y : {1, 5, 8}) CHECK(pixel_at(filled, x, y) == kRed);
+    }
+}
+
 TEST_CASE("ui_canvas blits scaled images with the right corners") {
     splat::UiImage source;
     source.resize(2, 2);
@@ -571,10 +664,11 @@ TEST_CASE("ui_canvas input actions keep their bit values") {
     CHECK(idle.held == 0);
     CHECK_FALSE(idle.pointer_valid);
     CHECK_FALSE(idle.click);
+    CHECK_FALSE(idle.pointer_down);
     CHECK(idle.dt == 0.0);
 
     const splat::UiInput pressed{splat::Select | splat::Down, splat::Down, true, 640.0f, 360.0f,
-                                true, 1.0 / 60.0};
+                                true, false, 1.0 / 60.0};
     CHECK((pressed.pressed & splat::Select) != 0);
     CHECK((pressed.pressed & splat::Up) == 0);
     CHECK(pressed.pointer_valid);

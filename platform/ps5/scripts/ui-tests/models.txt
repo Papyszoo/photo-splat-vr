@@ -28,8 +28,11 @@
 # models-dl-90, models-ready, models-selected, licence-1, licence-2.
 #
 # Times are seconds from the first UI frame. The panel boots into the folders;
-# Options opens Settings (Models, Conversions, Quit). The Models rows are SHARP,
-# DA2-Small, then "Default model" (Cross switches it to the next ready model).
+# Options opens Settings, and the System section is Models, Conversions,
+# Network locations, Visible folders, Quit (stage H inserted Visible folders
+# after Network locations, so the way down from Models to Quit is four Downs).
+# The Models rows are SHARP, DA2-Small, then "Default model" (Cross switches it
+# to the next ready model).
 
 0.5   mark models-start
 1.0   shot home
@@ -67,5 +70,7 @@
 149.0 press Circle
 150.5 press Down
 151.1 press Down
-151.7 press Cross
-152.0 quit
+151.7 press Down
+152.3 press Down
+152.9 press Cross
+153.2 quit

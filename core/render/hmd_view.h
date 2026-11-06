@@ -185,8 +185,9 @@ inline void centre_pivot_bounds(float p5, float* lower, float* upper) {
 }
 
 // The dolly term of a press, (1-f)*D, is capped so the scene never appears to
-// lurch: 1.5 m/s, the research's comfort limit.
-inline constexpr float kScaleDollyMetresPerSecond = 1.5f;
+// lurch: 4 m/s, the press rate VR9 chose (the research's 1.5 m/s comfort limit,
+// doubled with the 1.5 s doubling time; docs/PLAN.md, headset test 6).
+inline constexpr float kScaleDollyMetresPerSecond = 4.0f;
 
 // ---- maquette scaling (VR9) -----------------------------------------------
 // "Like it was on my table" (headset test 6). Shrinking glides the scene's
@@ -222,48 +223,67 @@ void maquette_centre(float scale, const float c0[3], const float table[3], float
 float maquette_scale_for_extent(float extent_metres);
 
 // The robust horizontal extent of a scene-space splat cloud at `scale`: the
-// larger of the x and z 5-95 percentile spans, in displayed metres. Falls back
-// to 0 (no samples), which maquette_scale_for_extent() reads as "no glide".
+// larger of the x and z 5-95 percentile spans of the displayed cloud, in
+// metres. Falls back to 0 (no samples), which maquette_scale_for_extent()
+// reads as "no glide".
 float robust_scene_extent(const float* positions, size_t count, float scale);
 
-enum class ScalePivotMode { front = 0, centre = 1, maquette = 2 };
+// Front/Centre scale the 3D scene about a visible point; Capture scales it about
+// the photo's capture point (the scene origin). In Capture the static image is
+// unchanged, but a smaller scene makes every head/body movement count more -
+// the miniature effect. maquette is the retired table-model value, kept so old
+// state loads without a special case.
+enum class ScalePivotMode { front = 0, centre = 1, maquette = 2, capture = 3 };
 
-// The lazy-follow VR panel (headset test 5): a world-stable point at a fixed
-// distance ahead of the eyes, re-centred with a ~0.3 s ease when the head has
-// turned more than ~17 deg away from it, and always drawn parallel to the
-// view (yaw and pitch, never roll).
+// Settings -> Comfort -> Scale (UiState::scale_around): 0 front, 1 centre, and
+// anything else - the default 2 included - is Capture. The viewer applies this
+// at load and every frame; a stored 2 (the retired table model) lands on Capture.
+inline ScalePivotMode pivot_mode_from_setting(int scale_around) {
+    if (scale_around == 0) return ScalePivotMode::front;
+    if (scale_around == 1) return ScalePivotMode::centre;
+    return ScalePivotMode::capture;
+}
+
+// The VR panel's world-fixed anchor (headset test 5, user decision
+// 2026-11-06): a quad latched where the menu opened and then left alone. It
+// does not follow the head. The user's reason, in their own words: the PSVR2's
+// sweet spot is small, so a window that keeps re-centring itself towards the
+// middle of the view is impossible to read - a window that stays put can be
+// re-centred on demand instead (the Cross hold with the panel open,
+// UiHost::recenter_panel()).
 //
-// Why not a classic eye-point billboard: a quad whose normal points at the eye
-// from an off-axis centre is seen at an angle, and that angle *is* the
-// keystone. Keeping the quad's plane parallel to the view plane makes the
-// projected shape a rigid rectangle for any head yaw, pitch or roll; the
-// direction vector only decides where it sits. Re-centring moves that
-// direction back in front of the user without changing the shape.
+// Why the quad's plane is parallel to the *latched* view plane: a quad whose
+// normal points at the eye from an off-axis centre is seen at an angle, and
+// that angle *is* the keystone. Keeping the plane parallel to the view plane it
+// was created in makes the projected shape a rigid rectangle while the user
+// looks through that plane; turning the head away from it then sees the window
+// at an angle, which is what a fixed window does (and the point of the
+// decision: no constant re-centring). Only latch()/recenter() moves it.
 inline constexpr float kPanelDistanceMetres = 1.6f;
-inline constexpr float kPanelFollowStartDegrees = 17.5f;
-inline constexpr float kPanelFollowSettleDegrees = 1.5f;
-// First-order ease on the direction: 95 % of the way in 0.3 s.
-inline constexpr double kPanelFollowSeconds = 0.1;
 
-class PanelFollower {
+class PanelAnchor {
 public:
-    // The panel appears for the first time: directly ahead of this pose.
-    void reset(double yaw, double pitch);
-    // One frame: ease the direction back in front when it has left the view.
-    void update(double yaw, double pitch, double seconds);
-    // The quad for this frame at `eye`: centre on the followed direction, the
-    // plane parallel to the current yaw/pitch (upright, no roll).
-    OverlayQuad quad(const float eye[3], double yaw, double pitch) const;
+    // Unlatched: the quad is empty (width and height 0), like an invisible
+    // panel, so a caller that draws without latching draws nothing.
+    PanelAnchor() {
+        quad_.width = 0.0f;
+        quad_.height = 0.0f;
+    }
 
-    const float* direction() const { return direction_; }
-    bool following() const { return following_; }
-    bool initialised() const { return initialised_; }
-    float distance = kPanelDistanceMetres;
+    // Store the quad itself: centre 1.6 m along the pose's forward, right and
+    // up from that same yaw/pitch (upright, never rolled), 1.4 x 0.7875 m.
+    // After this the anchor is independent of every later head pose.
+    void latch(const float eye[3], double yaw, double pitch);
+    // The panel's recentre: latch again at the current pose.
+    void recenter(const float eye[3], double yaw, double pitch) { latch(eye, yaw, pitch); }
+    // The stored quad. No camera argument, because nothing about the head
+    // changes it; empty until the first latch().
+    const OverlayQuad& quad() const { return quad_; }
+    bool latched() const { return latched_; }
 
 private:
-    float direction_[3] = {0.0f, 0.0f, 1.0f};
-    bool following_ = false;
-    bool initialised_ = false;
+    OverlayQuad quad_;
+    bool latched_ = false;
 };
 
 // Tracked head -> FrameView, with the placement/recentre semantics of the
@@ -287,16 +307,20 @@ private:
 // gravity and must appear in front of the eyes.
 //
 // The scene can be manipulated without moving the anchor. A scale press (L2/R2)
-// freezes a pivot in the *world*. VR9's default is the **maquette**: T is a
-// table point 0.7 m ahead and 0.35 m below the eyes, the scene shrinks and its
-// content centre glides onto T, then L2/R2 scale the maquette about T; growing
-// past the landing scale glides it back to the original placement, and above 1
-// it also scales about T. T, C0 and the landing scale belong to the round trip,
-// not to one press: they are captured when a shrink starts from full size and
-// reused by every later press until a recentre, a scene change, or the scale
-// returning to 1.0, so several presses down and then up return exactly to the
-// original placement. VR8's Front (5th-percentile cone depth) and Centre
-// (median, 0.5 m near guard) pivots remain as Settings options. The viewer
+// freezes a pivot in the *world*. The default is **Capture**: the pivot is the
+// scene origin, i.e. the photo's capture point, between the eyes at
+// load/recentre, so the picture is invariant at rest and a smaller scene
+// amplifies head motion. VR9's **maquette** remains as an internal round-trip
+// mode: T is a table point 0.7 m ahead and 0.35 m below the eyes, the scene
+// shrinks and its content centre glides onto T, then L2/R2 scale the maquette
+// about T; growing past the landing scale glides it back to the original
+// placement, and above 1 it also scales about T. T, C0 and the landing scale
+// belong to the round trip, not to one press: they are captured when a shrink
+// starts from full size and reused by every later press until a recentre, a
+// scene change, or the scale returning to 1.0, so several presses down and then
+// up return exactly to the original placement. VR8's Front (5th-percentile cone
+// depth) and Centre (median, 0.5 m near guard) pivots remain as Settings
+// options. The viewer
 // does not move: the camera is the head and only the scene transforms change
 // (ViewerState::scale_about_pivot(), or place_maquette() for the glide). VR7
 // used a fixed 1.5 m point, which was still read as a dolly; VR6 scaled about
@@ -324,6 +348,8 @@ public:
     void set_fade_start(float fraction);
     float comfort_radius() const { return state_.comfort_radius(); }
     float world_scale() const { return state_.world_scale(); }
+    // What the HUD/CSV show: the scene scale (Capture included).
+    float hud_scale() const { return state_.world_scale(); }
 
     // Updates the cached head pose and eye midpoint; false when the head is
     // not tracked, in which case the last pose is held.
@@ -357,8 +383,20 @@ public:
     float near_depth() const { return near_depth_; }
 
     // ---- scale (L2/R2), about a point fixed in the world ------------------
-    // Which pivot the next press freezes: Front (the default) or Centre.
-    void set_scale_pivot_mode(ScalePivotMode mode) { pivot_mode_ = mode; }
+    // Which pivot the next press freezes: Capture (the default: the photo's
+    // capture point, the scene origin), Front (the near edge) or Centre (the
+    // visible middle). Maquette is the internal VR9 round trip.
+    // All scale modes may shrink to kMinSceneScale. Capture pivots at the
+    // capture point (the static image is invariant, head motion is amplified);
+    // Front fixes the near edge, Centre the visible middle. The mode is read
+    // every frame, so the range follows the Settings value without a restart.
+    void set_scale_pivot_mode(ScalePivotMode mode) {
+        pivot_mode_ = mode;
+        // Capture, Front and Centre may all shrink far below the immersive
+        // floor: a smaller scene makes head motion count more (the miniature
+        // effect). The scene origin stays at the capture point either way.
+        state_.set_world_scale_limits(kMinSceneScale, kMaxWorldScale);
+    }
     ScalePivotMode scale_pivot_mode() const { return pivot_mode_; }
     // A decimated copy of the scene's splat positions (scene space, xyz),
     // measured once per loaded scene. Presses pick their cone from these; with
@@ -427,8 +465,14 @@ public:
     // a positive turn turns the *scene* to the user's right.
     void move_scene(float right, float forward, float up);
     void turn_scene(float radians);
+    // The scene's accumulated turn, radians (positive turns the scene to the
+    // user's right). It is what view_yaw() subtracts from the head's own yaw.
     float scene_turn() const { return turn_; }
     const float* scene_offset() const { return state_.scene_offset(); }
+
+    void set_scene_offset(const float offset[3]) {
+        state_.set_scene_offset(offset[0], offset[1], offset[2]);
+    }
 
     // The frame for the cached pose.
     FrameView frame() const;
@@ -443,10 +487,9 @@ public:
     double scene_yaw() const { return scene_yaw_; }
     double scene_pitch() const { return scene_pitch_; }
     double scene_roll() const { return scene_roll_; }
-    // The yaw the renderer is actually given: the scene yaw with the right-stick
-    // turn removed (a positive turn swings the view left, so the content turns
-    // right). This is the value the pose log's `yaw_deg` column records; the
-    // turn itself is the separate `turn_deg` column (scene_turn()).
+    // The yaw the renderer is given: the head's own yaw minus the scene's
+    // right-stick turn. The turn is the separate `turn_deg` column
+    // (scene_turn()).
     double view_yaw() const { return scene_yaw_ - static_cast<double>(turn_); }
     const float* head_position() const { return head_; }
     const float* anchor() const { return state_.anchor(); }
@@ -493,12 +536,11 @@ private:
     double scene_pitch_ = 0.0;
     double scene_roll_ = 0.0;
     float ipd_ = 0.063f;
-    // Scene manipulation: the turn the right stick adds (about the placement
-    // frame's vertical; the camera yaw is scene_yaw - turn_), the median depth
-    // of the loaded scene (with the scene point it locates), the near content
-    // of the loaded scene, this press's world pivot, and the scale recentre
-    // returns to.
-    float turn_ = 0.0f;
+    // Scene manipulation: the median depth of the loaded scene (with the scene
+    // point it locates), the near content of the loaded scene, this press's
+    // world pivot, and the scale recentre returns to. `turn_` is the scene's
+    // accumulated yaw about the placement frame's vertical; the camera yaw is
+    // scene_yaw - turn_.
     float median_depth_ = 1.6f;
     float scale_pivot_[3] = {0.0f, 0.0f, 1.6f};
     float near_depth_ = 1.6f;
@@ -517,12 +559,19 @@ private:
     float gesture_start_scale_ = 1.0f;
     // Centre mode's factor ceiling for the near-content guard; 0 = no limit.
     float centre_growth_limit_ = 0.0f;
+    // The app applies UiState::scale_around (default Capture) before every
+    // press, so this constructor fallback is only what a caller gets before it
+    // applies a setting (the VR7 pivot-geometry tests use it).
     ScalePivotMode pivot_mode_ = ScalePivotMode::front;
     // A decimated copy of the scene's splat positions (scene space xyz): the
     // cone measure is taken per press from these, not per frame.
     std::vector<float> pivot_samples_;
     bool scale_gesture_ = false;
     float initial_scale_ = 1.0f;
+    // The scene's accumulated turn about the placement frame's vertical,
+    // radians (the right stick and the grab's yaw). Positive turns the scene to
+    // the user's right.
+    float turn_ = 0.0f;
 };
 
 }  // namespace splat

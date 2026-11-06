@@ -11,7 +11,9 @@
 #include "gallery/gallery.h"
 #include "jobs/job_runner.h"
 #include "render/scene_label.h"
+#include "scene/scene_folder.h"
 #include "ui/text_fit.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -24,24 +26,46 @@ std::string percent_text(const JobView& job) {
 }
 
 // The right-hand column in plain words: "Converting 50%", "Queued", "Done",
-// "Failed", "Cancelled". Pipeline stages stay out of the panel.
+// "Failed", "Cancelled". A finished import shows its notice ("imported 3
+// splats") instead of "Done": the count is the whole point of the row.
 std::string right_text(const JobView& job) {
+    // A scene turn is a file job with its own words: it never converts a photo
+    // and its result is the entry the user already has.
+    const bool rotate = job.kind == "rotate";
     if (job.state == "running") {
         // A pending cancel matters more than the progress: the job is still
         // spending GPU time on the photo it already started.
-        if (!job.message.empty()) return "Stopping after this photo";
+        if (!job.message.empty()) {
+            return rotate ? "Stopping after this scene"
+                          : (job.backend == "import" ? "Stopping after this file"
+                                                     : "Stopping after this photo");
+        }
+        if (rotate) return "Rotating " + percent_text(job);
+        // An import has no percentage worth reading (three stages), so its row
+        // names the stage the runner is in; a conversion keeps the percentage.
+        if (job.backend == "import" && !job.stage.empty() && job.stage != "starting") {
+            std::string stage = job.stage;
+            stage[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(stage[0])));
+            return stage;
+        }
         return "Converting " + percent_text(job);
     }
-    if (job.state == "done") return "Done";
+    if (job.state == "done") {
+        if (rotate) return "Rotated";
+        return job.message.empty() ? std::string("Done") : job.message;
+    }
     if (job.state == "failed") return "Failed";
     if (job.state == "cancelled") return "Cancelled";
     return "Queued";
 }
 
-// "SHARP  .  Krakow trip"; a failed job shows its reason instead.
+// "SHARP  .  Krakow trip"; a failed job shows its reason instead. A scene turn
+// has no model: its first word is "Scene" and the shelf it came from follows.
 std::string sublabel_text(const JobView& job) {
     if (job.state == "failed" && !job.message.empty()) return job.message;
-    std::string text = scene_model_name(job.backend, std::string());
+    const std::string first =
+        job.kind == "rotate" ? std::string("Scene") : scene_model_name(job.backend, std::string());
+    std::string text = first;
     text += "  \xC2\xB7  ";
     text += job.album.empty() ? std::string(kAllScenesAlbumName) : job.album;
     return text;
@@ -155,7 +179,11 @@ void QueueScreen::cancel_focused(UiContext& ctx) {
         ctx.toast(cancelled.message());
         return;
     }
-    ctx.toast(job.state == "running" ? "Cancels after this photo" : "Cancelled");
+    ctx.toast(job.state == "running"
+                  ? (job.kind == "rotate" ? "Cancels after this scene"
+                                          : (job.kind == "import" ? "Cancels after this file"
+                                                                  : "Cancels after this photo"))
+                  : "Cancelled");
     refresh(ctx);
 }
 
@@ -164,6 +192,25 @@ void QueueScreen::view_focused(UiContext& ctx) {
     if (focused < 0 || focused >= static_cast<int>(jobs_.size())) return;
     const JobView& job = jobs_[static_cast<std::size_t>(focused)];
     if (job.state != "done") return;
+    // A turn does not create a scene in an album: it rewrites the entry the
+    // shelf already has, so there is nothing to look up here (the old lookup
+    // ran with an empty album and said "scene is not there yet").
+    if (job.kind == "rotate") return;
+
+    // A scene uploaded to a network location is not under the console's scene
+    // root, so the album lookup below would never find it. The job recorded the
+    // folder it wrote; open that file from where it lies.
+    if (!job.output_root.empty() && vfs::is_remote(job.output_root)) {
+        if (job.scene_folder.empty()) {
+            ctx.toast("scene is not there yet");
+            return;
+        }
+        UiCommand command;
+        command.kind = UiCommand::OpenPath;
+        command.path = scene_files(job.scene_folder).splat;
+        ctx.command(std::move(command));
+        return;
+    }
 
     const std::vector<SceneEntry> scenes = list_scenes(ctx.svc.paths.scenes, job.album);
     const int index = scene_index_for(job.name, scenes);
@@ -191,12 +238,10 @@ void QueueScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
 
     const int running = running_index();
     if (running < 0) return;
-    const int row = running - list_.scroll();
-    if (row < 0 || row >= list_.visible_rows(content, ctx.theme)) return;
-    draw_row_progress(canvas, content, row, list_.rows()[static_cast<std::size_t>(running)].right,
-                      jobs_[static_cast<std::size_t>(running)].fraction,
-                      static_cast<int>(jobs_.size()) > list_.visible_rows(content, ctx.theme),
-                      ctx.theme);
+    const Rect plate = list_.row_rect(running, content, ctx.theme);
+    if (plate.empty()) return;
+    draw_row_progress(canvas, plate, list_.rows()[static_cast<std::size_t>(running)].right,
+                      jobs_[static_cast<std::size_t>(running)].fraction, ctx.theme);
 }
 
 std::vector<Hint> QueueScreen::hints() const {
@@ -204,7 +249,7 @@ std::vector<Hint> QueueScreen::hints() const {
     if (focus < 0 || focus >= static_cast<int>(jobs_.size())) return {Hint{"Circle", "Back"}};
     const JobView& job = jobs_[static_cast<std::size_t>(focus)];
     std::vector<Hint> hints;
-    if (job.state == "done") hints.push_back(Hint{"Cross", "View"});
+    if (job.state == "done" && job.kind != "rotate") hints.push_back(Hint{"Cross", "View"});
     if (job.state == "queued" || job.state == "running") hints.push_back(Hint{"Square", "Cancel"});
     hints.push_back(Hint{"Circle", "Back"});
     return hints;

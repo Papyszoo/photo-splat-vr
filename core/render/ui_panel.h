@@ -38,10 +38,11 @@ OverlayQuad tv_panel_quad(const OverlayCamera& camera, uint32_t canvas_w,
 // placed from) leans; its front faces the reference position. `width` and
 // `height` are metres (1.4 x 0.7875 is 16:9 at reading size).
 //
-// This is the pre-VR8 placement, kept as the reference the new lazy follower
-// (PanelFollower, hmd_view.h) replaced: a fixed yaw-only plane seen off-axis is
+// This is the pre-VR8 placement: a fixed yaw-only plane, which seen off-axis is
 // exactly the keystoned panel of the 2026-10-27 recording. UiHost uses the
-// follower; this function remains for the geometry test and the TV-style quad.
+// world-fixed anchor instead (PanelAnchor, hmd_view.h: the same plane as the
+// pose it latched from, so it is not keystoned); this function remains for the
+// geometry test and the TV-style quad.
 OverlayQuad vr_panel_quad(const CameraPose& reference, float distance = 1.6f,
                           float width = 1.4f, float height = 0.7875f);
 

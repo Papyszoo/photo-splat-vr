@@ -1,0 +1,97 @@
+# LibRaw 0.22.3 has no CMake project. Its sources are listed once here,
+# taken from Makefile.dist LIB_OBJECTS object rules (the
+# single-threaded library: every object has a "src/<...>.cpp" rule), and
+# compiled by the desktop build (core/CMakeLists.txt) and the PS5 cross
+# build (platform/ps5/ggml/CMakeLists.txt). Deliberately explicit: a glob
+# would silently pick up a source the next submodule bump adds, and LibRaw
+# does not support its whole tree being compiled (the GPL demosaic packs and
+# the DNG-SDK/RawSpeed glue are opt-in).
+#
+# The list matches 0.22.3's Makefile.dist LIB_OBJECTS exactly (one source per
+# object); a submodule bump must regenerate it from that file, not from a glob.
+#
+# The consuming CMakeLists.txt sets SPLAT_LIBRAW_DIR and defines the
+# splat_libraw target with -DLIBRAW_NOTHREADS and without USE_ZLIB,
+# USE_JPEG or USE_LCMS (the payload SDK has none of them).
+# SPDX-License-Identifier: GPL-3.0-or-later
+set(SPLAT_LIBRAW_SOURCES
+    "${SPLAT_LIBRAW_DIR}/src/libraw_c_api.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/libraw_datastream.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/canon_600.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/crx.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/pana8.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/olympus14.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/sonycc.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decompressors/losslessjpeg.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/decoders_dcraw.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/decoders_libraw_dcrdefs.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/decoders_libraw.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/dng.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/fp_dng.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/fuji_compressed.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/generic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/kodak_decoders.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/load_mfbacks.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/smal.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/unpack_thumb.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/decoders/unpack.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/aahd_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/ahd_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/dcb_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/dht_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/misc_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/demosaic/xtrans_demosaic.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/integration/dngsdk_glue.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/integration/rawspeed_glue.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/adobepano.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/canon.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/ciff.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/cr3_parser.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/epson.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/exif_gps.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/fuji.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/identify_tools.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/identify.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/kodak.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/leica.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/makernotes.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/mediumformat.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/minolta.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/misc_parsers.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/nikon.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/hasselblad_model.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/normalize_model.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/olympus.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/p1.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/pentax.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/samsung.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/sony.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/metadata/tiff.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/aspect_ratio.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/dcraw_process.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/mem_image.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/postprocessing_aux.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/postprocessing_utils_dcrdefs.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/postprocessing/postprocessing_utils.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/preprocessing/raw2image.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/preprocessing/ext_preprocess.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/preprocessing/subtract_black.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/tables/cameralist.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/tables/colorconst.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/tables/colordata.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/tables/wblists.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/curves.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/decoder_info.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/init_close_utils.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/open.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/phaseone_processing.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/read_utils.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/thumb_utils.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/utils_dcraw.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/utils/utils_libraw.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/write/apply_profile.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/write/file_write.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/write/tiff_writer.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/x3f/x3f_parse_process.cpp"
+    "${SPLAT_LIBRAW_DIR}/src/x3f/x3f_utils_patched.cpp"
+)

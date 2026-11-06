@@ -1,0 +1,131 @@
+# Stage H, part 2; stage U1 updated the scope.
+#
+# This script is driven by visible-folders-check.sh after the setup script has
+# set 2468 and ticked family-a. Nothing here is chosen by hand.
+#
+# What it proves: the gallery lists one visible album on boot, a wrong passcode
+# says so and keeps the list locked, the right one opens it, the photo picker
+# still lists every source (stage U1: it is not filtered), and the location list
+# shows every configured share (management is not behind the passcode).
+#
+# Settings: the focus starts on Scale; Visible folders is nine Downs, Network
+# locations eight (stage T added the Thumbnail size row in Display).
+0.5   mark locked-start
+0.6   shot home
+1.4   press Cross
+2.0   shot family-a
+2.8   press Left
+3.2   press Cross
+3.8   shot photos-open
+4.6   press Circle
+5.2   press Circle
+5.8   press Options
+6.7   press Down
+7.1   press Down
+7.5   press Down
+7.9   press Down
+8.3   press Down
+8.7   press Down
+9.1   press Down
+9.5   press Down
+9.9   press Down
+10.3  press Cross
+10.9  shot visible-folders-locked
+11.3  press Cross
+11.9  press Right
+12.3  press Right
+12.7  press Right
+13.1  press Right
+13.5  press Right
+13.9  press Right
+14.3  press Right
+14.7  press Right
+15.1  press Right
+15.5  press Cross
+16.1  press Cross
+16.7  press Cross
+17.3  press Cross
+17.9  press Down
+18.3  press Down
+18.7  press Down
+19.1  press Down
+19.5  press Right
+19.9  press Right
+20.3  press Cross
+20.9  shot wrong-passcode
+21.7  press Cross
+22.3  press Right
+22.7  press Cross
+23.3  press Right
+23.7  press Right
+24.1  press Cross
+24.7  press Right
+25.1  press Right
+25.5  press Cross
+26.1  press Right
+26.5  press Right
+26.9  press Cross
+27.5  press Down
+27.9  press Down
+28.3  press Down
+28.7  press Down
+29.1  press Right
+29.5  press Right
+29.9  press Right
+30.3  press Right
+30.7  press Cross
+31.3  shot visible-folders-list
+32.1  press Circle
+32.7  press Circle
+33.3  press Options
+34.2  press Down
+34.6  press Down
+35.0  press Down
+35.4  press Down
+35.8  press Down
+36.2  press Down
+36.6  press Down
+37.0  press Down
+37.4  press Cross
+38.0  shot locations-all
+38.4  press Circle
+39.0  press Down
+39.4  press Down
+39.8  press Down
+40.2  press Down
+40.6  press Down
+41.0  press Down
+41.4  press Down
+41.8  press Down
+42.2  press Down
+42.6  press Down
+43.0  press Down
+43.4  press Down
+43.8  press Down
+44.2  press Down
+44.6  press Down
+45.0  press Down
+45.4  press Down
+45.8  press Down
+46.2  press Down
+46.6  press Down
+47.0  press Down
+47.4  press Down
+47.8  press Down
+48.2  press Down
+48.6  press Down
+49.0  press Down
+49.4  press Down
+49.8  press Down
+50.2  press Down
+50.6  press Down
+51.0  press Down
+51.4  press Down
+51.8  press Down
+52.2  press Down
+52.6  press Down
+53.0  press Down
+53.4  press Down
+53.8  press Down
+54.2  press Down
+54.6  press Cross

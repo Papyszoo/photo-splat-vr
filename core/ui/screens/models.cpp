@@ -257,13 +257,10 @@ void ModelsScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
 
     const int index = active_index();
     if (index >= 0) {
-        const int visible = list_.visible_rows(list_area, theme);
-        const int row = index - list_.scroll();
-        if (row >= 0 && row < visible) {
-            draw_row_progress(canvas, list_area, row,
-                              list_.rows()[static_cast<std::size_t>(index)].right,
-                              models_[static_cast<std::size_t>(index)].fraction,
-                              static_cast<int>(list_.rows().size()) > visible, theme);
+        const Rect plate = list_.row_rect(index, list_area, theme);
+        if (!plate.empty()) {
+            draw_row_progress(canvas, plate, list_.rows()[static_cast<std::size_t>(index)].right,
+                              models_[static_cast<std::size_t>(index)].fraction, theme);
         }
     }
 

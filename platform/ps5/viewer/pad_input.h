@@ -12,7 +12,9 @@
 // The mapping (docs/ui-v1-plan.md section 2):
 //   Options (the right Sense controller's menu button)  -> open the menu
 //   Triangle                                            -> toggle tooltips
-//   Cross, held for kRecentreHoldSeconds                 -> recentre
+//   Cross, held for kRecentreHoldSeconds                 -> recentre the scene
+//                                                          (panel closed) or the
+//                                                          panel window (panel open)
 //   L1 / R1                                             -> previous / next scene (on
 //                                                          a Sense: a tap steps, a
 //                                                          hold grabs - W26)
@@ -29,8 +31,10 @@
 // of the eyes (Front: nearest surface, Centre: median), so the viewer does not
 // move there either.
 //
-// A short Cross press does nothing (the hold state machine below decides), and
-// R3 no longer recentres. Everything else has no action on any device. Create
+// A short Cross press does nothing with the panel closed (the hold state
+// machine below decides); with the panel open Cross is the panel's Select and
+// resolves on release (TapHold below: a tap selects, a 1 s hold recentres the
+// window). R3 no longer recentres. Everything else has no action on any device. Create
 // in particular is the system's screenshot button: the DualSense and the left
 // Sense controller both send it as 0x1, and neither quits the viewer with it.
 // Options is the menu button on the DualSense and the right Sense controller;
@@ -117,8 +121,8 @@ constexpr float kStickDeadZone = 0.15f;
 // at rest.
 constexpr float kTriggerDeadZone = 0.05f;
 
-// Scene control rates. The scale is exponential and doubles every 3 s at full
-// deflection (the viewer clamps it to the world-scale range); the first
+// Scene control rates. The scale is exponential and doubles every 1.5 s at full
+// deflection (the viewer clamps it to the mode's scale range); the first
 // kScaleEaseSeconds of a press ease the rate in, so a tap cannot jump the scene.
 // Sticks are quadratic: at full deflection the viewer walks
 // kDefaultMoveMetresPerSecond (2.5 m/s, the Settings default) and turns
@@ -126,8 +130,8 @@ constexpr float kTriggerDeadZone = 0.05f;
 // - fine control near the centre, speed at the edge. Both peaks are Settings
 // rows (UiState::move_speed/turn_speed), so the viewer passes its own rate to
 // move_rate()/turn_rate(); the constants are what a build without a panel uses.
-constexpr float kScaleDoubleSeconds = 3.0f;
-constexpr double kScaleEaseSeconds = 0.5;
+constexpr float kScaleDoubleSeconds = 1.5f;
+constexpr double kScaleEaseSeconds = 0.3;
 constexpr float kDefaultMoveMetresPerSecond = 2.5f;
 constexpr float kDefaultTurnDegreesPerSecond = 40.0f;
 constexpr float kMoveMetresPerSecond = kDefaultMoveMetresPerSecond;
@@ -241,6 +245,8 @@ inline uint32_t ui_actions_for(uint32_t buttons, float left_x = 0.0f, float left
     if ((word & kSquare) != 0) actions |= splat::Secondary;
     if ((word & kTriangle) != 0) actions |= splat::Tooltips;
     if ((word & kOptions) != 0) actions |= splat::Menu;
+    if ((word & kL3) != 0) actions |= splat::RotateLeft;
+    if ((word & kR3) != 0) actions |= splat::RotateRight;
     return actions;
 }
 
@@ -410,6 +416,72 @@ public:
     bool active() const { return active_; }
     bool fired() const { return fired_; }
     float progress() const { return progress_; }
+
+private:
+    bool active_ = false;
+    bool fired_ = false;
+    double started_ = 0.0;
+    float progress_ = 0.0f;
+};
+
+// Cross inside the panel is the panel's Select, and while the panel is open it
+// is also the window's recentre (user decision 2026-11-06, "Same button,
+// context"). A press-edge Select plus a one-second hold would open the focused
+// row and *then* recentre, so the user would land in another screen: in VR the
+// press resolves on release instead. Released before kRecentreHoldSeconds it is
+// one tap (exactly one Select); held to the second it is one hold (the window
+// recentre) and no Select at all. `pending` is true for as long as the press
+// can still become either, which is what the caller uses to withhold Select
+// from the panel's UiInput. Pure and time-driven like RecentreHold, so the
+// console and the desktop test run the same code. `now` is seconds on any
+// monotonic clock.
+class TapHold {
+public:
+    struct Step {
+        bool tap = false;      // released early: one Select, this frame
+        bool hold = false;     // reached the hold time: one hold, no Select
+        bool pending = false;  // down and unresolved: withhold Select this frame
+        float progress = 0.0f; // 0..1 while down, 0 when not
+    };
+
+    Step update(bool down, double now_seconds) {
+        Step step;
+        if (down) {
+            if (!active_) {
+                active_ = true;
+                fired_ = false;
+                started_ = now_seconds;
+            }
+            const double held = std::max(0.0, now_seconds - started_);
+            progress_ = static_cast<float>(std::min(1.0, held / kRecentreHoldSeconds));
+            if (!fired_ && progress_ >= 1.0f) {
+                fired_ = true;
+                step.hold = true;
+            }
+        } else if (active_) {
+            // A release after the hold is silent: the hold already spent it.
+            step.tap = !fired_;
+            active_ = false;
+            fired_ = false;
+            progress_ = 0.0f;
+        }
+        step.pending = active_ && !fired_;
+        step.progress = progress_;
+        return step;
+    }
+
+    bool active() const { return active_; }
+    bool pending() const { return active_ && !fired_; }
+    float progress() const { return progress_; }
+
+    // The panel opened or closed: a press that straddles the edge is not a tap
+    // on the new screen (and not a recentre of a window that just appeared).
+    void reset() {
+        active_ = false;
+        fired_ = false;
+        started_ = 0.0;
+        progress_ = 0.0f;
+    }
 
 private:
     bool active_ = false;

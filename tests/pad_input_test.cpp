@@ -5,7 +5,8 @@
 // meaning (not by position), the sticks and triggers of both layouts mapped to
 // the viewer's motion (walk/rise/turn) and the scene's scale, the recentre
 // hold's timing (complete at 1 s, cancel before it, a short press does
-// nothing), and the per-frame OR of three devices. The console run is what
+// nothing), the panel's tap-or-hold (U2: a tap selects, a 1 s hold recentres
+// the window), and the per-frame OR of three devices. The console run is what
 // proves the reads themselves.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -196,11 +197,11 @@ TEST_CASE("viewer sticks and triggers map to the viewer control") {
     CHECK(both.scale == doctest::Approx(1.0f));
 
     // The scale factor doubles every kScaleDoubleSeconds at full trigger once
-    // the press has eased in, and does nothing at rest: 3 s of a full press is
-    // exactly 2x, half a press sqrt(2)x. The ease-in ramps the rate over the
+    // the press has eased in, and does nothing at rest: one kScaleDoubleSeconds
+    // of a full press is exactly 2x, half is sqrt(2)x. The ease-in ramps the rate over the
     // first kScaleEaseSeconds, so the first frame of a press moves nothing and
     // a short tap changes almost nothing.
-    CHECK(kScaleDoubleSeconds == doctest::Approx(3.0f));
+    CHECK(kScaleDoubleSeconds == doctest::Approx(1.5f));
     CHECK(scale_factor(0.0f, 1.5, 10.0) == doctest::Approx(1.0f));
     CHECK(scale_factor(1.0f, 0.0, 10.0) == doctest::Approx(1.0f));
     CHECK(scale_factor(1.0f, static_cast<double>(kScaleDoubleSeconds), 10.0) ==
@@ -351,8 +352,11 @@ TEST_CASE("viewer the panel action map is the UI v1 table") {
     // Options opens the menu now; it is no longer the scene path's quit bit.
     CHECK(ui_actions_for(kOptions) == splat::Menu);
     CHECK((ui_actions_for(kOptions) & splat::Menu) != 0);
-    // Triggers, sticks (as buttons), Create and the stick clicks have no action.
-    CHECK(ui_actions_for(kCreate | kL2 | kR2 | kL3 | kR3) == 0);
+    // Triggers and Create have no action; the two stick clicks are the panel's
+    // file-turn keys (L3/R3), the same on the photo picker and the scene shelf.
+    CHECK(ui_actions_for(kCreate | kL2 | kR2) == 0);
+    CHECK(ui_actions_for(kL3) == splat::RotateLeft);
+    CHECK(ui_actions_for(kR3) == splat::RotateRight);
     CHECK(ui_actions_for(0) == 0);
     // Two buttons at once give both actions, and every action bit is distinct.
     CHECK(ui_actions_for(kUp | kCross) == (splat::Up | splat::Select));
@@ -451,6 +455,73 @@ TEST_CASE("viewer Cross hold completes at one second and cancels early") {
     CHECK(step.progress == doctest::Approx(0.3f));
     step = hold.update(false, 22.5);
     CHECK(step.cancelled == true);
+}
+
+// U2: Cross inside the open panel is the panel's Select *and* the window's
+// recentre, so the press resolves on release: released before 1 s it is one tap
+// (one Select), held to the second it is one recentre and no Select at all.
+TEST_CASE("viewer Cross inside the panel is a tap or a hold, never both") {
+    using namespace viewer::pad;
+    TapHold tap;
+    CHECK_FALSE(tap.active());
+    CHECK_FALSE(tap.pending());
+
+    // A 0.3 s press: one tap on release, no hold, and Select is withheld while
+    // the press can still become either.
+    TapHold::Step step = tap.update(true, 10.0);
+    CHECK(step.pending);
+    CHECK_FALSE(step.tap);
+    CHECK_FALSE(step.hold);
+    CHECK(step.progress == doctest::Approx(0.0f));
+    step = tap.update(true, 10.3);
+    CHECK(step.pending);
+    CHECK(step.progress == doctest::Approx(0.3f));
+    step = tap.update(false, 10.3);
+    CHECK(step.tap);
+    CHECK_FALSE(step.hold);
+    CHECK_FALSE(step.pending);
+    CHECK(step.progress == doctest::Approx(0.0f));
+    CHECK_FALSE(tap.active());
+    // The release frame is the only tap; the next frame is silent.
+    step = tap.update(false, 10.4);
+    CHECK_FALSE(step.tap);
+
+    // A full second: one hold, no tap, even when it is released afterwards.
+    step = tap.update(true, 20.0);
+    CHECK(step.pending);
+    step = tap.update(true, 20.999);
+    CHECK(step.pending);
+    CHECK_FALSE(step.hold);
+    step = tap.update(true, 21.0);
+    CHECK(step.hold);
+    CHECK_FALSE(step.tap);
+    CHECK_FALSE(step.pending);  // spent: Select is no longer withheld for it
+    CHECK(step.progress == doctest::Approx(1.0f));
+    step = tap.update(true, 22.0);
+    CHECK_FALSE(step.hold);  // the hold fires once per press
+    CHECK(step.progress == doctest::Approx(1.0f));
+    step = tap.update(false, 22.1);
+    CHECK_FALSE(step.tap);  // a hold is never also a tap
+    CHECK_FALSE(step.hold);
+    CHECK_FALSE(tap.active());
+
+    // A second press after a tap works, with its own timing.
+    step = tap.update(true, 30.0);
+    CHECK(step.pending);
+    step = tap.update(false, 30.2);
+    CHECK(step.tap);
+
+    // The panel's open/close edge resets it: a press that straddles the edge is
+    // neither a tap on the new screen nor a recentre of the new window.
+    step = tap.update(true, 40.0);
+    CHECK(step.pending);
+    tap.reset();
+    CHECK_FALSE(tap.active());
+    CHECK_FALSE(tap.pending());
+    CHECK(tap.progress() == doctest::Approx(0.0f));
+    step = tap.update(false, 40.1);
+    CHECK_FALSE(step.tap);
+    CHECK_FALSE(step.hold);
 }
 
 // VR5-fix: the CSV's hold_progress column is the hold's 0..1 (the same value

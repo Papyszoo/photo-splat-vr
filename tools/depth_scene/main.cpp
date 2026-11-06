@@ -240,13 +240,18 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    splat::Result<std::vector<uint8_t>> file_bytes = splat::read_file_bytes(photo);
+    splat::Result<std::vector<uint8_t>> file_bytes =
+        splat::read_file_bytes(photo, splat::image::DecodeOptions{}.max_bytes);
     if (!file_bytes.ok()) {
         std::fprintf(stderr, "splat_depth_scene: %s\n", file_bytes.message().c_str());
         return 1;
     }
-    splat::Result<splat::Image> decoded = splat::decode_image(file_bytes.value().data(),
-                                                              file_bytes.value().size());
+    splat::image::DecodeOptions decode_options;
+    decode_options.hint = splat::image_format_from_extension(photo);
+    splat::image::DecodeInfo decode_info;
+    splat::Result<splat::Image> decoded =
+        splat::image::decode_photo(file_bytes.value().data(), file_bytes.value().size(),
+                                   decode_options, &decode_info);
     if (!decoded.ok()) {
         std::fprintf(stderr, "splat_depth_scene: cannot decode %s: %s\n", photo.c_str(),
                      decoded.message().c_str());
@@ -313,7 +318,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::vector<uint8_t> original_jpeg;
-    if (splat::looks_like_jpeg(file_bytes.value().data(), file_bytes.value().size())) {
+    if (splat::looks_like_jpeg(file_bytes.value().data(), file_bytes.value().size()) &&
+        decode_info.exif_orientation == 1) {
         original_jpeg = file_bytes.take();
     } else {
         splat::Result<std::vector<uint8_t>> encoded = splat::encode_jpeg(image);

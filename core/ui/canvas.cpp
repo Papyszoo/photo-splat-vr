@@ -436,6 +436,85 @@ void UiCanvas::blit_cover(int x, int y, int w, int h, const UiImage& image, int 
     }
 }
 
+void UiCanvas::blit_fit(int x, int y, int w, int h, const UiImage& image, int radius, Rgba plate) {
+    // No turn: the same contained draw the turned version uses (its quarter
+    // count 0 is the identity mapping).
+    blit_turned_fit(x, y, w, h, 0, image, radius, plate);
+}
+
+void UiCanvas::blit_turned_fit(int x, int y, int w, int h, int quarters, const UiImage& image,
+                               int radius, Rgba plate) {
+    dirty_ = true;
+    if (w <= 0 || h <= 0 || image.empty()) return;
+    const int turns = ((quarters % 4) + 4) % 4;
+    // The plate shows through the letterbox a fitted picture leaves on the
+    // long side of the tile.
+    fill_round_rect(x, y, w, h, radius, plate);
+
+    // The turned image's own dimensions: a quarter turn swaps width and height.
+    const int source_w = static_cast<int>(image.w);
+    const int source_h = static_cast<int>(image.h);
+    const int turned_w = (turns % 2) != 0 ? source_h : source_w;
+    const int turned_h = (turns % 2) != 0 ? source_w : source_h;
+    const float scale = std::min(static_cast<float>(w) / static_cast<float>(turned_w),
+                                 static_cast<float>(h) / static_cast<float>(turned_h));
+    const int draw_w = std::max(1, static_cast<int>(std::lround(turned_w * scale)));
+    const int draw_h = std::max(1, static_cast<int>(std::lround(turned_h * scale)));
+    const int left = x + (w - draw_w) / 2;
+    const int top = y + (h - draw_h) / 2;
+    // The picture is clipped to the plate's rounded box, like blit_cover: a
+    // fitted photo can reach the box edges (a landscape picture wider than the
+    // tile spans its full width), and it must keep the tile's rounded corners
+    // instead of painting over them.
+    const int r = clamp_radius(radius, w, h);
+
+    for (int row = top; row < top + draw_h; ++row) {
+        if (row < 0 || row >= static_cast<int>(height_)) continue;
+        const bool straight = row >= y + r && row < y + h - r;
+        // Continuous coordinates in the turned image.
+        const float tv = (static_cast<float>(row - top) + 0.5f) *
+                             static_cast<float>(turned_h) / static_cast<float>(draw_h) -
+                         0.5f;
+        for (int col = left; col < left + draw_w; ++col) {
+            if (col < 0 || col >= static_cast<int>(width_)) continue;
+            float coverage = 1.0f;
+            if (!straight && (col < x + r || col >= x + w - r)) {
+                coverage = clamp01(0.5f - round_box_distance(
+                                              static_cast<float>(col) + 0.5f,
+                                              static_cast<float>(row) + 0.5f, static_cast<float>(x),
+                                              static_cast<float>(y), static_cast<float>(w),
+                                              static_cast<float>(h), static_cast<float>(r)));
+                if (coverage <= 0.0f) continue;
+            }
+            const float tu = (static_cast<float>(col - left) + 0.5f) *
+                                 static_cast<float>(turned_w) / static_cast<float>(draw_w) -
+                             0.5f;
+            // The inverse of a clockwise quarter turn, one case per turn: the
+            // turned pixel (tu, tv) is the source pixel (u, v).
+            float u = tu;
+            float v = tv;
+            switch (turns) {
+                case 1:  // 90 clockwise: turned (0,0) is source (0, h-1)
+                    u = tv;
+                    v = static_cast<float>(source_h - 1) - tu;
+                    break;
+                case 2:
+                    u = static_cast<float>(source_w - 1) - tu;
+                    v = static_cast<float>(source_h - 1) - tv;
+                    break;
+                case 3:  // 270 clockwise (90 counter-clockwise)
+                    u = static_cast<float>(source_w - 1) - tv;
+                    v = tu;
+                    break;
+                default: break;
+            }
+            const Rgba color{sample_bilinear(image, u, v, 0), sample_bilinear(image, u, v, 1),
+                             sample_bilinear(image, u, v, 2), sample_bilinear(image, u, v, 3)};
+            cover_impl(col, row, color, coverage);
+        }
+    }
+}
+
 void UiCanvas::bar(int x, int y, int w, int h, float frac, Rgba track, Rgba fill) {
     dirty_ = true;
     if (w <= 0 || h <= 0) return;

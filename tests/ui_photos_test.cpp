@@ -6,9 +6,11 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -18,6 +20,7 @@
 #include <chrono>
 #include <thread>
 
+#include "common/exif.h"
 #include "common/image.h"
 #include "common/path.h"
 #include "gallery/photo_sources.h"
@@ -25,6 +28,8 @@
 #include "test_util.h"
 #include "ui/fakes.h"
 #include "ui/screens/convert_dialog.h"
+#include "ui/screens/keyboard.h"
+#include "ui/screens/location_edit.h"
 #include "ui/screens/photos.h"
 #include "ui/screen_stack.h"
 
@@ -58,6 +63,38 @@ splat::UiInput press(uint32_t action) {
     splat::UiInput input;
     input.pressed = action;
     return input;
+}
+
+// The location editor's row for a field (Save is the last row, so the scan can
+// stop there).
+int row_of(const splat::LocationEditScreen& screen, splat::LocationEditScreen::Field field) {
+    for (int row = 0; row < 32; ++row) {
+        const splat::LocationEditScreen::Field at = screen.field_at(row);
+        if (at == field) return row;
+        if (at == splat::LocationEditScreen::Field::Save) break;
+    }
+    return -1;
+}
+
+// Types `text` on the free-text keyboard and presses OK, the way the pad does.
+void type_ok(splat::KeyboardScreen& keyboard, splat::UiContext& context, const std::string& text) {
+    for (const char c : text) {
+        int index = -1;
+        for (int i = 0; i < static_cast<int>(keyboard.keys().size()); ++i) {
+            const splat::KeyboardKey& key = keyboard.keys()[static_cast<std::size_t>(i)];
+            if (key.kind == splat::KeyboardKey::Kind::Character && key.character == c) index = i;
+        }
+        REQUIRE_MESSAGE(index >= 0, "no key for " << c);
+        keyboard.focus_key(index);
+        keyboard.update(context, press(splat::Select));
+    }
+    int ok = -1;
+    for (int i = 0; i < static_cast<int>(keyboard.keys().size()); ++i) {
+        if (keyboard.keys()[static_cast<std::size_t>(i)].kind == splat::KeyboardKey::Kind::Ok) ok = i;
+    }
+    REQUIRE(ok >= 0);
+    keyboard.focus_key(ok);
+    keyboard.update(context, press(splat::Select));
 }
 
 bool has_hint(const std::vector<splat::Hint>& hints, const std::string& button,
@@ -152,7 +189,7 @@ TEST_CASE("ui_photos lists the sources and toggles the selection") {
 
     fixture.update(press(splat::Select));
     REQUIRE(fixture.screen.selection().size() == 1);
-    CHECK(fixture.screen.selection()[0] == listed[0].path);
+    CHECK(fixture.screen.selection()[0].path == listed[0].path);
     CHECK(fixture.screen.selected(listed[0].path));
     CHECK(has_hint(fixture.screen.hints(), "Square", "Convert (1)"));
     fixture.idle();
@@ -169,7 +206,7 @@ TEST_CASE("ui_photos lists the sources and toggles the selection") {
     fixture.update(press(splat::Right));
     fixture.update(press(splat::Select));
     REQUIRE(fixture.screen.selection().size() == 1);
-    CHECK(fixture.screen.selection()[0] == listed[1].path);
+    CHECK(fixture.screen.selection()[0].path == listed[1].path);
     CHECK(has_hint(fixture.screen.hints(), "Square", "Convert (1)"));
 
     // Drawing paints the tabs, the tiles and the check mark.
@@ -200,7 +237,7 @@ TEST_CASE("ui_photos refuses an HDR capture and says why") {
     fixture.update(press(splat::Left));
     fixture.update(press(splat::Select));
     REQUIRE(fixture.screen.selection().size() == 1);
-    CHECK(fixture.screen.selection()[0] == fixture.capture_root / "capture_03.jpg");
+    CHECK(fixture.screen.selection()[0].path == fixture.capture_root / "capture_03.jpg");
 }
 
 TEST_CASE("ui_photos switches tabs and drops a vanished USB source") {
@@ -349,19 +386,128 @@ TEST_CASE("ui_photos opens the convert dialog with the basket") {
     auto* dialog = dynamic_cast<splat::ConvertDialog*>(fixture.stack.top());
     REQUIRE(dialog != nullptr);
     CHECK(dialog->photos().size() == 2);
-    CHECK(dialog->photos()[0] == fixture.screen.selection()[0]);
+    CHECK(dialog->photos()[0] == fixture.screen.selection()[0].path);
     // The photos go to the folder the picker was opened from.
     CHECK(dialog->album() == "trip");
 }
 
-TEST_CASE("ui_photos square without a selection says what to do") {
+TEST_CASE("ui_photos L3/R3 turns a JPEG by rewriting its orientation tag") {
     Fixture fixture;
     write_jpeg(fixture.inbox / "a.jpg", 10);
+    const Path photo = fixture.inbox / "a.jpg";
+    const std::vector<uint8_t> original = [&photo] {
+        std::ifstream in(photo, std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+    }();
     fixture.enter();
-    fixture.update(press(splat::Secondary));
-    CHECK(fixture.stack.empty());
+    fixture.idle();
+
+    // The same two keys as the Scenes shelf, and Square is not the turn.
+    CHECK(has_hint(fixture.screen.hints(), "L3", "Rotate left"));
+    CHECK(has_hint(fixture.screen.hints(), "R3", "Rotate right"));
+    CHECK_FALSE(has_hint(fixture.screen.hints(), "Square", "Rotate 90\xC2\xB0"));
+
+    // A JPEG can be rewritten: the source file's Orientation tag changes and no
+    // in-memory turn is kept, so a conversion cannot apply the turn twice.
+    fixture.update(press(splat::RotateRight));
     REQUIRE_FALSE(fixture.toasts.empty());
-    CHECK(fixture.toasts.back() == "Select photos with Cross first");
+    CHECK(fixture.toasts.back() == "Rotated a right (file updated)");
+    CHECK(fixture.screen.focused_quarters() == 0);
+    std::ifstream in(photo, std::ios::binary);
+    const std::vector<uint8_t> turned((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+    CHECK(turned != original);
+    CHECK(turned.size() > original.size());  // a tag was added, no pixel re-encode
+    const auto exif = splat::parse_exif(turned.data(), turned.size());
+    REQUIRE_MESSAGE(exif.ok(), exif.message());
+    CHECK(exif.value().orientation.value_or(1) == 6);   // 90 clockwise
+    // The image bytes after the APP1 segment are untouched: the original JPEG's
+    // SOI..EOI payload still follows it.
+    CHECK(std::search(turned.begin(), turned.end(), original.begin() + 2, original.end()) !=
+          turned.end());
+
+    // Left once restores the original orientation.
+    fixture.update(press(splat::RotateLeft));
+    CHECK(fixture.toasts.back() == "Rotated a left (file updated)");
+    const std::vector<uint8_t> restored = [&photo] {
+        std::ifstream back(photo, std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(back)),
+                                    std::istreambuf_iterator<char>());
+    }();
+    const auto restored_exif = splat::parse_exif(restored.data(), restored.size());
+    REQUIRE_MESSAGE(restored_exif.ok(), restored_exif.message());
+    CHECK(restored_exif.value().orientation.value_or(1) == 1);
+
+    // Four right presses cycle 6, 3, 8, 1: upright again, still no saved turn.
+    for (int i = 0; i < 4; ++i) fixture.update(press(splat::RotateRight));
+    CHECK(fixture.toasts.back() == "Rotated a right (file updated)");
+    CHECK(fixture.screen.focused_quarters() == 0);
+    fixture.idle();
+    REQUIRE(fixture.screen.grid().cells().size() == 1);
+    CHECK(fixture.screen.grid().cells()[0].turn_quarters == 0);
+
+    // The basket carries 0 for a rewritten file: the tag is the turn.
+    fixture.update(press(splat::Select));
+    REQUIRE(fixture.screen.selection().size() == 1);
+    CHECK(fixture.screen.selection()[0].rotate_quarters == 0);
+    CHECK(has_hint(fixture.screen.hints(), "Square", "Convert (1)"));
+    fixture.update(press(splat::Secondary));
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::ConvertDialog);
+    auto* dialog = dynamic_cast<splat::ConvertDialog*>(fixture.stack.top());
+    REQUIRE(dialog != nullptr);
+    REQUIRE(dialog->picks().size() == 1);
+    CHECK(dialog->picks()[0].rotate_quarters == 0);
+}
+
+TEST_CASE("ui_photos keeps a turn for a file it cannot rewrite, across a relaunch") {
+    Fixture fixture;
+    // A PNG has no Orientation tag writer here: the source is left alone and
+    // the turn is stored in <state>/photo-turns.json.
+    std::vector<uint8_t> rgba(8 * 4 * 4, 120);
+    const auto encoded = splat::encode_png(rgba.data(), 8, 4);
+    REQUIRE_MESSAGE(encoded.ok(), encoded.message());
+    std::filesystem::create_directories(fixture.inbox);
+    {
+        std::ofstream out(fixture.inbox / "a.png", std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(encoded.value().data()),
+                  static_cast<std::streamsize>(encoded.value().size()));
+    }
+    const std::vector<uint8_t> original = [&fixture] {
+        std::ifstream in(fixture.inbox / "a.png", std::ios::binary);
+        return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+    }();
+    fixture.enter();
+    fixture.idle();
+
+    fixture.update(press(splat::RotateRight));
+    REQUIRE_FALSE(fixture.toasts.empty());
+    CHECK(fixture.toasts.back() == "Rotated a right; the file itself was not changed");
+    CHECK(fixture.screen.focused_quarters() == 1);
+    fixture.idle();
+    REQUIRE(fixture.screen.grid().cells().size() == 1);
+    CHECK(fixture.screen.grid().cells()[0].turn_quarters == 1);
+    // The source bytes are untouched.
+    std::ifstream in(fixture.inbox / "a.png", std::ios::binary);
+    const std::vector<uint8_t> after((std::istreambuf_iterator<char>(in)),
+                                     std::istreambuf_iterator<char>());
+    CHECK(after == original);
+    // And the saved turn goes into the basket, which is what the conversion
+    // applies (one quarter, not two).
+    fixture.update(press(splat::Select));
+    REQUIRE(fixture.screen.selection().size() == 1);
+    CHECK(fixture.screen.selection()[0].rotate_quarters == 1);
+
+    // A relaunch: a fresh screen over the same state directory reads the turn
+    // back from disk. The drawn turn and the basket both follow.
+    splat::PhotosScreen relaunched;
+    splat::UiContext context{fixture.services, fixture.theme, fixture.stack};
+    context.content = splat::Rect{16, 78, 1248, 586};
+    splat::ScreenArgs args;
+    args.a = "trip";
+    relaunched.on_enter(context, args);
+    CHECK(relaunched.focused_quarters() == 1);
 }
 
 TEST_CASE("ui_photos browses console folders") {
@@ -426,7 +572,7 @@ TEST_CASE("ui_photos browses console folders") {
     fixture.update(press(splat::Right));
     fixture.update(press(splat::Select));
     REQUIRE(fixture.screen.selection().size() == 1);
-    CHECK(fixture.screen.selection()[0] == data / "photos" / "A.png");
+    CHECK(fixture.screen.selection()[0].path == data / "photos" / "A.png");
 
     // Circle goes up a folder (the screen keeps it), focusing the folder we
     // came from; from a root back to the list of places; then it leaves.
@@ -460,3 +606,151 @@ TEST_CASE("ui_photos browses console folders") {
     CHECK_FALSE(fixture.screen.handle_back(fixture.context));
 }
 
+
+TEST_CASE("ui_photos the last tab adds a network location") {
+    Fixture fixture;
+    splat::FakeLocationService locations;
+    fixture.services.locations = &locations;
+    fixture.registry.add(splat::ScreenId::Photos,
+                         [] { return std::make_unique<splat::PhotosScreen>(); });
+    fixture.registry.add(splat::ScreenId::LocationEdit,
+                         [] { return std::make_unique<splat::LocationEditScreen>(); });
+    fixture.registry.add(splat::ScreenId::Keyboard,
+                         [] { return std::make_unique<splat::KeyboardScreen>(); });
+
+    // The screen lives in the stack so the editor's return is a real reveal.
+    splat::ScreenArgs args;
+    args.a = "trip";
+    REQUIRE(fixture.stack.push(splat::ScreenId::Photos, args));
+    auto* photos = static_cast<splat::PhotosScreen*>(fixture.stack.top());
+    photos->update(fixture.context, splat::UiInput{});
+
+    // Inbox, Console, USB, Captures, the photo location, then the add tab.
+    std::vector<std::string> ids;
+    for (const splat::PhotoTab& tab : photos->tabs()) ids.push_back(tab.id);
+    REQUIRE(ids.size() == 6);
+    CHECK(ids[0] == "inbox");
+    CHECK(ids[1] == "console");
+    CHECK(ids[2] == "usb");
+    CHECK(ids[3] == "captures");
+    CHECK(ids[4] == "smb0");
+    CHECK(ids[5] == "add_location");
+    CHECK(photos->tabs()[5].title == std::string(splat::PhotosScreen::kAddLocationLabel));
+    CHECK(photos->tabs()[5].add_location);
+
+    // The tab lists nothing and says what it does; Cross is the action.
+    photos->set_tab(fixture.context, 5);
+    CHECK(photos->message() == splat::PhotosScreen::kAddLocationHint);
+    CHECK(photos->grid().cells().empty());
+    const std::vector<splat::Hint> hints = photos->hints();
+    REQUIRE(hints.size() == 2);
+    CHECK(hints[0].button == "Cross");
+    CHECK(hints[0].label == "Add network location");
+
+    // Cross pushes the editor with an empty id (a new location).
+    photos->update(fixture.context, press(splat::Select));
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::LocationEdit);
+    auto* edit = static_cast<splat::LocationEditScreen*>(fixture.stack.top());
+    CHECK(edit->title() == "Add location");
+    CHECK(edit->draft().id.empty());
+    // The picker's own add starts as a photo source: that is the row this
+    // screen exists for, and leaving it off is the bug this test drives out.
+    CHECK(edit->draft().photo_source);
+    CHECK(edit->list().rows()[static_cast<std::size_t>(
+                 row_of(*edit, splat::LocationEditScreen::Field::PhotoSource))]
+                 .right == "On");
+
+    // Type Host and Share on the panel keyboard, then Cross on Save: nothing
+    // else is touched, so the saved row is what the defaults say.
+    edit->activate(fixture.context, row_of(*edit, splat::LocationEditScreen::Field::Host));
+    auto* keyboard = static_cast<splat::KeyboardScreen*>(fixture.stack.top());
+    REQUIRE(keyboard != nullptr);
+    type_ok(*keyboard, fixture.context, "nas2.local");
+    CHECK(edit->draft().host == "nas2.local");
+    edit->activate(fixture.context, row_of(*edit, splat::LocationEditScreen::Field::Share));
+    keyboard = static_cast<splat::KeyboardScreen*>(fixture.stack.top());
+    REQUIRE(keyboard != nullptr);
+    type_ok(*keyboard, fixture.context, "family");
+    CHECK(edit->draft().share == "family");
+    edit->activate(fixture.context, row_of(*edit, splat::LocationEditScreen::Field::Save));
+    // Save popped the editor, which reveals the picker: on_enter -> refresh.
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::Photos);
+    const std::vector<splat::LocationView> listed = locations.list();
+    REQUIRE(listed.size() == 3);
+    const splat::LocationView& added_row = listed.back();
+    CHECK(added_row.host == "nas2.local");
+    CHECK(added_row.share == "family");
+    CHECK(added_row.photo_source);
+
+    photos = static_cast<splat::PhotosScreen*>(fixture.stack.top());
+    int added = -1;
+    for (std::size_t index = 0; index < photos->tabs().size(); ++index) {
+        if (photos->tabs()[index].id == added_row.id) added = static_cast<int>(index);
+    }
+    CHECK_MESSAGE(added >= 0, "saving from the add tab left no tab for the new share");
+    if (added >= 0) CHECK(photos->tabs()[static_cast<std::size_t>(added)].title == "nas2.local/family");
+    // Still one terminal add tab, now after the new source.
+    CHECK(photos->tabs().back().add_location);
+}
+
+TEST_CASE("ui_photos the tab strip stays inside the content rect and follows the focus") {
+    Fixture fixture;
+    splat::FakeLocationService locations;
+    for (int index = 0; index < 6; ++index) {
+        splat::LocationView draft;
+        draft.name = "share" + std::to_string(index);
+        draft.host = "nas" + std::to_string(index) + ".local";
+        draft.share = "Photos";
+        draft.photo_source = true;
+        std::string id;
+        REQUIRE(locations.add(draft, &id).ok());
+    }
+    fixture.services.locations = &locations;
+    fixture.enter();
+    REQUIRE(fixture.screen.tabs().size() >= 10);
+
+    // A narrow one keeps every rect inside the content rect and always draws the
+    // focused tab, scrolling by whole tabs.
+    const splat::Rect narrow{16, 78, 420, 586};
+    fixture.screen.set_tab(fixture.context, static_cast<int>(fixture.screen.tabs().size()) - 1);
+    const std::vector<splat::Rect> rects = fixture.screen.tab_rects(narrow, fixture.theme);
+    const int first = fixture.screen.tab_first(narrow, fixture.theme);
+    REQUIRE_FALSE(rects.empty());
+    CHECK(first > 0);
+    CHECK(first <= fixture.screen.tab());
+    CHECK(fixture.screen.tab() < first + static_cast<int>(rects.size()));
+    for (const splat::Rect& rect : rects) {
+        CHECK(rect.x >= narrow.x);
+        CHECK(rect.right() <= narrow.right());
+        CHECK(rect.h > 0);
+    }
+    // Drawing the same strip is what the screen does every frame.
+    fixture.screen.draw(fixture.context, fixture.canvas, narrow);
+
+    // The left end starts at tab 0 and, with this many tabs, still overflows the
+    // wide strip by whole tabs (never by a clipped one).
+    fixture.screen.set_tab(fixture.context, 0);
+    CHECK(fixture.screen.tab_first(fixture.context.content, fixture.theme) == 0);
+    const std::vector<splat::Rect> from_zero =
+        fixture.screen.tab_rects(fixture.context.content, fixture.theme);
+    CHECK_FALSE(from_zero.empty());
+    CHECK(from_zero.size() < fixture.screen.tabs().size());
+    for (const splat::Rect& rect : from_zero) {
+        CHECK(rect.x >= fixture.context.content.x);
+        CHECK(rect.right() <= fixture.context.content.right());
+    }
+}
+
+TEST_CASE("ui_photos every tab fits on a wide strip") {
+    Fixture fixture;
+    fixture.enter();
+    REQUIRE(fixture.screen.tabs().size() == 4);
+    const std::vector<splat::Rect> rects =
+        fixture.screen.tab_rects(fixture.context.content, fixture.theme);
+    REQUIRE(rects.size() == fixture.screen.tabs().size());
+    CHECK(fixture.screen.tab_first(fixture.context.content, fixture.theme) == 0);
+    for (const splat::Rect& rect : rects) {
+        CHECK(rect.x >= fixture.context.content.x);
+        CHECK(rect.right() <= fixture.context.content.right());
+    }
+}

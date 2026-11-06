@@ -1,11 +1,10 @@
 #include "gallery/thumbs.h"
 
 #include <cstddef>
-#include <filesystem>
-#include <system_error>
 
 #include "jobs/image_io.h"
 #include "scene/scene_folder.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -27,7 +26,11 @@ RgbaImage to_rgba(const Image& image) {
 Result<RgbaImage> load_fitted(const Path& path, int max_edge) {
     if (max_edge <= 0) return Result<RgbaImage>::failure("thumbnail edge must be positive");
 
-    const Result<Image> decoded = decode_image(path);
+    // The bytes come through the VFS, so a thumbnail of a scene on a network
+    // location decodes exactly like a local one.
+    const Result<std::vector<uint8_t>> bytes = vfs::read_file(path);
+    if (!bytes.ok()) return Result<RgbaImage>::failure(bytes.message());
+    const Result<Image> decoded = decode_image(bytes.value().data(), bytes.value().size());
     if (!decoded.ok()) return Result<RgbaImage>::failure(decoded.message());
 
     const Result<Image> fitted = make_thumbnail(decoded.value(), max_edge);
@@ -43,8 +46,8 @@ Result<RgbaImage> load_photo_thumb(const Path& path, int max_edge) {
 
 Result<RgbaImage> load_scene_thumb(const Path& folder, int max_edge) {
     const Path thumb = scene_files(folder).thumbnail;
-    std::error_code error;
-    if (!std::filesystem::is_regular_file(thumb, error) || error) {
+    vfs::FileStat status;
+    if (!vfs::stat(thumb, &status).ok() || !status.regular) {
         return Result<RgbaImage>::failure("scene has no thumb.jpg: " + folder.string());
     }
     return load_fitted(thumb, max_edge);

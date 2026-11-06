@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "vfs/io.h"
+
 namespace splat {
 namespace {
 
@@ -82,15 +84,25 @@ std::vector<std::string> split_words(const std::string& line) {
     return words;
 }
 
-Status read_ply_header(std::ifstream& file, PlyHeader& header) {
+Status read_ply_header(const std::vector<uint8_t>& bytes, PlyHeader& header) {
+    size_t position = 0;
+    const auto next_line = [&bytes, &position](std::string* line) {
+        if (position >= bytes.size()) return false;
+        size_t end = position;
+        while (end < bytes.size() && bytes[end] != '\n') ++end;
+        line->assign(reinterpret_cast<const char*>(bytes.data()) + position, end - position);
+        position = end < bytes.size() ? end + 1 : bytes.size();
+        return true;
+    };
+
     std::string line;
-    if (!std::getline(file, line)) return Status::error("empty .ply");
+    if (!next_line(&line)) return Status::error("empty .ply");
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line != "ply") return Status::error("not a .ply (missing magic)");
 
     bool have_format = false;
     bool header_done = false;
-    while (std::getline(file, line)) {
+    while (next_line(&line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const std::vector<std::string> words = split_words(line);
         if (words.empty()) continue;
@@ -132,17 +144,22 @@ Status read_ply_header(std::ifstream& file, PlyHeader& header) {
     if (!have_format) return Status::error(".ply header has no format line");
     if (header.elements.empty()) return Status::error(".ply has no elements");
 
-    const std::streamoff data_offset = file.tellg();
-    if (data_offset < 0) return Status::error("cannot determine .ply data offset");
-    header.data_offset = data_offset;
+    header.data_offset = static_cast<std::streamoff>(position);
     return Status::success();
+}
+
+// The whole file, read through the VFS: a .ply on a network location parses
+// exactly like a local one.
+Result<std::vector<uint8_t>> read_ply_file(const Path& path) {
+    return vfs::read_file(path);
 }
 
 }  // namespace
 
-Status import_ply(const Path& path, SplatScene& scene) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return Status::error("cannot open " + path.string());
+Status import_ply(const Path& path, SplatScene& scene, uint32_t max_splats) {
+    const Result<std::vector<uint8_t>> bytes = read_ply_file(path);
+    if (!bytes.ok()) return Status::error("cannot open " + path.string());
+    const std::vector<uint8_t>& file = bytes.value();
 
     PlyHeader header;
     const Status parsed = read_ply_header(file, header);
@@ -152,6 +169,13 @@ Status import_ply(const Path& path, SplatScene& scene) {
     if (vertex == nullptr) return Status::error(".ply has no vertex element");
     if (header.elements.empty() || header.elements.front().name != "vertex") {
         return Status::error(".ply vertex element must come first");
+    }
+    // The declared count is known from the header, so an oversized file is
+    // refused before the vertex block (56+ bytes per vertex) is allocated.
+    if (max_splats != 0 && vertex->count > max_splats) {
+        return Status::error(".ply declares " + std::to_string(vertex->count) +
+                             " splats, above the " + std::to_string(max_splats) +
+                             "-splat import limit");
     }
 
     static const std::array<const char*, 14> kRequired{{
@@ -171,18 +195,12 @@ Status import_ply(const Path& path, SplatScene& scene) {
     }
     const size_t data_bytes = vertex->count * vertex->stride;
 
-    file.seekg(0, std::ios::end);
-    const std::streamoff file_size = file.tellg();
-    if (file_size < header.data_offset ||
-        static_cast<size_t>(file_size - header.data_offset) < data_bytes) {
+    const std::uintmax_t data_offset = static_cast<std::uintmax_t>(header.data_offset);
+    if (file.size() < data_offset || file.size() - data_offset < data_bytes) {
         return Status::error(".ply vertex data is truncated");
     }
-    file.seekg(header.data_offset, std::ios::beg);
-    std::vector<uint8_t> data(data_bytes);
-    if (data_bytes > 0) {
-        file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data_bytes));
-        if (!file) return Status::error("failed while reading .ply vertex data");
-    }
+    const uint8_t* data = file.data() + data_offset;
+
 
     scene.resize(vertex->count);
     const PlyProperty* x = vertex->find("x");
@@ -201,7 +219,7 @@ Status import_ply(const Path& path, SplatScene& scene) {
     const PlyProperty* rot3 = vertex->find("rot_3");
 
     for (size_t i = 0; i < vertex->count; ++i) {
-        const uint8_t* row = data.data() + i * vertex->stride;
+        const uint8_t* row = data + i * vertex->stride;
         scene.position[i * 3 + 0] = load_f32(row + x->offset);
         scene.position[i * 3 + 1] = load_f32(row + y->offset);
         scene.position[i * 3 + 2] = load_f32(row + z->offset);
@@ -282,15 +300,16 @@ Status export_ply(const Path& path, const SplatScene& scene) {
 }
 
 Result<Intrinsics> read_ply_intrinsics(const Path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return Result<Intrinsics>::failure("cannot open " + path.string());
+    const Result<std::vector<uint8_t>> bytes = read_ply_file(path);
+    if (!bytes.ok()) return Result<Intrinsics>::failure("cannot open " + path.string());
+    const std::vector<uint8_t>& file = bytes.value();
 
     PlyHeader header;
     const Status parsed = read_ply_header(file, header);
     if (!parsed.ok()) return Result<Intrinsics>::failure(parsed.message());
 
     Intrinsics out;
-    std::streamoff offset = header.data_offset;
+    std::uintmax_t offset = static_cast<std::uintmax_t>(header.data_offset);
     for (const PlyElement& element : header.elements) {
         const bool is_float = element.properties.size() == 1 &&
                               is_float_type(element.properties.front().type);
@@ -299,8 +318,8 @@ Result<Intrinsics> read_ply_intrinsics(const Path& path) {
         if (element.name == "intrinsic" && is_float && element.count == 9 &&
             element.stride == sizeof(float)) {
             float values[9] = {};
-            file.seekg(offset, std::ios::beg);
-            if (file.read(reinterpret_cast<char*>(values), sizeof(values))) {
+            if (offset + sizeof(values) <= file.size()) {
+                std::memcpy(values, file.data() + offset, sizeof(values));
                 out.fx = values[0];
                 out.cx = values[2];
                 out.fy = values[4];
@@ -310,8 +329,8 @@ Result<Intrinsics> read_ply_intrinsics(const Path& path) {
                    element.stride == sizeof(uint32_t) && element.properties.size() == 1 &&
                    element.properties.front().type == "uint") {
             uint32_t size[2] = {};
-            file.seekg(offset, std::ios::beg);
-            if (file.read(reinterpret_cast<char*>(size), sizeof(size))) {
+            if (offset + sizeof(size) <= file.size()) {
+                std::memcpy(size, file.data() + offset, sizeof(size));
                 out.width = size[0];
                 out.height = size[1];
             }
@@ -319,7 +338,7 @@ Result<Intrinsics> read_ply_intrinsics(const Path& path) {
         if (element.count != 0 && element.stride > (size_t(-1) / element.count)) {
             return Result<Intrinsics>::failure(".ply element sizes overflow");
         }
-        offset += static_cast<std::streamoff>(element.count * element.stride);
+        offset += element.count * element.stride;
     }
 
     // A .ply without SHARP's extra elements (or with a nonsensical one) simply

@@ -1,0 +1,49 @@
+# A3.1/A3.2/A3.6: a network location, listed and opened, with no copy.
+#
+# The driver pushes state/locations.json before the run (console-run.sh), so
+# nothing is typed on the on-panel keyboard here: the case is about the mount,
+# the listing and the open.
+#
+# Home -> Options (Settings, depth 2) -> eight rows down to "Network locations"
+# (Scale around, Move speed, Turn speed, Edge softness, Blending, Models,
+# Conversions, **Network locations**) -> Cross opens the Locations screen.
+#
+# The first row is the configured location. Cross opens it as a library root
+# (Scenes over the share); tile 0 is "+ Add photos" and tile 1 is the scene the
+# SMB save uploaded (the NFS export is seeded with the same folder). One Right,
+# then Cross, opens it in place. A remote scene is opened with OpenPath, so the
+# line the app writes is the "opened from <id>" one:
+#
+#   viewer: location smb0 ready                     (the mount probe)
+#   viewer: tv scene <name> (opened from smb0)      (opened from the share)
+#
+# (There is no "(album smb0:/...)" line: that form is only written for a local
+# album. The old expectation asked for it and could never pass.)
+#
+# The location's Path is an empty sub-folder of the share (the driver makes it),
+# so the library root holds no scenes of its own and the tile order is stable.
+# No "copying" wait: the scene is read through the adapter, never written under
+# the title's data folder.
+0.5  mark home
+0.8  press Options
+1.6  shot settings
+2.0  press Down
+2.35 press Down
+2.70 press Down
+3.05 press Down
+3.40 press Down
+3.75 press Down
+4.10 press Down
+4.45 press Down
+4.60 press Cross
+5.4  shot locations
+8.0  shot locations-ready
+8.6  press Cross
+10.0 shot library
+10.8 press Right
+11.4 press Cross
+16.0 shot remote-scene
+17.0 press Circle
+18.0 press Circle
+19.0 press Circle
+20.0 quit

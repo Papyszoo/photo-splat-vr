@@ -8,7 +8,9 @@
 #include <utility>
 
 #include "ui/button_glyph.h"
+#include "ui/screen.h"
 #include "ui/text_fit.h"
+#include "ui/ui_state.h"
 #include "ui/widgets.h"
 
 namespace splat {
@@ -29,6 +31,20 @@ constexpr float kBayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13,
 
 }  // namespace
 
+int UiContext::thumbnail_size() const {
+    return svc.state != nullptr ? clamp_thumbnail_size(svc.state->thumbnail_size)
+                                : kThumbnailSizeDefault;
+}
+
+Rect panel_content_rect(const UiTheme& theme, uint32_t canvas_width, uint32_t canvas_height) {
+    // The chrome bands scale with the theme too (VR9): the VR panel's 0.7 theme
+    // puts the title and the content area at the same physical place as the TV's.
+    const int content_top = theme.scaled(kContentTop);
+    const int hint_band = theme.scaled(kHintBand);
+    return Rect{theme.margin, content_top, static_cast<int>(canvas_width) - 2 * theme.margin,
+                static_cast<int>(canvas_height) - content_top - hint_band};
+}
+
 UiApp::UiApp(UiServices& services, UiTheme theme)
     : services_(services),
       theme_(theme),
@@ -46,12 +62,7 @@ UiApp::UiApp(UiServices& services, UiTheme theme)
 }
 
 Rect UiApp::content_rect(uint32_t canvas_width, uint32_t canvas_height) const {
-    // The chrome bands scale with the theme too (VR9): the VR panel's 0.7 theme
-    // puts the title and the content area at the same physical place as the TV's.
-    const int content_top = theme_.scaled(kContentTop);
-    const int hint_band = theme_.scaled(kHintBand);
-    return Rect{theme_.margin, content_top, static_cast<int>(canvas_width) - 2 * theme_.margin,
-                static_cast<int>(canvas_height) - content_top - hint_band};
+    return panel_content_rect(theme_, canvas_width, canvas_height);
 }
 
 void UiApp::start() {
@@ -67,6 +78,7 @@ void UiApp::tick_services(double dt) {
     if (services_.jobs != nullptr) services_.jobs->tick(dt);
     if (services_.models != nullptr) services_.models->tick(dt);
     if (services_.captures != nullptr) services_.captures->tick(dt);
+    if (services_.locations != nullptr) services_.locations->tick(dt);
 }
 
 void UiApp::update_toast(double dt) {
@@ -121,7 +133,8 @@ void UiApp::update(const UiInput& input) {
         pointer_valid_ = false;
     }
     // A running job animates its progress, about 4 times per second.
-    const bool busy = services_.jobs != nullptr && services_.jobs->busy();
+    const bool busy = (services_.jobs != nullptr && services_.jobs->busy()) ||
+                      (services_.locations != nullptr && services_.locations->busy());
     if (busy) {
         busy_redraw_ += input.dt;
         if (busy_redraw_ >= 0.25) {
@@ -146,6 +159,28 @@ void UiApp::update(const UiInput& input) {
     }
     handle_navigation(input, local);
     nav_.update(context_, local);
+    log_screen_change();
+    log_toast_change();
+}
+
+void UiApp::log_screen_change() {
+    if (services_.log == nullptr || nav_.empty()) return;
+    const ScreenId top = nav_.top_id();
+    if (logged_screen_.has_value() && *logged_screen_ == top) return;
+    logged_screen_ = top;
+    // Depth too: a script that opens the same screen twice (Settings from the
+    // panel, then again from a dialog) is told apart by the stack size.
+    services_.log(std::string("ui: screen ") + screen_id_name(top) + " depth " +
+                  std::to_string(nav_.size()));
+}
+
+void UiApp::log_toast_change() {
+    if (services_.log == nullptr) return;
+    if (toast_text_ == logged_toast_) return;
+    logged_toast_ = toast_text_;
+    // The text only: a toast that expired leaves an empty line, which is the
+    // "nothing said" state a script can assert after a step.
+    services_.log("ui: toast " + toast_text_);
 }
 
 bool UiApp::draw(UiCanvas& canvas) {

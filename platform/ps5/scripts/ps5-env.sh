@@ -447,6 +447,31 @@ for entry in doc.get("entries", []):
 '
 }
 
+# ps5_ftp_list_checked DIR [DRY]: ps5_ftp_list, but non-zero when the console
+# did not answer or the reply is not a listing. A caller that reads "nothing
+# listed" as "nothing there" (the tmp-empty check, the free-space proxy) must
+# not treat a failed request as an empty folder - that is how an unreachable
+# console reported PASS.
+ps5_ftp_list_checked() {
+    local dir="$1" dry="${2:-0}" body
+    ps5_guard_remote_path "$dir"
+    if [ "$dry" = 1 ]; then
+        ps5_dry_line "  GET  $(ps5_base_url)/api/ftp/list?path=$(ps5_url_encode "$dir")"
+        return 0
+    fi
+    body="$(ps5_http GET "/api/ftp/list?path=$(ps5_url_encode "$dir")" none "")" || return 1
+    printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    entries = json.load(sys.stdin)["entries"]
+except Exception:
+    sys.exit(1)
+for entry in entries:
+    print("%s\t%d\t%s" % (entry.get("name", ""), int(entry.get("size", 0)),
+                          "dir" if entry.get("is_dir") else "file"))
+'
+}
+
 # ps5_ftp_files DIR [DRY]: ps5_ftp_list without the directories
 # ("name<TAB>size", the format the size checks compare).
 ps5_ftp_files() {

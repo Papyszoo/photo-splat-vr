@@ -17,12 +17,13 @@ class UploadStore {
 public:
     static constexpr uint64_t kDefaultMaxBytes = 40ull * 1024ull * 1024ull;  // 40 MB
 
-    enum class Format { Jpeg, Png };
+    // The formats the inbox accepts. Content decides; the extension of the
+    // stored name comes from here.
+    enum class Format { Jpeg, Png, Webp, Heif, Avif, Tiff };
 
     explicit UploadStore(Path inbox, uint64_t max_bytes = kDefaultMaxBytes);
 
-    // Content sniffing, not the extension: JPEG starts with FF D8 FF, PNG with
-    // the 8-byte signature.
+    // Content sniffing through core/image/format.h, never the extension.
     static std::optional<Format> detect_format(const std::string& data);
     static const char* extension_for(Format format);
 

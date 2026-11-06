@@ -80,6 +80,22 @@ public:
     // corners: the tile thumbnails.
     void blit_cover(int x, int y, int w, int h, const UiImage& image, int radius);
 
+    // `image` fitted whole inside the box (contained, aspect kept, never
+    // stretched or cropped) and centred on a rounded `plate`: the photo tiles
+    // that must show every edge of the picture, with the plate where its shape
+    // differs (stage TF2). A picture that already has the box's shape fills it,
+    // clipped to the plate's rounded corners exactly like blit_cover().
+    void blit_fit(int x, int y, int w, int h, const UiImage& image, int radius, Rgba plate);
+
+    // `image` turned `quarters` clockwise quarter turns (taken mod 4) and
+    // fitted inside the box - contained, aspect kept, never stretched - centred
+    // on a rounded `plate`, clipped to its rounded corners. The photo picker
+    // draws a turned tile with it: the decoded thumbnail is turned at draw
+    // time, never decoded again. No turn (quarters 0 mod 4) is the plain
+    // contained fit of blit_fit().
+    void blit_turned_fit(int x, int y, int w, int h, int quarters, const UiImage& image,
+                         int radius, Rgba plate);
+
     // Track rectangle plus a fill of `frac` (clamped to [0, 1]) of the width,
     // rounded to the nearest pixel.
     void bar(int x, int y, int w, int h, float frac, Rgba track, Rgba fill);

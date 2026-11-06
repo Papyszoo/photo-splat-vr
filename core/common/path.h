@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace splat {
 
@@ -23,5 +24,10 @@ using Path = std::filesystem::path;
 // False when `path` is empty, the working directory cannot be read, or the
 // result is somehow not absolute; `out` is then unspecified.
 bool normal_absolute(const Path& path, Path& out);
+
+// The path's extension, lowercase and with its dot (".SPZ" -> ".spz"), empty
+// when there is none. The format sniff and read_scene_path's dispatch both key
+// on this, so it lives here instead of in two anonymous namespaces.
+std::string lowercase_extension(const Path& path);
 
 }  // namespace splat

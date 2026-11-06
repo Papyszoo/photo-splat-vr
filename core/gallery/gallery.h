@@ -23,6 +23,12 @@ namespace splat {
 // hand.
 inline constexpr const char* kAllScenesAlbumName = "Unsorted";
 
+// What every folder mutation answers on a network location (core/vfs/io.h):
+// the console reads a share, it does not rearrange one. Shared so the screens
+// can say it without inventing a second wording.
+inline constexpr const char* kRemoteMutationRefusal =
+    "folders on a network location cannot be changed from the console";
+
 struct AlbumEntry {
     Path dir;               // album directory; the root itself for the implicit album
     std::string name;       // folder name; kAllScenesAlbumName for the implicit album
@@ -38,22 +44,46 @@ struct SceneEntry {
     std::string album;  // album folder name; empty for the loose-scene album
     SceneMeta meta;     // default-constructed when meta.json is missing or unreadable
     bool has_thumb = false;
+    // True when meta.json could be read. The visible-folders policy needs it:
+    // a scene whose meta cannot be read is "other", never the album it sits in
+    // (core/gallery/visibility.h). False for a scene written before meta.json
+    // existed at all, which is what makes the distinction explicit.
+    bool meta_readable = false;
 };
 
 // False for the empty string, names longer than 48, a leading dot and any
 // character outside [A-Za-z0-9._ -].
 bool valid_album_name(const std::string& name);
 
+// Every album row the root holds, unfiltered: the scenes each one has and its
+// cover. The "Visible folders" screen is the only caller - it must list the
+// albums the policy hides, so it cannot read list_albums(). No browsing screen
+// may use this.
+std::vector<AlbumEntry> list_albums_all(const Path& root);
+
 // Albums sorted by name; the implicit loose-scene album (kAllScenesAlbumName)
 // always first when the root is readable. A missing root yields an empty list,
 // not an error. Entries whose name starts with '.' are ignored.
+//
+// With a passcode set this is the allow-list: an unticked album is omitted
+// entirely, and a ticked album reports only its visible scenes - count and
+// cover included, so a folder whose scenes are all hidden shows 0 and no
+// thumbnail (core/gallery/visibility.h).
 std::vector<AlbumEntry> list_albums(const Path& root);
 
 // Scenes of one album, sorted by folder name. `album` is the album folder name
 // under `root`; "" is the loose-scene album, and kAllScenesAlbumName resolves
 // to the root as well (unless a hand-made folder of that name exists). A
-// missing album directory yields an empty list.
+// missing album directory yields an empty list. With a passcode set, a scene is
+// dropped unless both its placement and its source folder are ticked.
 std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album = "");
+
+// The same list, but a root the file system refuses to read (an offline or
+// wrong network share) is an error naming it instead of an empty album. A
+// screen uses this for a location root so the user reads the share's failure
+// rather than "no scenes"; local callers keep list_scenes().
+Result<std::vector<SceneEntry>> list_scenes_checked(const Path& root,
+                                                   const std::string& album = "");
 
 // What a viewer boots from when no scene was picked by hand: one album and its
 // scenes, in the gallery's own order (the same list_albums/list_scenes a screen
