@@ -19,8 +19,15 @@ struct VrOptions {
     bool preload = true;           // PRELOAD=0 turns the next-scene preload off
     // MIRROR=0: no TV mirror. Otherwise (the default) Hmd2's social screen
     // shows the headset's view on the TV, which is what a system recording
-    // captures.
+    // captures. It is the TV only when the title's own output (tv_output below)
+    // is off or could not be opened.
     bool mirror = true;
+    // TV_OUTPUT=0: no TV output of the title's own (viewer.env, on by default).
+    // The TV then shows the Hmd2 mirror as through 0.5.x. With it on, the title
+    // opens the main VideoOut port at the start of the session and puts the
+    // scene without the VR window or HUD there, plus the flat menu while it is
+    // open (tv_output.h); a port that will not open falls back to the mirror.
+    bool tv_output = true;
 };
 
 // Runs one VR session against the headset and returns the title's exit status:

@@ -56,6 +56,8 @@ std::string right_text(const JobView& job) {
     }
     if (job.state == "failed") return "Failed";
     if (job.state == "cancelled") return "Cancelled";
+    // The finished scene is waiting for its network folder to answer.
+    if (job.state == "waiting") return job.message.empty() ? std::string("Waiting") : job.message;
     return "Queued";
 }
 
@@ -169,7 +171,7 @@ void QueueScreen::cancel_focused(UiContext& ctx) {
     const int focused = list_.focus();
     if (focused < 0 || focused >= static_cast<int>(jobs_.size())) return;
     const JobView& job = jobs_[static_cast<std::size_t>(focused)];
-    if (job.state != "queued" && job.state != "running") {
+    if (job.state != "queued" && job.state != "running" && job.state != "waiting") {
         ctx.toast("already " + job.state);
         return;
     }
@@ -250,7 +252,9 @@ std::vector<Hint> QueueScreen::hints() const {
     const JobView& job = jobs_[static_cast<std::size_t>(focus)];
     std::vector<Hint> hints;
     if (job.state == "done" && job.kind != "rotate") hints.push_back(Hint{"Cross", "View"});
-    if (job.state == "queued" || job.state == "running") hints.push_back(Hint{"Square", "Cancel"});
+    if (job.state == "queued" || job.state == "running" || job.state == "waiting") {
+        hints.push_back(Hint{"Square", "Cancel"});
+    }
     hints.push_back(Hint{"Circle", "Back"});
     return hints;
 }

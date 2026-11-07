@@ -11,8 +11,12 @@
 
 namespace splat {
 
-// C9 job states. Queued and Running are active; the other three are terminal.
-enum class JobState { Queued, Running, Done, Failed, Cancelled };
+// C9 job states. Queued and Running are active; Done, Failed and Cancelled are
+// terminal. Waiting (0.6.0) is the one in between: the scene is finished and sits
+// in the job's own staging folder, and the network folder it is meant for did
+// not answer, so the runner retries the upload until the share is back or the
+// user cancels. It survives a restart through the queue file.
+enum class JobState { Queued, Running, Waiting, Done, Failed, Cancelled };
 
 const char* job_state_name(JobState state);
 std::optional<JobState> job_state_from_name(const std::string& name);
@@ -51,7 +55,7 @@ struct Job {
     // Empty in queue files written before stage H.
     std::string source_folder;
     JobState state = JobState::Queued;
-    std::string message;      // failure or cancellation reason
+    std::string message;      // failure or cancellation reason; "Waiting for <name>" while Waiting
     Path scene_folder;        // set when the job is done
     double seconds_taken = 0.0;
     uint64_t sequence = 0;    // enqueue order, also the numeric part of the id
@@ -141,17 +145,23 @@ public:
     // queued or another job is already running (one conversion at a time).
     Result<std::optional<Job>> take_next();
 
-    // Running -> Done. scene_folder and seconds_taken are stored; a cancelled
-    // job is never overwritten. `message` is the row's notice ("imported 1,234
+    // Running -> Done (a Waiting job whose upload finally worked goes straight to
+    // Done too). scene_folder and seconds_taken are stored; a cancelled job is
+    // never overwritten. `message` is the row's notice ("imported 1,234
     // splats", "thinned 4,000,000 to 2,000,000 splats") and is empty for a
     // conversion, which has nothing extra to say.
     Status mark_done(const std::string& id, const Path& scene_folder, double seconds_taken,
                      std::string message = std::string());
 
-    // Running -> Failed with the message the UI shows.
+    // Running (or Waiting) -> Failed with the message the UI shows.
     Status mark_failed(const std::string& id, std::string message);
 
-    // Queued or Running -> Cancelled.
+    // Running -> Waiting: the scene is finished but its network destination did
+    // not answer. `message` is the row's text ("Waiting for NAS") and
+    // `seconds_taken` the conversion time, kept for the Done that follows.
+    Status mark_waiting(const std::string& id, std::string message, double seconds_taken);
+
+    // Queued, Running or Waiting -> Cancelled.
     Status cancel(const std::string& id);
 
     Status save() const;

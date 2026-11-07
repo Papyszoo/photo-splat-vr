@@ -28,6 +28,7 @@ const char* job_state_name(JobState state) {
     switch (state) {
         case JobState::Queued: return "queued";
         case JobState::Running: return "running";
+        case JobState::Waiting: return "waiting";
         case JobState::Done: return "done";
         case JobState::Failed: return "failed";
         case JobState::Cancelled: return "cancelled";
@@ -38,6 +39,7 @@ const char* job_state_name(JobState state) {
 std::optional<JobState> job_state_from_name(const std::string& name) {
     if (name == "queued") return JobState::Queued;
     if (name == "running") return JobState::Running;
+    if (name == "waiting") return JobState::Waiting;
     if (name == "done") return JobState::Done;
     if (name == "failed") return JobState::Failed;
     if (name == "cancelled") return JobState::Cancelled;
@@ -221,6 +223,15 @@ Result<JobQueue> JobQueue::open(const Path& state_file) {
             }
             // A process that died mid-conversion cannot still be converting.
             job.state = *state == JobState::Running ? JobState::Queued : *state;
+            // A job only waits for a network folder: a Waiting row with no
+            // location destination, or a turn, is not one this build wrote, and
+            // its retry would have nowhere to upload to.
+            if (job.state == JobState::Waiting &&
+                (job.kind == JobKind::rotate || !vfs::is_remote(job.output_root))) {
+                return Result<JobQueue>::failure("job " + job.id +
+                                                 " is waiting for a network folder but has none in " +
+                                                 state_file.string());
+            }
 
             if (job.id.empty()) {
                 return Result<JobQueue>::failure("job queue contains a job without an id");
@@ -349,7 +360,8 @@ Result<std::string> JobQueue::add_job(const Path& photo, JobKind kind, std::stri
     }
     for (const Job& existing : jobs_) {
         if (existing.photo != normalized) continue;
-        if (existing.state == JobState::Queued || existing.state == JobState::Running) {
+        if (existing.state == JobState::Queued || existing.state == JobState::Running ||
+            existing.state == JobState::Waiting) {
             return Result<std::string>::failure("photo is already queued: " + normalized.string());
         }
     }
@@ -406,7 +418,7 @@ Status JobQueue::mark_done(const std::string& id, const Path& scene_folder, doub
                           std::string message) {
     Job* job = mutable_find(id);
     if (job == nullptr) return Status::error("no such job: " + id);
-    if (job->state != JobState::Running) {
+    if (job->state != JobState::Running && job->state != JobState::Waiting) {
         return Status::error("job " + id + " is " + job_state_name(job->state) + ", expected running");
     }
 
@@ -417,10 +429,23 @@ Status JobQueue::mark_done(const std::string& id, const Path& scene_folder, doub
     return save();
 }
 
-Status JobQueue::mark_failed(const std::string& id, std::string message) {
+Status JobQueue::mark_waiting(const std::string& id, std::string message, double seconds_taken) {
     Job* job = mutable_find(id);
     if (job == nullptr) return Status::error("no such job: " + id);
     if (job->state != JobState::Running) {
+        return Status::error("job " + id + " is " + job_state_name(job->state) + ", expected running");
+    }
+
+    job->state = JobState::Waiting;
+    job->message = std::move(message);
+    job->seconds_taken = seconds_taken;
+    return save();
+}
+
+Status JobQueue::mark_failed(const std::string& id, std::string message) {
+    Job* job = mutable_find(id);
+    if (job == nullptr) return Status::error("no such job: " + id);
+    if (job->state != JobState::Running && job->state != JobState::Waiting) {
         return Status::error("job " + id + " is " + job_state_name(job->state) + ", expected running");
     }
 

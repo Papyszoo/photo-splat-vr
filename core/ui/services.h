@@ -9,7 +9,7 @@
 //
 // Views are plain structs copied out of the service, so a screen never holds a
 // lock or a pointer into service state. `state` is a lowercase token shared
-// with the core types: jobs use queued/running/done/failed/cancelled
+// with the core types: jobs use queued/running/waiting/done/failed/cancelled
 // (core/jobs/job_queue.h), models use the ModelState names
 // (core/model/model_manager.h).
 //
@@ -57,7 +57,7 @@ struct JobView {
     std::string backend;  // "sharp", "da2", ...
     std::string album;    // "" = the loose-scene album
     std::string kind;     // convert / import / rotate
-    std::string state;    // queued/running/done/failed/cancelled
+    std::string state;    // queued/running/waiting/done/failed/cancelled
     float fraction = 0.0f;
     std::string stage;    // short progress label for the running job
     std::string message;  // failure/cancel reason, empty otherwise
@@ -87,6 +87,9 @@ struct ModelView {
     bool selected = false;  // the row the converter would load
     bool offered = true;    // false: shown disabled ("not offered yet")
     double backend_seconds = 0.0;  // measured conversion time, 0 = unknown
+    // Seconds left of a running download, from its real byte rate; negative when
+    // unknown (not downloading, or too little of it seen yet).
+    double eta_seconds = -1.0;
 };
 
 struct CaptureView {

@@ -117,13 +117,15 @@ the next save; rotation lives in the scene files now.
 
 ## In the photo picker
 
-Splat files appear after the photos in the folder browser (the Console tab) and
-next to the photos in the Inbox and USB tabs, as tiles labelled `SPLAT · spz`
-with a `SPLAT` badge and no thumbnail (decoding one just to draw a preview would
-import it twice). Cross on one queues its import into the folder the picker was
-opened for, and the bar says `Import` rather than `Select`: the tile never joins
-the photo basket. The toast reads `Importing <name>`. Square on a **folder** row imports every splat file at up to
-three levels below it, at most 50 files, and toasts `Queued N imports`; a folder
-with no splat files says so and queues nothing. Imports and conversions share
+Every picker tab is a folder browser (Console, Inbox, each USB stick, each
+network location): a folder shows its subfolders as folder tiles, then its
+photos, then its splat files, as tiles labelled `SPLAT · spz` with a `SPLAT`
+badge and no thumbnail (decoding one just to draw a preview would import it
+twice). Cross on one queues its import into the folder the picker was opened
+for, and the bar says `Import` rather than `Select`: the tile never joins the
+photo basket. The toast reads `Importing <name>`. Files are picked one by one,
+as in a file browser; there is no search and no folder-level import, and Square
+on a folder tile does nothing. The file is read through the file-system layer,
+so a splat file on a network share imports like one on a stick. Imports and conversions share
 the one queue and run one at a time, but an import loads no model, so it needs
 no GGUF and does not pause a running viewer.

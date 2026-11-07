@@ -41,6 +41,9 @@ public:
     const std::vector<PhotoPick>& picks() const { return picks_; }
     // The folder the jobs go to ("" = the loose-scene album).
     const std::string& album() const { return album_; }
+    // The library root they go to when it is a network location (the shelf's own
+    // or the Output folder); empty = this console's scene root.
+    const Path& output_root() const { return output_root_; }
     // The Ready models in list order; empty when none is ready.
     const std::vector<ModelView>& models() const { return ready_; }
     // The model the focused row would queue with ("" when none is ready).
@@ -71,6 +74,10 @@ private:
     // Set when the folder is on a network location (ScreenArgs::b): the runner
     // builds the scene locally and uploads it to this root.
     Path output_root_;
+    // The destination in words when it is on a network location ("NAS > Splats"),
+    // empty for the local library; and why the Output folder cannot be used.
+    std::string destination_text_;
+    std::string target_error_;
     std::vector<ModelView> ready_;
     bool jobs_available_ = false;
     bool blocked_ = false;

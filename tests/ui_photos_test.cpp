@@ -182,9 +182,9 @@ TEST_CASE("ui_photos lists the sources and toggles the selection") {
     CHECK(fixture.screen.album() == "trip");
     CHECK(fixture.screen.title() == "Add photos");
 
-    // The grid order is the gallery's order; the focus starts on the first tile.
-    const std::vector<splat::PhotoEntry> listed =
-        splat::list_photos(splat::PhotoSource{"inbox", "Inbox", fixture.inbox, false});
+    // The grid order is the folder listing's order (name order); the focus starts
+    // on the first tile.
+    const std::vector<splat::FolderEntry> listed = splat::list_folder(fixture.inbox);
     REQUIRE(listed.size() == 3);
 
     fixture.update(press(splat::Select));
@@ -531,7 +531,7 @@ TEST_CASE("ui_photos browses console folders") {
 
     fixture.update(press(splat::PageNext));
     REQUIRE(fixture.screen.tab() == 1);
-    CHECK(fixture.screen.console_dir().empty());
+    CHECK(fixture.screen.browse_dir().empty());
     // The tab already says "Console": no line repeating it.
     CHECK(fixture.screen.location().empty());
     fixture.idle();
@@ -544,14 +544,14 @@ TEST_CASE("ui_photos browses console folders") {
     CHECK(has_hint(fixture.screen.hints(), "Circle", "Back"));
 
     fixture.update(press(splat::Select));  // into the internal storage
-    CHECK(fixture.screen.console_dir() == data);
+    CHECK(fixture.screen.browse_dir() == data);
     CHECK(has_hint(fixture.screen.hints(), "Circle", "Back"));  // a source root
     fixture.idle();
     // The app's folder is not offered.
     REQUIRE(fixture.screen.grid().cells().size() == 1);
     CHECK(fixture.screen.grid().cells()[0].caption == "photos");
     fixture.update(press(splat::Select));  // into photos/
-    CHECK(fixture.screen.console_dir() == data / "photos");
+    CHECK(fixture.screen.browse_dir() == data / "photos");
     const std::vector<std::string> crumbs = fixture.screen.breadcrumb();
     REQUIRE(crumbs.size() == 2);
     CHECK(crumbs[0] == "Internal storage");
@@ -577,11 +577,11 @@ TEST_CASE("ui_photos browses console folders") {
     // Circle goes up a folder (the screen keeps it), focusing the folder we
     // came from; from a root back to the list of places; then it leaves.
     CHECK(fixture.screen.handle_back(fixture.context));
-    CHECK(fixture.screen.console_dir() == data);
+    CHECK(fixture.screen.browse_dir() == data);
     fixture.idle();
     CHECK(fixture.screen.grid().focus() == 0);
     CHECK(fixture.screen.handle_back(fixture.context));
-    CHECK(fixture.screen.console_dir().empty());
+    CHECK(fixture.screen.browse_dir().empty());
     CHECK_FALSE(fixture.screen.handle_back(fixture.context));
     CHECK(fixture.screen.selection().size() == 1);
 
@@ -596,7 +596,7 @@ TEST_CASE("ui_photos browses console folders") {
     std::filesystem::remove_all(fixture.mnt / "ext0");
     fixture.screen.refresh(fixture.context);
     fixture.screen.set_tab(fixture.context, 1);
-    CHECK(fixture.screen.console_dir() == data);
+    CHECK(fixture.screen.browse_dir() == data);
     CHECK(fixture.screen.location().empty());
     fixture.idle();
     fixture.update(press(splat::Select));  // photos/

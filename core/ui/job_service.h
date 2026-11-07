@@ -6,6 +6,10 @@
 // mutex the runner also takes around its queue calls (never during inference),
 // so the panel stays responsive while a job runs.
 //
+// A job whose network destination did not answer when its scene was ready is
+// "waiting" (core/jobs/job_runner.h): the worker wakes when the runner's retry is
+// due, and cancelling a waiting job removes its staging copy.
+//
 // A cancel of the running job is a request, applied by the runner at its next
 // stage boundary: mid inference there is no cancel point inside the backend, so
 // the job stops after the photo it is working on and the view says so until
@@ -24,6 +28,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -73,8 +78,9 @@ public:
     // Oldest first (the queue's enqueue order), done and failed rows kept for
     // the session.
     std::vector<JobView> snapshot() const override;
-    // Queued: cancelled at once. Running: cancelled at the next stage boundary
-    // (the view keeps "running" and says it cancels after this photo).
+    // Queued or Waiting: cancelled at once (a waiting job's temporary files are
+    // removed). Running: cancelled at the next stage boundary (the view keeps
+    // "running" and says it cancels after this photo).
     Status cancel(const std::string& id) override;
     bool busy() const override;
     // The folder the viewer has open: the runner refuses to rewrite it. The
@@ -88,7 +94,7 @@ private:
     void notify_changed();
     bool cancel_requested(const std::string& id);
     void set_progress(float fraction, const std::string& stage);
-    void wait_for_work();
+    void wait_for_work(std::optional<double> alarm_seconds);
 
     JobQueue& queue_;
     JobRunner& runner_;

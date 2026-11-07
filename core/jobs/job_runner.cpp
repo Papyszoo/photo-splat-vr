@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -25,6 +27,8 @@ namespace {
 // Longest folder name taken from the photo stem. A collision suffix is added
 // after this cut, so a folder name can be 50 characters long.
 constexpr size_t kMaxSceneFolderName = 48;
+// The leading dot keeps an upload in progress out of every listing (hidden_name).
+constexpr const char* kUploadTempPrefix = ".upload-";
 
 // Holds the GPU for inference and releases it on every return path. begin()
 // fails only when the guard has been shut down; acquired() then tells the
@@ -149,11 +153,23 @@ std::string scene_source_folder(const Job& job) {
     return visibility->key_for_source(job.photo).text();
 }
 
+// The hidden folder (a leading dot: no library, album or picker listing shows
+// it) a job's scene is uploaded into before it gets its final name, in the same
+// folder `parent` as that name. The job id makes it the job's own, so a retry (or
+// a cancel) can find and remove what an earlier attempt left.
+Path upload_temp_folder(const Path& parent, const std::string& job_id) {
+    return parent / (kUploadTempPrefix + job_id);
+}
+
 // Copies a finished scene from the local staging folder to its destination on
-// a network location and checks that every file arrived whole. The staging copy
-// is removed only when the destination really holds the scene: an interrupted
-// upload leaves it for the operator (the failure message names it).
-Status upload_scene(const Path& staging, const Path& destination) {
+// a network location and checks that every file arrived whole. The scene is
+// built in `temporary`, verified there and only then renamed to `destination`,
+// so a share that drops in the middle of the copy never leaves a partial scene
+// under a real name: the temporary is removed (best effort - when the share is
+// off, the next attempt removes it first). The staging copy is removed only when
+// the destination really holds the scene: an interrupted upload leaves it for
+// the operator (the failure message names it).
+Status upload_scene(const Path& staging, const Path& temporary, const Path& destination) {
     std::vector<vfs::DirEntry> staged;
     const Status listed = vfs::list(staging, &staged);
     if (!listed.ok()) return Status::error(listed.message());
@@ -168,29 +184,49 @@ Status upload_scene(const Path& staging, const Path& destination) {
         return Status::error("the staging folder " + staging.string() + " is empty");
     }
 
-    const Status copied = vfs::copy_tree(staging, destination);
-    if (!copied.ok()) return Status::error(copied.message());
+    // What an earlier attempt of this job left behind goes first.
+    (void)vfs::remove_tree(temporary);
+    const auto abandon = [&](Status failure) {
+        (void)vfs::remove_tree(temporary);
+        return failure;
+    };
+
+    const Status copied = vfs::copy_tree(staging, temporary);
+    if (!copied.ok()) return abandon(Status::error(copied.message()));
 
     for (const vfs::DirEntry& entry : staged) {
         if (entry.directory || entry.symlink) continue;
         vfs::FileStat source;
         vfs::FileStat target;
         if (!vfs::stat(staging / entry.name, &source).ok() || !source.regular) {
-            return Status::error("cannot verify " + entry.name);
+            return abandon(Status::error("cannot verify " + entry.name));
         }
-        if (!vfs::stat(destination / entry.name, &target).ok() || !target.regular) {
-            return Status::error("uploaded " + entry.name + " is missing");
+        if (!vfs::stat(temporary / entry.name, &target).ok() || !target.regular) {
+            return abandon(Status::error("uploaded " + entry.name + " is missing"));
         }
         if (source.size != target.size) {
-            return Status::error("uploaded " + entry.name + " is " +
-                                 std::to_string(target.size) + " bytes, expected " +
-                                 std::to_string(source.size));
+            return abandon(Status::error("uploaded " + entry.name + " is " +
+                                         std::to_string(target.size) + " bytes, expected " +
+                                         std::to_string(source.size)));
         }
+    }
+
+    const Status published = vfs::rename_file(temporary, destination);
+    if (!published.ok()) {
+        return abandon(Status::error("cannot save as " + destination.string() + ": " +
+                                     published.message()));
     }
     return vfs::remove_tree(staging);
 }
 
 }  // namespace
+
+double upload_retry_delay_seconds(int attempt, double initial_seconds, double max_seconds) {
+    double delay = std::max(0.0, initial_seconds);
+    const double cap = std::max(delay, max_seconds);
+    for (int step = 1; step < attempt && delay < cap; ++step) delay *= 2.0;
+    return std::min(delay, cap);
+}
 
 std::string scene_folder_base(const Path& photo) {
     const std::string stem = photo.stem().string();
@@ -222,10 +258,189 @@ void JobRunner::set_scene_open(std::function<bool(const Path& folder)> open) {
     scene_open_ = std::move(open);
 }
 
+bool JobRunner::destination_offline(const Path& output_root) const {
+    if (!vfs::is_remote(output_root)) return false;
+    const std::string id = vfs::location_id(output_root);
+    if (vfs::file_systems().find(id) == nullptr) {
+        // No adapter: either the location was removed, or it is being re-mounted
+        // after an edit (the store still knows it). Only the first is a failure.
+        return config_.location_name && !config_.location_name(id).empty();
+    }
+    vfs::FileStat root;
+    return !vfs::stat(output_root, &root).ok();
+}
+
+Path JobRunner::staging_folder(const std::string& id) const {
+    if (config_.staging_root.empty() || id.empty() || id == "." || id == ".." ||
+        id.find_first_of("/\\") != std::string::npos) {
+        return Path();
+    }
+    return config_.staging_root / id;
+}
+
+void JobRunner::discard_staging(const std::string& id) const {
+    const Path folder = staging_folder(id);
+    if (!folder.empty()) (void)vfs::remove_tree(folder);
+}
+
+void JobRunner::discard_waiting(const std::string& id) {
+    discard_staging(id);
+    // The share may still hold the hidden temporary folder of an attempt that
+    // dropped; the runner thread removes it (a share that is off must not stall
+    // the caller, who is the UI).
+    std::lock_guard<std::mutex> lock(abandoned_mutex_);
+    abandoned_.push_back(id);
+}
+
+void JobRunner::remove_abandoned_uploads() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lock(abandoned_mutex_);
+        ids.swap(abandoned_);
+    }
+    for (const std::string& id : ids) {
+        Path folder;
+        {
+            QueueAccess access(queue_mutex_);
+            const Job* job = queue_.find(id);
+            if (job == nullptr || job->kind == JobKind::rotate ||
+                !vfs::is_remote(job->output_root)) {
+                continue;
+            }
+            // The temporary sits beside the scene's final name, in the album.
+            folder = upload_temp_folder(album_root(job->output_root, job->album), id);
+        }
+        (void)vfs::remove_tree(folder);
+    }
+}
+
+std::string JobRunner::due_waiting_job() {
+    const auto now = std::chrono::steady_clock::now();
+    // A cancelled or finished job's schedule is history.
+    for (auto it = retries_.begin(); it != retries_.end();) {
+        const Job* job = queue_.find(it->first);
+        it = (job != nullptr && job->state == JobState::Waiting) ? std::next(it)
+                                                                  : retries_.erase(it);
+    }
+    const Job* best = nullptr;
+    for (const Job& job : queue_.jobs()) {
+        if (job.state != JobState::Waiting) continue;
+        const auto retry = retries_.find(job.id);
+        if (retry != retries_.end() && retry->second.due > now) continue;
+        if (best == nullptr || job.sequence < best->sequence) best = &job;
+    }
+    return best == nullptr ? std::string() : best->id;
+}
+
+std::optional<double> JobRunner::next_retry_seconds() const {
+    QueueAccess access(queue_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    std::optional<double> soonest;
+    for (const Job& job : queue_.jobs()) {
+        if (job.state != JobState::Waiting) continue;
+        double wait = 0.0;
+        const auto retry = retries_.find(job.id);
+        if (retry != retries_.end()) {
+            wait = std::max(0.0, std::chrono::duration<double>(retry->second.due - now).count());
+        }
+        if (!soonest || wait < *soonest) soonest = wait;
+    }
+    return soonest;
+}
+
+Result<std::optional<JobOutcome>> JobRunner::retry_upload(const Job& job) {
+    using Outcome = Result<std::optional<JobOutcome>>;
+
+    const auto current_outcome = [&]() {
+        QueueAccess access(queue_mutex_);
+        return outcome_from_queue(queue_, job.id);
+    };
+
+    const Path staging = staging_folder(job.id);
+    Status published = Status::success();
+    Path destination;
+    bool offline = false;
+    if (staging.empty() || !path_exists(staging)) {
+        published = Status::error("the finished scene is no longer on this console (" +
+                                  staging.string() + ")");
+    } else {
+        // The destination name is chosen again: the share may have changed while
+        // it was away.
+        destination = unique_scene_folder(album_root(job.output_root, job.album),
+                                          scene_folder_base(job.photo));
+        const Status uploaded = upload_scene(
+            staging, upload_temp_folder(destination.parent_path(), job.id), destination);
+        if (!uploaded.ok()) {
+            published = Status::error("upload failed: " + uploaded.message() + "; kept at " +
+                                      staging.string());
+            offline = destination_offline(job.output_root);
+        }
+    }
+
+    // Back under the lock: what the user did meanwhile decides what this attempt
+    // means. A job cancelled while the upload ran leaves nothing behind - not the
+    // staging copy, not a scene it just put on the share.
+    Status recorded = Status::success();
+    bool cancelled = false;
+    {
+        QueueAccess access(queue_mutex_);
+        const Job* current = queue_.find(job.id);
+        if (current == nullptr || current->state != JobState::Waiting) {
+            cancelled = true;
+        } else if (published.ok()) {
+            recorded = queue_.mark_done(job.id, destination, job.seconds_taken, std::string());
+        } else if (!offline) {
+            recorded = queue_.mark_failed(job.id, published.message());
+        }
+    }
+    if (cancelled) {
+        // A scene the share took is removed again; a copy the cancel broke (it
+        // removes the staging copy while the upload still reads it) left only
+        // its hidden temporary folder, which upload_scene already tried to
+        // remove and is tried once more here.
+        if (!destination.empty()) {
+            (void)vfs::remove_tree(
+                published.ok() ? destination
+                               : upload_temp_folder(destination.parent_path(), job.id));
+        }
+        discard_staging(job.id);
+        retries_.erase(job.id);
+        return Outcome::success(std::optional<JobOutcome>(current_outcome()));
+    }
+    if (!published.ok() && offline) {
+        // Still off: try again later, on a longer wait.
+        Retry& again = retries_[job.id];
+        ++again.attempts;
+        again.due = std::chrono::steady_clock::now() +
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(upload_retry_delay_seconds(
+                            again.attempts, config_.retry_initial_seconds,
+                            config_.retry_max_seconds)));
+        return Outcome::success(std::optional<JobOutcome>(current_outcome()));
+    }
+    retries_.erase(job.id);
+    if (!recorded.ok()) return Outcome::failure(recorded.message());
+    return Outcome::success(std::optional<JobOutcome>(current_outcome()));
+}
+
 Result<std::optional<JobOutcome>> JobRunner::run_next(const ProgressCallback& progress) {
     using Outcome = Result<std::optional<JobOutcome>>;
 
     if (guard_.stopped()) return Outcome::failure("the GPU phase guard is shutting down");
+
+    remove_abandoned_uploads();
+
+    // A Waiting job whose time has come goes first: its scene is finished, the
+    // upload needs no model and no GPU, and a share that is back should not wait
+    // behind a queue of conversions. It stays Waiting while it tries, so the
+    // panel shows no conversion and a cancel takes effect at once.
+    std::optional<Job> retry;
+    {
+        QueueAccess access(queue_mutex_);
+        const std::string due = due_waiting_job();
+        if (!due.empty()) retry = *queue_.find(due);
+    }
+    if (retry) return retry_upload(*retry);
 
     Result<std::optional<Job>> taken = [&]() -> Result<std::optional<Job>> {
         QueueAccess access(queue_mutex_);
@@ -354,10 +569,52 @@ Result<std::optional<JobOutcome>> JobRunner::run_next(const ProgressCallback& pr
     };
     const auto publish = [&](const Path& folder, const Path& destination) -> Status {
         if (!upload) return Status::success();
-        const Status uploaded = upload_scene(folder, destination);
+        const Status uploaded = upload_scene(
+            folder, upload_temp_folder(destination.parent_path(), job.id), destination);
         if (uploaded.ok()) return Status::success();
         return Status::error("upload failed: " + uploaded.message() + "; kept at " +
                              folder.string());
+    };
+
+    // The finished scene could not be delivered because its network folder does
+    // not answer: the job waits, keeps the scene in its staging folder, and
+    // run_next tries again later. A job cancelled meanwhile stays cancelled and
+    // loses its staging copy.
+    const auto finish_waiting = [&](double seconds) -> Outcome {
+        Status recorded = Status::success();
+        JobOutcome outcome;
+        {
+            QueueAccess access(queue_mutex_);
+            const Job* current = queue_.find(job.id);
+            if (current != nullptr && current->state == JobState::Running) {
+                std::string name;
+                if (config_.location_name) name = config_.location_name(vfs::location_id(output_root));
+                if (name.empty()) name = vfs::location_id(output_root);
+                recorded = queue_.mark_waiting(job.id, "Waiting for " + name, seconds);
+            }
+            outcome = outcome_from_queue(queue_, job.id);
+        }
+        if (!recorded.ok()) return Outcome::failure(recorded.message());
+        if (outcome.state == JobState::Waiting) {
+            Retry& next = retries_[job.id];
+            ++next.attempts;
+            next.due = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(upload_retry_delay_seconds(
+                               next.attempts, config_.retry_initial_seconds,
+                               config_.retry_max_seconds)));
+            reporter.report(1.0f, "waiting");
+        } else {
+            discard_staging(job.id);
+            retries_.erase(job.id);
+        }
+        return Outcome::success(std::optional<JobOutcome>(std::move(outcome)));
+    };
+    // A failed publish is a wait when the folder is offline, else a failure.
+    const auto finish_unpublished = [&](const Status& published, double seconds) -> Outcome {
+        if (upload && destination_offline(output_root)) return finish_waiting(seconds);
+        retries_.erase(job.id);
+        return finish_failed(published.message());
     };
 
     // An import is decided before any model exists: no backend is loaded, and
@@ -417,7 +674,7 @@ Result<std::optional<JobOutcome>> JobRunner::run_next(const ProgressCallback& pr
         const Status written = write_imported_scene(folder, scene, meta, thumb);
         if (!written.ok()) return finish_failed("cannot write scene folder: " + written.message());
         const Status published = publish(folder, destination);
-        if (!published.ok()) return finish_failed(published.message());
+        if (!published.ok()) return finish_unpublished(published, seconds);
 
         const std::string message =
             report.thinned
@@ -542,7 +799,7 @@ Result<std::optional<JobOutcome>> JobRunner::run_next(const ProgressCallback& pr
         write_scene_folder(folder, scene.value(), meta, original_jpeg, thumbnail_jpeg.value());
     if (!written.ok()) return finish_failed("cannot write scene folder: " + written.message());
     const Status published = publish(folder, destination);
-    if (!published.ok()) return finish_failed(published.message());
+    if (!published.ok()) return finish_unpublished(published, seconds);
 
     // Which decode path ran is the release claim about RAW thumbnails ("the
     // camera's preview, not a dark frame"), and only the decoder knows it. It

@@ -64,6 +64,44 @@ Settings, and nothing about locations is behind the visible-folders passcode any
 more (stage U1). Turn the Photos tab row off in that editor for a share that is
 only meant to be a scene library.
 
+A location's tab is a folder browser, the same one every other picker tab uses
+(Console, Inbox and each USB stick since 0.6.0). It opens at the location's
+`Path`; the subfolders of the current folder are folder tiles first, then its
+photos and splat files, by name. Cross on a folder opens it, Circle goes up one
+level (at the share's top it leaves the picker), and the line under the tab
+shows the place inside the share (`2026 > july`), never the raw `smb0:/...`
+path. Files are picked one by one: Cross selects a photo and Square converts the
+selected photos; Cross on a splat file imports it from the share (it is read
+through the VFS like the photos); Square on a folder tile does nothing. Each
+visit is one directory listing over the VFS, on a worker, so SMB and NFS behave
+alike and the tree below the folder is never walked; names starting with a dot
+(macOS File Sharing's `.DS_Store` and `._*` files) are not shown. A folder or a
+share that cannot be read shows the adapter's own message instead of an empty
+folder. Scene libraries were never flattened: the albums home lists the
+albums, and a shelf one album's scenes, per listing (next section).
+
+## A location as a scene library
+
+`Settings > Network locations`, Cross on a location, opens its library the way
+the console opens its own: the **albums** screen, rooted at the location's
+`Path`. The albums are the subfolders of that folder that hold scenes (a scene is
+a folder with a `scene.psplat`), each with its scene count and a cover; the
+scenes directly in the folder itself are **Unsorted**, which is always there, as
+on the console. A folder with no scene in it - `Documents`, `Backups`, an empty
+folder - is not an album. Cross opens an album's shelf, Circle goes back up, and
+the shelf is the console's shelf: `+` converts into that album, Cross on a scene
+views it from the share without copying it, L3/R3 turns it. Each screen is one
+listing over the VFS, on a worker; a share that is switched off, or a path that
+is gone, shows the adapter's own message instead of "No scenes yet", and a
+library the passcode hides is blocked without contacting the share. Only the
+folder's direct subfolders are albums: a scene two levels down (`Path/a/b/scene`)
+is not listed, as on the console.
+
+Folders are made on the console, not on the share: there is no "New folder"
+tile and no Rename/Delete menu on a network library (Triangle says so). An album
+appears on a share when a conversion or an import into an album of that name is
+saved there (next section).
+
 ## Plain-text credentials
 
 **The password is stored as plain text** in `<state>/locations.json`
@@ -128,21 +166,29 @@ the source is left alone and the toast names it.
 
 ## Upload-then-delete
 
-Converting a photo whose folder is on a location (`Albums`/`Scenes` opened from
-the Locations screen, then `+` and Convert) does not write straight to the
-share:
+Converting a photo into a network library (the albums home opened from the
+Locations screen, an album's shelf, then `+` and Convert) or into the Output
+folder does not write straight to the share:
 
 1. the scene is written locally, to `<dataDir>/tmp/<job id>/`
    (`original.jpg`, `thumb.jpg`, `scene.psplat`, `meta.json`);
-2. `copy_tree` copies it to `<output root>/<album>/<scene folder>`;
+2. `copy_tree` copies it into a hidden folder beside the scene's final name,
+   `<output root>/<album>/.upload-<job id>/`;
 3. the staging folder must hold at least one file (an empty one is refused, so
    "every file arrived" is never vacuously true), and every file's size is
    compared with the staging copy;
-4. only then is the staging folder removed.
+4. only then is the hidden folder renamed to `<output root>/<album>/<scene
+   folder>` (one rename on the share: SMB and NFS both have it) and the staging
+   folder removed.
 
-A share that drops mid-upload therefore never leaves a half scene where the
-gallery scans (the scene folder is only valid once `meta.json` is there), and
-the job fails with the reason and the copy's path:
+A share that drops mid-upload therefore never leaves a half scene under a real
+name: what arrived sits in the hidden `.upload-<job id>` folder, which no
+library, album or picker listing shows (names starting with a dot are skipped
+everywhere). The failed attempt removes it when the share still answers, the
+next attempt of the same job removes it first when the share was off, and
+cancelling the job removes it as soon as the share is back. If the share never
+comes back, the hidden folder stays there, unseen, until it is deleted by hand.
+The job fails with the reason and the copy's path:
 
 ```
 upload failed: <reason>; kept at /data/ps5-splat-vr/tmp/job-000042
@@ -151,6 +197,100 @@ upload failed: <reason>; kept at /data/ps5-splat-vr/tmp/job-000042
 The kept folder is the finished scene; uploading it again by hand is enough to
 recover, and nothing in the gallery lists it (it is not under `scenes/`).
 A failed job's row in `Conversions` carries the same message.
+
+## Output folder
+
+`Settings > Output folder` says where every new scene is saved. The default is
+**Console**. To save on a share instead, open the row, pick the location's tab
+(every configured location is there, photo source or not), browse to the folder
+(Cross opens a folder, Circle goes up; only folders are listed) and press Square,
+**Use this folder**. The Console tab with Square puts it back. The row shows the
+choice as `<location name> > folder > folder`, never the raw path.
+
+The choice is one line in `<state>/ui.json`:
+
+```json
+{ "output_folder": "smb0:/scenes/Made" }
+```
+
+`""` (or no key) is the console. The value is checked on load: it must be a
+canonical location path (`<id>:/a/b`, no `..`, no empty component, no backslash,
+at most 1024 characters), anything else - a local path, a number, a hand-edited
+climb out of the folder - is ignored and the console is used, while the rest of
+the file is still read.
+
+What it changes:
+
+- Every conversion and every splat import started from the console's own
+  library (the Scenes shelf) builds the scene in `<dataDir>/tmp/<job id>/` and
+  uploads it as described above, into
+  `<output folder>/<album>/<scene folder>`: **the album of the shelf it was
+  started from** goes along, so a photo converted in the album `Trips` lands in
+  `<output folder>/Trips/<scene>`, and one converted in Unsorted lands loose in
+  `<output folder>/<scene>`, the same default the console has. The album folder
+  is created on the share on first use; an existing one is reused. The album's
+  name follows the console's album rules (`valid_album_name`: letters, digits,
+  space, `.`, `_`, `-`, at most 48 characters, no leading dot); a console folder
+  whose name breaks them (hand-made, say `Café`) cannot be made on a share, and
+  converting says "This folder's name cannot be used on a network share" instead
+  of dropping or rewriting the album. The convert dialog says where it goes ("into
+  NAS > Made > Trips"). A job keeps the folder and album it was queued with;
+  changing the setting does not move queued or finished scenes, and existing
+  scenes stay where they are. An import makes a converted copy there as well; the
+  original file is untouched.
+- A network library opened from `Settings > Network locations` (and then `+`)
+  keeps saving into itself, into the album it is showing: the user browsed there
+  on purpose.
+- Choosing a folder switches that location's **Splat library** on, so the
+  location is a row of Visible folders (unticked until the owner ticks it, as for
+  any location) and the scenes are not behind a missing switch.
+- Choosing an Output folder **never changes what a location shows**. The
+  location's row in `Settings > Network locations` always opens its own `Path`,
+  so every scene already there stays visible where it is. The new scenes lie at
+  `<output folder>/<album>/<scene>`, which a library listing only its direct
+  subfolders as albums does not reach when the Output folder is a folder *inside*
+  `Path` (one level too deep) or outside it. So the location that holds the
+  Output folder gets one more row under its own, `<location> > folders` with
+  "Output folder - new scenes are saved here", that opens the same albums screen
+  rooted at the Output folder: its albums are the folders the console shelf's
+  albums were saved into, and its Unsorted holds the loose scenes. Edit and
+  delete on that row act on the location. When the Output folder *is* the
+  location's `Path`, there is no second row.
+- If the location has since been removed, converting says so and queues nothing;
+  a scene is never saved on the console behind the user's back.
+
+### When the share is off
+
+A scene is built before it is uploaded, so the share is first needed at the end.
+If the output folder's location is configured but does not answer at that point
+(the probe is one stat of the destination root, 5 s at most per attempt), the job
+does not fail:
+
+1. its row in `Settings > Conversions` becomes `Waiting for <location name>`;
+   the top-bar conversion chip stays up and says `Waiting` (`Waiting · 2`, or
+   `Converting · 1 queued · 1 waiting` beside a conversion in progress), and the
+   album's shelf shows the photo as a pending tile badged `Waiting` (Cross on it
+   toasts `Waiting for <location name>`), like any unfinished job;
+2. the finished scene stays in `<dataDir>/tmp/<job id>/` - the only thing kept on
+   the console - and the queue file records the job as `waiting`;
+3. the job retries by itself, after 5 s, then 10 s, 20 s, 40 s, 80 s and then
+   every 120 s, and **at once when the app starts** (the wait survives a restart
+   through `jobs.json`; the temporary folder is not swept while a job waits);
+   other conversions are not held up behind it;
+4. when the share answers, the scene is uploaded under a name that is free *now*
+   (a scene of the same name that appeared meanwhile is never overwritten; an
+   earlier attempt's hidden `.upload-<job id>` folder is removed first, so a
+   retry gives one scene folder and no `-2` copy), verified, renamed to its
+   name, the temporary folder removed, and the row becomes `Done`;
+5. Square on the row cancels it and removes the temporary folder, even while an
+   attempt is uploading (a scene that attempt had just put on the share is
+   removed again, and so is the hidden folder a dropped attempt left).
+
+Only "the location does not answer" waits. A share that answers and then refuses
+the write, or a location this console no longer knows, fails as before
+(`upload failed: ...; kept at ...`). A retry that the process died in simply
+stays waiting; a job that died while converting, or in its first upload, is
+re-queued like any running job and converts again.
 
 ## Error strings the screens show
 
@@ -162,6 +302,9 @@ A failed job's row in `Conversions` carries the same message.
 | a share whose path is missing | `offline: smb0: "scenes" does not exist on nas.local` |
 | a save with no host or share | `a location needs a host` / `a location needs a share` |
 | an upload that failed | `upload failed: <reason>; kept at <path>` |
+| a scene waiting for its share | `Waiting for <location name>` (row in Conversions, pending tile on the shelf; cancel with Square) |
+| a console album whose name a share cannot take | `This folder's name cannot be used on a network share. Rename the folder first.` |
+| the Output folder's location removed | `The output folder's network location was removed. Choose another in Settings.` |
 | an NFS mount that does not answer | `offline: nfs0: cannot mount nas.local:/export: <libnfs reason>` |
 | NFS support not built in | `offline: nfs0: NFS support is not built into this version` |
 | an export path that does not exist | `offline: nfs0: "scenes" does not exist on nas.local` |

@@ -18,16 +18,32 @@
 // place the photos are looked for; the editor's return re-lists the tabs and
 // the new location is there.
 //
-// In the Console tab, Cross on a folder enters it and Circle goes back up; at
-// the top Circle leaves the picker as usual. Folders, photos and (L2) splat
-// files are shown, and the place is a breadcrumb under the tab ("photos >
-// 2026-10"; the tab itself says "Console"), never a raw path.
+// Every file-backed tab is a folder browser, the way Finder or Windows Explorer
+// shows one (user, 2026-11-07: "Just give me folder structure ... and just pick
+// myself which ones I want imported"): Console, Inbox, each USB stick and each
+// network location use the same code. A tab opens at its top (the Inbox, the
+// stick, the share's path; Console shows /data and each extended storage as
+// folder tiles when there are several), the sub-folders are folder tiles first,
+// then that one folder's photos and splat files. Cross on a folder enters it and
+// Circle goes back up; at the top Circle leaves the picker as usual. The place
+// is a breadcrumb under the tab ("photos > 2026-10"; the tab itself says
+// "Console"), never a raw path; at a top the line says where the files come
+// from. Each visit is one directory listing over the VFS (local, SMB and NFS
+// alike); nothing walks a tree, and nothing imports or searches a whole folder.
+// Square on a folder tile does nothing: files are picked one by one.
 //
 // A splat file (an already-converted scene: .splat, .spz, .compressed.ply, ...)
-// is a tile labelled "SPLAT · spz" with a SPLAT badge. Cross imports it into the
-// album the picker was opened for; it is never added to the photo basket. Square
-// on a folder row imports every splat file at most three levels below it (at
-// most 50), so a whole export can be brought in from one folder.
+// is a tile labelled "SPLAT · spz" with a SPLAT badge. Cross imports it into
+// the album the picker was opened for, from any source including a network
+// folder; it is never added to the photo basket, which holds photos only.
+//
+// Settings > Output folder pushes this same screen in its choose-a-folder mode
+// (ScreenArgs::a == kPickFolderMode): the tabs are "Console" (new scenes stay on
+// this console) and one per network location, every location, photo source or
+// not; only folders are listed; Cross opens one and Circle goes up as everywhere;
+// Square is "Use this folder" (on the Console tab, "Use the console"). The choice
+// is written to UiState::output_folder, the location's splat library is switched
+// on so the scenes show in its library, and the screen closes.
 //
 // The tabs are rebuilt from the filesystem on on_enter(), on every tab switch
 // and from refresh(): a USB stick that was pulled out is gone afterwards.
@@ -66,15 +82,19 @@ struct PhotoTab {
     std::string title;       // "Inbox", "Console", "USB" / "USB 1", "Captures",
                              // the location's name, "+ Add network location"
     std::string label;       // the tab text (the title)
-    Path dir;                // source directory; empty on console/captures and without a stick
+    Path dir;                // the top of its folder browser; empty on console/captures
+                             // and without a stick
     bool removable = false;  // a USB stick: dropped when it vanishes
     bool captures = false;
     bool console = false;
-    // A network location's photo source: dir is "<id>:/<path>", and the count
-    // is not computed (a tab label must not wait on a NAS).
+    // A network location's photo source: dir is "<id>:/<path>" and is the top of
+    // its folder browser; the count is not computed (a tab label must not wait
+    // on a NAS).
     bool location = false;
     // The terminal tab: Cross opens the location editor (stage U1).
     bool add_location = false;
+    // The photo and splat files directly at an Inbox or USB tab's top (not
+    // below it), the capture count on Captures; 0 elsewhere.
     std::size_t count = 0;
 };
 
@@ -84,11 +104,10 @@ public:
     void update(UiContext& ctx, const UiInput& input) override;
     void draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) override;
     std::vector<Hint> hints() const override;
-    std::string title() const override { return "Add photos"; }
+    std::string title() const override { return pick_folder_ ? "Output folder" : "Add photos"; }
     bool handle_back(UiContext& ctx) override;
 
-    // Re-discovers the sources and re-lists every one of them (the counts are
-    // part of the tab labels). Keeps the current tab while its id is still
+    // Re-discovers the sources and recounts them. Keeps the current tab while its id is still
     // there, otherwise falls back to the first tab (Inbox).
     void refresh(UiContext& ctx);
     // Switches to `index` (clamped) and clears the basket: a basket belongs to
@@ -105,9 +124,6 @@ public:
     // Clockwise quarter turns the focused photo carries (0 when the focus is
     // not on a photo).
     int focused_quarters() const;
-    // Square on a folder row: imports every splat file below it. Public so a
-    // test can drive the same path the button takes.
-    void import_splat_folder(UiContext& ctx, const Path& dir);
     bool selected(const Path& path) const;
     // The empty-state line of the current tab ("" when it has photos).
     const std::string& message() const { return message_; }
@@ -116,12 +132,15 @@ public:
     std::size_t thumbnail_loads() const { return thumbs_.loads(); }
     // The destination folder ("" = the loose scenes).
     const std::string& album() const { return album_; }
-    // The console browser's folder ("" = the list of roots).
-    const Path& console_dir() const { return console_dir_; }
+    // The folder the browser shows: a console folder ("" = the list of roots), a
+    // folder of the Inbox or a stick, or a folder of a network location
+    // ("<id>:/<path>").
+    const Path& browse_dir() const { return browse_dir_; }
     // The dim line under the tabs: where this tab's photos come from.
     std::string location() const;
-    // The console browser's place below the tab: the storage (when there are
-    // several), then the folders; empty at the top.
+    // The browser's place below the tab: on Console the storage (when there are
+    // several), then the folders; on any other tab the folders below its top.
+    // Empty at the top.
     std::vector<std::string> breadcrumb() const;
     // The grid area below the tab header: the one rect the picker lays its tiles
     // out in, for the tests' area table too (no second copy of kGridTop).
@@ -132,6 +151,11 @@ public:
     std::vector<Rect> tab_rects(const Rect& content, const UiTheme& theme) const;
     int tab_first(const Rect& content, const UiTheme& theme) const;
     bool on_add_location() const;
+    // ScreenArgs::a that turns the picker into the Output folder chooser.
+    static constexpr const char* kPickFolderMode = "pick-output-folder";
+    // The first tab of the chooser: new scenes stay on this console.
+    static constexpr const char* kConsoleOutputTab = "console-output";
+    bool picking_folder() const { return pick_folder_; }
     static constexpr const char* kAddLocationLabel = "+ Add network location";
     static constexpr const char* kAddLocationHint =
         "Add a network location to pick photos from that share.";
@@ -142,7 +166,7 @@ private:
         Path path;
         std::string name;
         uint64_t size = 0;
-        bool folder = false;     // console browser: a folder to enter
+        bool folder = false;     // folder browser: a folder to enter
         bool supported = true;   // false: an HDR capture
         int rotate_quarters = 0; // Square on this tile: the turn it is drawn with
         bool splat = false;      // an already-converted splat file: import it
@@ -151,12 +175,24 @@ private:
 
     bool on_captures() const;
     bool on_console() const;
+    // The tabs that browse folder by folder: every one that has a place to list
+    // (Console, Inbox, a USB stick, a network location).
+    bool on_browser() const;
     // What the worker publishes for a file-backed tab.
     struct TabListing {
         std::vector<Entry> entries;
         std::string message;
     };
 
+    // Makes `tabs` the strip, keeping the tab whose id is `keep` when it is still
+    // there (else the first), and lists it. The tail refresh() and the chooser
+    // share.
+    void install_tabs(UiContext& ctx, std::vector<PhotoTab> tabs, const std::string& keep);
+    // The chooser's tabs: Console, then every configured location.
+    void refresh_output_tabs(UiContext& ctx);
+    // Square in the chooser: stores the folder (or the console) as the output
+    // folder and closes the screen.
+    void use_folder(UiContext& ctx);
     void request_tab();
     void apply_tab(UiContext& ctx);
     void load_tab(UiContext& ctx);
@@ -167,7 +203,12 @@ private:
     void enter_folder(UiContext& ctx, const Path& dir);
     std::string root_label(std::size_t index) const;
     int root_index(const Path& dir) const;
-    bool at_console_top() const;
+    bool at_browse_top() const;
+    // The browser's top folder on the current tab (the Inbox, a stick or a
+    // location's path; empty on Console, whose top is the list of storages) and
+    // the folder one level up from browse_dir_, never above that top.
+    Path browse_top() const;
+    Path browse_parent() const;
     // The visible-folders key of a photo from the current tab ("" when this
     // build has no policy context: the old meta.json is written then). It is
     // information for meta.json; the picker is not filtered by it.
@@ -187,6 +228,8 @@ private:
     // on success).
     void poll_copy(UiContext& ctx);
 
+    // The Output folder chooser rather than the photo picker (kPickFolderMode).
+    bool pick_folder_ = false;
     std::string album_;
     // The library root the picker was opened for: the local scene folder, or a
     // network library (ScreenArgs::b). A conversion from a remote root is
@@ -198,7 +241,7 @@ private:
     // location, published by update() through apply_tab().
     vfs::AsyncListing listing_;
     std::vector<PhotoSource> console_roots_;
-    Path console_dir_;
+    Path browse_dir_;
     Path data_root_;   // shown as /data in paths
     Path hidden_dir_;  // the app's own folder, not listed in the browser
     std::vector<PhotoPick> selection_;

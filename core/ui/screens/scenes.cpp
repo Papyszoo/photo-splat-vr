@@ -27,16 +27,31 @@ namespace {
 
 constexpr uint32_t kPhotoThumbEdge = 320;
 
-bool pending_state(const std::string& state) { return state == "queued" || state == "running"; }
+bool same_folder(const Path& a, const Path& b) {
+    return !a.empty() && !b.empty() && a.lexically_normal() == b.lexically_normal();
+}
+
+// An unfinished job: a scene waiting for its network folder (state "waiting") is
+// one, like a queued or running conversion.
+bool pending_state(const std::string& state) {
+    return state == "queued" || state == "running" || state == "waiting";
+}
 
 std::string job_badge(const JobView& job) {
     if (job.state == "queued") return "Queued";
+    if (job.state == "waiting") return "Waiting";
     if (!job.message.empty()) return "Stopping";
     return "Converting";
 }
 
-bool same_folder(const Path& a, const Path& b) {
-    return !a.empty() && !b.empty() && a.lexically_normal() == b.lexically_normal();
+// The conversion belongs to this shelf: the same album and, on a network
+// library, the same library root (a job for another root, or for a console
+// album of the same name, is not one of its scenes). A console shelf also shows
+// the jobs started from it, whose scenes are saved on the Output folder.
+bool job_for_shelf(const JobView& job, const std::string& album, const Path& root) {
+    if (job.album != album) return false;
+    if (!vfs::is_remote(root)) return true;
+    return same_folder(job.output_root, root);
 }
 
 // The placement the screen was opened for: an album (or Unsorted) under the
@@ -158,7 +173,7 @@ void ScenesScreen::apply_scenes(UiContext& ctx) {
                 }
                 continue;
             }
-            if (job.album != album_) continue;
+            if (!job_for_shelf(job, album_, root_)) continue;
             if (pending_state(job.state)) {
                 pending_.push_back(job);
             } else {
@@ -321,7 +336,7 @@ bool ScenesScreen::sync_jobs(UiContext& ctx) {
             if (pending_state(job.state)) rotating.push_back(job);
             continue;
         }
-        if (job.album != album_) continue;
+        if (!job_for_shelf(job, album_, root_)) continue;
         if (pending_state(job.state)) {
             pending.push_back(job);
         } else {
@@ -513,9 +528,16 @@ void ScenesScreen::update(UiContext& ctx, const UiInput& input) {
     if (scene < 0) {
         const JobView& job = pending_[static_cast<std::size_t>(focus - 1)];
         const int percent = static_cast<int>(job.fraction * 100.0f + 0.5f);
-        ctx.toast(job.state == "queued"
-                      ? job.name + " is waiting for its turn"
-                      : job.name + ": converting " + std::to_string(percent) + "%");
+        if (job.state == "queued") {
+            ctx.toast(job.name + " is waiting for its turn");
+        } else if (job.state == "waiting") {
+            // The scene is finished; the row's message names the share it is
+            // waiting for ("Waiting for NAS").
+            ctx.toast(job.message.empty() ? job.name + " is waiting for its network folder"
+                                          : job.message);
+        } else {
+            ctx.toast(job.name + ": converting " + std::to_string(percent) + "%");
+        }
         return;
     }
     if (is_rotating(items_[static_cast<std::size_t>(scene)].folder)) {

@@ -10,8 +10,15 @@
 #include "common/status.h"
 #include "model/converter.h"
 #include "model/http_fetch.h"
+#include "model/segmented_download.h"
 
 namespace splat {
+
+// Where the source download sits on the one progress bar fetch() reports
+// (download 0.05 .. 0.70, then verify, then convert). The models row turns the
+// bar back into bytes for its time estimate.
+inline constexpr float kFetchDownloadStart = 0.05f;
+inline constexpr float kFetchDownloadSpan = 0.65f;
 
 // C1 state machine, one instance per backend.
 //
@@ -82,6 +89,11 @@ struct ModelManagerOptions {
                                                          const Path& source, const Path& out,
                                                          Progress& progress)>;
     Converter converter;
+    // A download with at least this much left to fetch, from a server that offers
+    // byte ranges, runs as `segment_count` parallel ranged requests
+    // (core/model/segmented_download.h); anything else is one GET. A test seam.
+    uint64_t segment_min_bytes = kSegmentedMinBytes;
+    int segment_count = kSegmentedCount;
 };
 
 // Layout under the state directory:
@@ -89,6 +101,7 @@ struct ModelManagerOptions {
 //   models/<backend>.json    persisted state machine record
 //   downloads/<filename>     verified source checkpoint
 //   downloads/<filename>.part  resumable partial download
+//   downloads/<filename>.part.segments  per-segment resume state of a parallel download
 //   models/<backend>.gguf    converted runtime file
 //   inbox/                   offline drop folder (FTP/USB)
 class ModelManager {
@@ -156,6 +169,8 @@ private:
     IHttpFetcher* fetcher_ = nullptr;
     std::vector<ModelBackendSpec> specs_;
     ModelManagerOptions::Converter converter_;
+    uint64_t segment_min_bytes_ = kSegmentedMinBytes;
+    int segment_count_ = kSegmentedCount;
 };
 
 }  // namespace splat

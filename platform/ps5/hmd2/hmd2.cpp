@@ -240,6 +240,8 @@ struct State {
     // only thing it says about the mirror's geometry.
     bool mirror = false;
     bool mirror_on = false;
+    bool mirror_resolved = false;     // the five mirroring exports are bound
+    int hmd2_module = -1;             // libSceHmd2's handle, for a late resolve
     void *mirror_work = nullptr;
     void *mirror_display = nullptr;
     size_t mirror_work_bytes = 0;
@@ -863,6 +865,15 @@ bool open_video_out() {
 // pointer is checked (the exports are optional, and setup() only resolves them
 // when MIRROR=1), every return code is checked, and each failure leaves the
 // mirror off, logs one line and lets VR run.
+// The five mirroring exports, optional: a firmware without them costs the TV,
+// never the session. Shared by setup() (Config::mirror) and start_mirror().
+bool resolve_mirror_exports(const char **missing) {
+    return resolve_module(s.hmd2_module, "libSceHmd2.sprx", kHmd2MirrorSlots,
+                          kSlots(kHmd2MirrorSlots), kTables_libSceHmd2,
+                          sizeof kTables_libSceHmd2 / sizeof *kTables_libSceHmd2, missing,
+                          false /* optional */);
+}
+
 void mirror_start() {
     if (s.mirror_on)
         return;
@@ -989,12 +1000,13 @@ bool setup(const Config &config) {
     // The mirroring exports are optional: MIRROR=0 does not resolve them at
     // all, and a library or firmware without them leaves the mirror off rather
     // than aborting the session. One line says why; VR continues.
+    s.hmd2_module = handle;
+    s.mirror_resolved = false;
     if (s.mirror) {
         const char *mirror_missing = nullptr;
-        if (!resolve_module(handle, "libSceHmd2.sprx", kHmd2MirrorSlots,
-                            kSlots(kHmd2MirrorSlots), kTables_libSceHmd2,
-                            sizeof kTables_libSceHmd2 / sizeof *kTables_libSceHmd2, &mirror_missing,
-                            false /* optional */)) {
+        if (resolve_mirror_exports(&mirror_missing)) {
+            s.mirror_resolved = true;
+        } else {
             s.mirror = false;
             logf("hmd2: TV mirror off: libSceHmd2 does not provide %s; VR continues",
                  mirror_missing != nullptr ? mirror_missing : "the mirroring exports");
@@ -1486,6 +1498,25 @@ size_t image_bytes() {
 }
 
 bool mirroring() {
+    return s.mirror_on;
+}
+
+bool start_mirror() {
+    if (!s.active)
+        return false;
+    if (s.mirror_on)
+        return true;
+    if (!s.mirror_resolved) {
+        const char *missing = nullptr;
+        if (!resolve_mirror_exports(&missing)) {
+            logf("hmd2: TV mirror unavailable: libSceHmd2 does not provide %s",
+                 missing != nullptr ? missing : "the mirroring exports");
+            return false;
+        }
+        s.mirror_resolved = true;
+    }
+    s.mirror = true;
+    mirror_start();
     return s.mirror_on;
 }
 

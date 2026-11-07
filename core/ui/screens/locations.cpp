@@ -6,6 +6,7 @@
 
 #include "ui/screen_stack.h"
 #include "ui/text_fit.h"
+#include "ui/ui_state.h"
 #include "vfs/io.h"
 
 namespace splat {
@@ -38,7 +39,14 @@ void LocationsScreen::refresh(UiContext& ctx) {
     // the owner adds, edits and removes shares here, with or without one.
     const std::vector<LocationView> locations = ctx.svc.locations->list();
 
-    std::string states;
+    // The Output folder is a row of its own when it is not the library the
+    // location's row already opens (see below); a change of the setting rebuilds
+    // the list.
+    const std::string output = ctx.svc.state != nullptr
+                                   ? canonical_output_folder(Path(ctx.svc.state->output_folder))
+                                   : std::string();
+
+    std::string states = output + ";";
     for (const LocationView& location : locations) states += location.id + "=" + location.state + ";";
     if (static_cast<int>(locations.size()) == last_count_ && states == last_states_) return;
     last_count_ = static_cast<int>(locations.size());
@@ -53,9 +61,13 @@ void LocationsScreen::refresh(UiContext& ctx) {
     const int focus = list_.focus();
     ids_.clear();
     names_.clear();
+    roots_.clear();
     std::vector<ListRow> rows;
-    rows.reserve(locations.size() + 1);
+    rows.reserve(locations.size() + 2);
     for (const LocationView& location : locations) {
+        // A location's row always opens its own library (its Path): choosing an
+        // Output folder never changes which scenes the location shows.
+        const std::string root = vfs::join(location.id, location.path).string();
         ListRow row;
         row.label = location.name;
         row.sublabel = share_line(location);
@@ -63,6 +75,23 @@ void LocationsScreen::refresh(UiContext& ctx) {
         rows.push_back(std::move(row));
         ids_.push_back(location.id);
         names_.push_back(location.name);
+        roots_.push_back(root);
+
+        // The Output folder on this location is where the new scenes are saved
+        // (<folder>/<album>/<scene>). When it is not the library above - a folder
+        // inside it (the scenes are one level deeper than the library lists) or
+        // outside it - it is a library row of its own, so both stay visible.
+        if (!output.empty() && vfs::location_id(Path(output)) == location.id &&
+            output != canonical_output_folder(Path(root))) {
+            ListRow saved;
+            saved.label = network_folder_text(ctx.svc.locations, Path(output));
+            saved.sublabel = "Output folder \xC2\xB7 new scenes are saved here";
+            saved.right = location.state;
+            rows.push_back(std::move(saved));
+            ids_.push_back(location.id);
+            names_.push_back(location.name);
+            roots_.push_back(output);
+        }
     }
     ListRow add;
     add.label = kAddLabel;
@@ -70,19 +99,23 @@ void LocationsScreen::refresh(UiContext& ctx) {
     rows.push_back(std::move(add));
     ids_.push_back(std::string());
     names_.push_back(kAddLabel);
+    roots_.push_back(std::string());
 
     list_.set_rows(std::move(rows));
     list_.set_focus(focus);
 }
 
-void LocationsScreen::open_library(UiContext& ctx, const std::string& id) {
+void LocationsScreen::open_library(UiContext& ctx, int row) {
     if (ctx.svc.locations == nullptr) return;
+    const std::string& id = ids_[static_cast<std::size_t>(row)];
     for (const LocationView& location : ctx.svc.locations->list()) {
         if (location.id != id) continue;
+        // The library opens as the console's own does: its folders that hold
+        // scenes are the albums (ScreenId::Albums), the row's root being the
+        // location's Path or the Output folder.
         ScreenArgs args;
-        args.a.clear();  // the location root itself is the album
-        args.b = vfs::join(location.id, location.path).string();
-        ctx.nav.push(ScreenId::Scenes, args);
+        args.b = roots_[static_cast<std::size_t>(row)];
+        ctx.nav.push(ScreenId::Albums, args);
         return;
     }
     ctx.toast("That location is gone");
@@ -152,7 +185,7 @@ void LocationsScreen::update(UiContext& ctx, const UiInput& input) {
     if (id.empty()) {
         open_edit(ctx, std::string());
     } else {
-        open_library(ctx, id);
+        open_library(ctx, focus);
     }
 }
 

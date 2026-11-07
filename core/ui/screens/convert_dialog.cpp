@@ -15,6 +15,7 @@
 #include "ui/job_service.h"
 #include "ui/screen_stack.h"
 #include "ui/text_fit.h"
+#include "ui/ui_state.h"
 #include "vfs/io.h"
 
 namespace splat {
@@ -51,10 +52,22 @@ void ConvertDialog::on_enter(UiContext& ctx, const ScreenArgs& args) {
         const std::string key = index < args.sources.size() ? args.sources[index] : std::string();
         picks_.push_back(PhotoPick{photos_.back(), quarters, key});
     }
-    album_ = args.a;
-    // Only a network library overrides the runner's root; a local one is
-    // already where the runner writes.
-    output_root_ = !args.b.empty() && vfs::is_remote(Path(args.b)) ? Path(args.b) : Path();
+    // Where the scenes go: the network library the picker was opened for, else
+    // the Output folder setting, else the runner's own root. A network
+    // destination keeps the shelf's album (<root>/<album>/<scene>). An Output
+    // folder whose location is gone is an error here, never a scene saved on the
+    // console.
+    const Result<SceneTarget> target =
+        scene_target(ctx.svc.state, ctx.svc.locations, Path(args.b), args.a);
+    target_error_ = target.ok() ? std::string() : target.message();
+    album_ = target.ok() ? target.value().album : args.a;
+    output_root_ = target.ok() ? target.value().root : Path();
+    destination_text_ = output_root_.empty() || ctx.svc.locations == nullptr
+                            ? std::string()
+                            : network_folder_text(ctx.svc.locations, output_root_);
+    if (!destination_text_.empty() && !album_.empty()) {
+        destination_text_ += " \xE2\x80\xBA " + album_;
+    }
     jobs_available_ = ctx.svc.jobs != nullptr;
     refresh_blocked();
     preview_ = UiImage{};
@@ -133,6 +146,9 @@ std::string ConvertDialog::folder_line() const {
     // The destination line. Empty while blocked: the album name is a hidden
     // folder's name, and a dialog left open under Settings is visible.
     if (blocked_) return {};
+    // A network destination reads as the location and folder, the way Settings
+    // names it; a local one as the album.
+    if (!destination_text_.empty()) return "into " + destination_text_;
     return "into " + (album_.empty() ? std::string(kAllScenesAlbumName) : album_);
 }
 
@@ -176,6 +192,10 @@ void ConvertDialog::start(UiContext& ctx) {
         ctx.toast("Conversion is not available on this build");
         return;
     }
+    if (!target_error_.empty()) {
+        ctx.toast(target_error_);
+        return;
+    }
     if (picks_.empty()) {
         ctx.toast("No photos selected");
         return;
@@ -208,6 +228,7 @@ void ConvertDialog::start(UiContext& ctx) {
 
 std::string ConvertDialog::message() const {
     if (blocked_) return kNotVisibleText;
+    if (!target_error_.empty()) return target_error_;
     if (!jobs_available_) return "Conversion is not available on this build";
     return {};
 }

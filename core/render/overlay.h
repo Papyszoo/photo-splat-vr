@@ -70,8 +70,14 @@ public:
 
     // Replaces the quad list (draw order: first quad is behind). Empty clears.
     Status set_quads(std::vector<OverlayQuad> quads);
+    // The TV's own quad list (0.6.0, render/tv_view.h): drawn by record_tv()
+    // onto the TV image with the TV camera, never into the eyes. It shares the
+    // textures of the eye list (the menu canvas is uploaded once) and the one
+    // vertex buffer, so setting either list keeps the other.
+    Status set_tv_quads(std::vector<OverlayQuad> quads);
 
     bool has_quads() const { return !quads_.empty(); }
+    bool has_tv_quads() const { return !tv_quads_.empty(); }
     size_t quad_count() const { return quads_.size(); }
     size_t texture_count() const { return textures_.size(); }
 
@@ -82,6 +88,9 @@ public:
     // encode, which is what the "gamma-space blending" target is.
     void record(VkCommandBuffer command_buffer, const OverlayCamera& camera,
                 bool srgb_target = true);
+    // The same for the TV list, with the TV camera and the TV image bound.
+    void record_tv(VkCommandBuffer command_buffer, const OverlayCamera& camera,
+                   bool srgb_target = true);
 
 private:
     OverlayRenderer() = default;
@@ -94,6 +103,10 @@ private:
         // which staging size the slot needs.
         VkFormat format = VK_FORMAT_UNDEFINED;
     };
+    Status check_textures(const std::vector<OverlayQuad>& quads) const;
+    Status rebuild_vertices();
+    void record_range(VkCommandBuffer command_buffer, const OverlayCamera& camera,
+                      bool srgb_target, const std::vector<OverlayQuad>& list, size_t first);
     Status upload_texture(Texture& texture, VkFormat format, uint32_t width, uint32_t height,
                           const uint8_t* pixels);
     Result<uint32_t> allocate_texture(VkFormat format, uint32_t width, uint32_t height,
@@ -120,6 +133,7 @@ private:
 
     VulkanBuffer vertices_;
     std::vector<OverlayQuad> quads_;
+    std::vector<OverlayQuad> tv_quads_;   // vertices follow quads_' in the buffer
     std::vector<Texture> textures_;
 };
 

@@ -429,14 +429,15 @@ save (DECISIONS.md, "Change 2026-11-05"). A scene is turned left or right by 90
 degrees on its entry in the panel (L3/R3), which rewrites the scene's own files.
 The
 background is black: the
-clear colour and the comfort fade's backdrop are both black, and the TV mirror
-shows the same buffers. There is no auto-exit by default (`SECONDS=0`); a dev
+clear colour and the comfort fade's backdrop are both black, and so is the TV
+picture's. There is no auto-exit by default (`SECONDS=0`); a dev
 run can set a cap, and the quit-watch file or Options → Quit ends the session.
 
 | Action | DualSense | Sense controllers |
 | --- | --- | --- |
-| Quit | **Options** | right: **Options** |
-| Recentre (hold 1 s) | **Cross** | right: **Cross** |
+| Menu (tap, on release) | **Options** | right: **Options** |
+| Recentre the scene and the open window (hold 1 s) | **Options** | right: **Options** |
+| Recentre (hold 1 s; the scene, or the window while the menu is open) | **Cross** | right: **Cross** |
 | Previous scene | **L1** | left: **L1 tap** (a hold is the grab) |
 | Next scene | **R1** | right: **R1 tap** (a hold is the grab) |
 | Grab (hold): the scene follows that hand; both grips also scale it about the point between them (W26) | — | left: **L1 hold**, right: **R1 hold** - a tap instead steps the scene |
@@ -486,8 +487,14 @@ import has no capture camera to give it a size; a converted scene keeps the
 session's scale.
 
 The buttons are mapped by meaning, not by position, and both devices feed the
-same table (`platform/ps5/viewer/pad_input.h`): Options is the only quit button,
-and it is on the DualSense and the right Sense controller. **R3 no longer
+same table (`platform/ps5/viewer/pad_input.h`): Options is the menu button (the
+panel's Quit item ends the session), on the DualSense and the right Sense
+controller. It resolves on release (`ui_mode.h` `OptionsGate`): a tap opens the
+menu, **a 1 s hold recentres the scene and the open window and never opens or
+closes anything**, with the same "Hold to recentre" bar (shown once the press
+passes a quarter second, so a tap does not flash it). The system sends a title
+no reset-view event (no export in libSceHmd2/libSceVrTracker2; HLA-PSVR2 reads
+the same hold itself), so this is the viewer's own. **R3 no longer
 recentres and a short Cross press does nothing**: a 1 s hold is what recentres,
 and the head-locked HUD under the view centre shows a thin bar filling up and
 "Hold to recentre" while it is held. Releasing early cancels. Create is the
@@ -544,8 +551,9 @@ keeps streaming until that window closes even after the end line, so pass
   capture-frustum fade blends into **black**: the renderer's clear colour and
   its comfort backdrop are the same value, set to 0 for VR, so the void around
   the photo and the fade past the comfort radius are black in both eyes and on
-  the TV mirror (the mirror shows the same eye buffers). The frames submitted
-  before the scene is placed are the untouched (black) eye buffers.
+  the TV (its picture is the same scene, cropped). The frames submitted before
+  the scene is placed are the untouched (black) eye buffers; with the TV output
+  up the TV shows the scene, a banner and the menu meanwhile.
 - **First placement (VR7)**: the scene is placed when the headset is worn, the
   tracker has a pose, and that pose has **held for 0.5 s with no tracker jump**
   (more than 10 deg or 4 cm in one sample - a SLAM re-anchor, not a head turn).
@@ -629,17 +637,46 @@ keeps streaming until that window closes even after the end line, so pass
   in the 2026-10-26 23:17 session were lost that way, every one an L1, because
   the on-demand upload was refused while the forward preload held the slot
   (`a scene is already staged`).
-- The TV shows the headset's view: Hmd2's social screen (mirroring) is on by
-  default, so a Create-button recording captures what the headset shows instead
-  of black. It is Hmd2's compositor that writes it, next to the frames this loop
-  already submits, so it costs the loop no frame, thread or copy; the log says
-  `vr mirror: on (Hmd2 social screen …)` once, then `mirror=…fps` in the
-  one-second line. `MIRROR=0` in `viewer.env` (or `--env` a file holding it)
-  turns it off if it ever costs VR frames; `mirror=off` then replaces the rate.
+- **The TV (0.6.0, "one menu, two views").** The title drives the TV itself: it
+  opens the main VideoOut port at the start of the session (before the headset
+  is worn) and shows the scene as the left eye sees it, cropped to 16:9 and
+  centred on the eye's optical axis, with **no VR window, scene label or HUD**,
+  at 30 fps. While the menu is open the same menu canvas is drawn flat over the
+  whole TV picture, fixed there, and any controller drives it (DualSense or
+  Sense); the VR person sees the same menu as the world-fixed window. While the
+  headset has not been put on, the TV shows the scene at the capture pose, a
+  "Waiting for the headset" banner and, when the menu is open, the menu: the
+  person at the TV can browse and pick a scene before anyone wears the headset
+  (the session keeps waiting without the five-minute limit; Quit in the menu
+  ends it). The picture is taken inside the renderer between the comfort pass and
+  the overlay pass (a blit, the TV quads, a readback into one of three slots);
+  the CPU tile write and the flip wait are on a worker thread, and a worker that
+  is behind only costs the TV a frame (`tvdrop=`), never the headset a wait.
+  Fallbacks (one line each, VR unaffected): `TV_OUTPUT=0` in `viewer.env`, a
+  main port the system refuses (`viewer: vr tv output: FAIL the main VideoOut
+  port would not open (...); the Hmd2 mirror carries the TV instead`), or a port
+  that stops working during the session (30 failed presents in a row, or 3 flips
+  in a row the system never showed: `viewer: vr tv output: FAIL ...; back to the
+  Hmd2 mirror (...)`) give the TV back to Hmd2's social screen as through 0.5.x
+  (`MIRROR=0` turns that off too: the TV then keeps the console UI).
+- **What to look for in the log** (all `viewer: ...`):
+
+      viewer: config ...: mode=vr ... mirror=1 tv_output=1
+      viewer: vr tv output: main VideoOut port open (1920x1080, 30 fps): the TV shows the scene without the VR window or HUD, and the flat menu while it is open
+      viewer: vr mirror: off (the title drives the TV itself, see vr tv output)
+      viewer: vr t=1s fps=60.0 ... gpu=11.3 ms ... mirror=off tv=on tvfps=30.0 tvtile=3.1 ms tvgpu=0.35 ms tvdrop=0 tverr=0
+
+  Good: `tv=on`, `tvfps` about 30, `tverr=0`, `tvdrop` low, and the VR numbers
+  (`fps` 60, `gpu`, `copy`, `slow=`, `missed=0`) the same as a run with
+  `TV_OUTPUT=0` (`tv=mirror`). `tvgpu` is the GPU time of the TV copy per TV
+  frame (blit, quads, readback), `tvtile` the CPU tile write per flip. If the
+  port opens but the TV stays on the console UI or black, the log says
+  `FAIL the system did not show 3 flips in a row` within seconds and `tv=mirror`
+  follows. Send the `vr tv output` lines and a few `tv=` lines either way.
 - Success (klog; the kernel prefix is the process name, match the text):
 
   ```
-  <118>[PPSA99202] viewer: config /data/ps5-splat-vr/bench/viewer.env: mode=vr scene=(first) seconds=1800 comfort_radius=0.250 m world_scale=1.00 preload=1 mirror=1
+  <118>[PPSA99202] viewer: config /data/ps5-splat-vr/bench/viewer.env: mode=vr scene=(first) seconds=1800 comfort_radius=0.250 m world_scale=1.00 preload=1 mirror=1 tv_output=1
   <118>[PPSA99202] viewer: mode vr (MODE=vr in /data/ps5-splat-vr/bench/viewer.env); TV mode is MODE=tv
   <118>[PPSA99202] viewer: vr session (mode vr): eye 1984x2048 per eye, 60 rendered -> 120 Hz reprojected, cap 1800 s
   <118>[PPSA99202] viewer: vr log: /data/ps5-splat-vr/logs/session-20261027-190102.csv (one row per submitted frame, flushed every second, at most 32 MiB)
@@ -694,8 +731,10 @@ keeps streaming until that window closes even after the end line, so pass
   `missed=0` (a single 1 is the first frame), `queue-full=0`, `err=0`,
   `worn=1`, and `scale=` the scene's current scale (1.00x until the user uses
   L2/R2). `slow=n/m` counts frames whose work passed 16.6 ms; a `vr pose` line
-  `worn=1`, `mirror=≈60fps` (the TV's rate; `off` when `MIRROR=0`, `failed`
-  when Hmd2 refused it). `slow=n/m` counts frames whose work passed 16.6 ms; a `vr pose` line
+  `worn=1`, `mirror=≈60fps` (the Hmd2 mirror's rate when it carries the TV;
+  `off` when the title drives the TV itself or `MIRROR=0`, `failed` when Hmd2
+  refused it), and `tv=on|mirror|none` with `tvfps= tvtile= tvgpu= tvdrop= tverr=`
+  (the title's own TV output, above). `slow=n/m` counts frames whose work passed 16.6 ms; a `vr pose` line
   follows each one with the raw Hmd2 head position in cm and the scene-frame
   yaw, pitch and roll in degrees (the one-second grid a recorded video can be
   matched against; below). The run ends with `vr done, exit 0` and `run-viewer.sh`
@@ -723,13 +762,13 @@ since the session start (so `t_s` and the `vr pose` lines share one clock).
 | `quat_x, quat_y, quat_z, quat_w` | the raw device orientation, x,y,z,w, same convention |
 | `yaw_deg, pitch_deg, roll_deg` | the angles the renderer used, in the **scene** frame (after the placement offsets): yaw positive to the right, pitch positive looking down, roll positive with the right ear down |
 | `dualsense_buttons`, `sense_left_buttons`, `sense_right_buttons` | each device's button word as read (`0x…`, the PS5 bitmask: Cross 0x4000, Options 0x8, L1 0x400, R1 0x800 — `platform/ps5/viewer/pad_input.h`) |
-| `actions` | the action bits this frame (`0x…`: 1 the menu/panel button, 2 tooltips, 4 recentre — set on the frame the **scene's** Cross hold completes; the same hold with the panel open recentres the **window**, sets no bit and is reported by `viewer: vr panel recentred: …` instead, 8 previous scene, 16 next scene; `platform/ps5/viewer/pad_input.h`). The 2026-10-27 evidence file's old "1 quit, 2 recentre, 4 previous, 8 next" row predated the panel bit |
+| `actions` | the action bits this frame (`0x…`: 1 the menu/panel button, 2 tooltips, 4 recentre — set on the frame the **scene's** Cross or Options hold completes, or a tracker re-anchor places the scene again; the same hold with the panel open recentres the **window**, sets no bit and is reported by `viewer: vr panel recentred: …` instead, 8 previous scene, 16 next scene; `platform/ps5/viewer/pad_input.h`). The 2026-10-27 evidence file's old "1 quit, 2 recentre, 4 previous, 8 next" row predated the panel bit |
 | `scale` | the scene's scale that frame (1.0 is the capture size, 0.001-4.0). **Capture** (the default) scales about the photo's capture point; **Centre/Front** scale about the visible 3D centre/near edge. The HUD shows this absolute scale (`Capture 0.08x`) |
 | `offset_x_m, offset_y_m, offset_z_m` | the scene's translation, metres in the placement frame (`offset_y_m` is **down** positive): the sticks walk/rise you, and a scale press adds its pivot compensation here - `offset' = pivot + f * (offset - pivot)`. A Front press whose pivot is 0.8 m ahead moves the offset 0.8 m for a 2x growth |
 | `turn_deg` | the scene's accumulated turn, degrees (positive turns the scene to the user's right): the right stick's turn and the yaw a one-hand grab adds. `yaw_deg` is the **camera's** yaw (scene yaw minus the turn). There is no other scene rotation any more and no `rot=yaw/pitch/roll` line: rotation is a file action on the panel, not a viewer control. At the 40 deg/s default one 60 Hz rendered frame is 0.67 deg |
 | `hold_progress` | the **scene's** recentre hold progress, 0.00–1.00 (0 when Cross is not held, and while the panel is open: the window's hold is the `viewer: vr panel recentred: …` klog line, with no bar; the bar on the overlay shows the same value) |
 | `scene` | the scene folder on screen at that frame (quoted; a comma inside is safe) |
-| `event` | what happened before this frame: `recentre` (the scene's Cross hold; the window's is the klog line above), `scene`, `scale start`, `scale end`, `move start`, `move end`, `grab start`, `grab end`, `quit`, `cap`, `fail`, or empty |
+| `event` | what happened before this frame: `recentre` (the scene's Cross or Options hold; the window's Cross hold is the klog line above), `reanchor` (the tracker's frame jumped and the scene was placed again), `scene`, `scale start`, `scale end`, `move start`, `move end`, `grab start`, `grab end`, `quit`, `cap`, `fail`, or empty |
 
 A scale press shows in `scale` and in `offset_*`: the offset absorbs the pivot
 compensation so that the pivot point keeps its place in the picture while the
@@ -842,7 +881,8 @@ default; with no `UI` key in `viewer.env` the panel is available and the first s
 as before, `UI=1` boots into the panel, `UI=0` turns it off. Install and launch with
 `platform/ps5/scripts/run-viewer.sh`, then, headset on:
 
-- [ ] 1. Options (DualSense or right Sense) opens the panel in front of you; klog: `viewer: ui open`.
+- [ ] 1. A **tap** on Options (DualSense or right Sense) opens the panel in front of you **when you let go**, wherever you are looking (turn your head 90 or 180 degrees first and try again: it is always in front); klog: `viewer: ui open`. **Hold Options 1 s** (menu closed): the "Hold to recentre" bar fills, the scene jumps in front of you and klog says `viewer: vr recentred: Options held 1.0 s …`; nothing opens. Hold it again with the menu **open**: scene and window both move in front of you (`… the open window follows`, then `viewer: vr panel recentred with the scene …`) and the menu does not change screen.
+- [ ] 1b. **Launch placement**: start the title with the headset on and look straight ahead without moving for the first seconds; the scene (and the menu that is open at boot) appears in front of you, not to the side. If the tracker latches its real frame after the scene was placed, klog says `viewer: vr tracker re-anchored (a jump of 25 deg or more in one sample): the scene is placed in front of the user again (… deg of yaw removed)` and the scene moves in front of you by itself. The CSV `event` column says `reanchor` on that frame.
 - [ ] 2. **World-fixed window (U2)**: the panel stays exactly where it opened. Turn your head left/right and pitch up/down: the window does **not** move or ease back in front (it slides toward the edge of the view and is seen at an angle — that is the point, no more constant re-centring). It must still be a rectangle, not a trapezoid, while you look through it. **Hold Cross 1 s with the panel open**: the window jumps back in front of you and klog says `viewer: vr panel recentred: Cross held 1.0 s (window 1.6 m ahead)`. A **short** Cross press still selects (one tap = one Cross; it must not both select and recentre).
 - [ ] 3. Focus moves: d-pad and left stick move between tiles, Cross opens, Circle goes back.
 - [ ] 4. L1/R1 page or change tab and the highlighted row stays in view.

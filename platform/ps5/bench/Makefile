@@ -98,7 +98,18 @@ TITLE_CXXFLAGS   := $(CXXFLAGS) -ffunction-sections -fdata-sections
 # --as-needed, which is what makes the imports NEEDED). libSceNetCtl is what
 # sceNetInit's stack uses for link state on this console; no sceSysmodule load
 # is needed (ProsperoMgr's bridge calls none).
-TITLE_EXTRA_LIBS    := $(SPLAT_LIBS) -lSceHttp -lSceSsl -lSceNet -lSceNetCtl
+# Since 0.5.0 libsplat_core_ps5.a also holds the HEIF/WebP/TIFF/RAW decoders and
+# the SMB/NFS clients, and convert_inbox.cpp reaches them through the photo
+# loader, so the title link needs the same extra archives platform/ps5/viewer
+# links (the payload ELFs above never reach them).
+CODECS_PREFIX ?= $(REPO)/build-ps5-codecs/prefix
+TITLE_PHOTO_LIBS := $(BUILD)/third_party/libwebp/libwebp.a \
+                    $(BUILD)/third_party/libtiff/libtiff.a \
+                    $(BUILD)/third_party/libsmb2/libsmb2.a \
+                    $(BUILD)/third_party/libnfs/libnfs.a \
+                    $(CODECS_PREFIX)/lib/libheif.a $(CODECS_PREFIX)/lib/libde265.a \
+                    $(CODECS_PREFIX)/lib/libaom.a $(BUILD)/libsplat_libraw.a
+TITLE_EXTRA_LIBS    := $(SPLAT_LIBS) $(TITLE_PHOTO_LIBS) -lSceHttp -lSceSsl -lSceNet -lSceNetCtl
 TITLE_EXTRA_LDFLAGS := --wrap=ggml_backend_graph_compute
 TITLE_HEADERS       := bench_title.h bench_dispatch.h bench_common.h \
                        $(GLUE)/bench_env.h $(GLUE)/ggml_logging.h \

@@ -316,7 +316,7 @@ if(EXISTS "${SPLAT_REPO}/third_party/libraw/buildfiles/libraw.pro")
 endif()
 target_compile_definitions(splat_core_ps5 PUBLIC
     SPLAT_HAVE_VULKAN=1
-    SPLAT_VERSION="0.5.0")
+    SPLAT_VERSION="0.6.0")
 
 # ---- the renderer's shaders ------------------------------------------------
 # core/render loads six SPIR-V modules by name at run time (RendererOptions::

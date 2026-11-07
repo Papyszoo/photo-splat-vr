@@ -12,6 +12,8 @@
 #include "gallery/visibility.h"
 #include "ui/screen_stack.h"
 #include "ui/screens/photos.h"
+#include "ui/text_fit.h"
+#include "ui/ui_state.h"
 
 namespace splat {
 namespace {
@@ -63,6 +65,13 @@ std::string visibility_text() {
     return visibility->enabled || visibility->damaged ? "Protected" : "Off";
 }
 
+// The Output folder row's value, shortened to half the row so a deep folder name
+// cannot push the row's label out.
+std::string output_text(const UiContext& ctx) {
+    return fit_text(output_folder_text(ctx.svc.state, ctx.svc.locations), ctx.theme.small_size,
+                    std::max(120, ctx.content.w / 2));
+}
+
 }  // namespace
 
 UiState& SettingsScreen::state(UiContext& ctx) {
@@ -92,6 +101,8 @@ void SettingsScreen::refresh_rows(const UiContext& ctx) {
                            ctx.svc.models == nullptr, false, false};
     rows[Conversions] = ListRow{"Conversions", "Photos being turned into scenes", "",
                                 ctx.svc.jobs == nullptr, false, false};
+    rows[OutputFolder] = ListRow{"Output folder", "Where new scenes are saved", output_text(ctx),
+                                 ctx.svc.state == nullptr, false, false};
     rows[Locations] = ListRow{"Network locations", "SMB shares and NFS exports the console can read",
                               locations_text(ctx.svc), ctx.svc.locations == nullptr, false,
                               false};
@@ -239,6 +250,7 @@ void SettingsScreen::update(UiContext& ctx, const UiInput& input) {
     // Jobs and downloads finish while Settings stays open, so the summaries
     // are refreshed every frame, without a row rebuild.
     list_.set_right(Models, ready_text(ctx.svc));
+    list_.set_right(OutputFolder, output_text(ctx));
     list_.set_right(Locations, locations_text(ctx.svc));
     list_.set_right(VisibleFolders, visibility_text());
     list_.update(input, ctx.content, ctx.theme);
@@ -287,6 +299,13 @@ void SettingsScreen::update(UiContext& ctx, const UiInput& input) {
             break;
         case Models: ctx.nav.push(ScreenId::Models); break;
         case Conversions: ctx.nav.push(ScreenId::Queue); break;
+        case OutputFolder: {
+            // The photo picker's folder browser, in its choose-a-folder mode.
+            ScreenArgs args;
+            args.a = PhotosScreen::kPickFolderMode;
+            ctx.nav.push(ScreenId::Photos, args);
+            break;
+        }
         case Locations: ctx.nav.push(ScreenId::Locations); break;
         case VisibleFolders: ctx.nav.push(ScreenId::VisibleFolders); break;
         case Quit: ctx.command(UiCommand{UiCommand::Quit, std::string(), 0}); break;

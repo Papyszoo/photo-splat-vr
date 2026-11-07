@@ -9,6 +9,9 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -29,6 +33,7 @@
 #include "model/gguf_writer.h"
 #include "model/license.h"
 #include "model/model_manager.h"
+#include "model/segmented_download.h"
 #include "model/sha256.h"
 #include "test_util.h"
 
@@ -182,7 +187,9 @@ private:
     std::vector<uint64_t> range_starts_;
 };
 
-// Test fetcher: same HTTP semantics as the desktop one, minus libcurl.
+// Test fetcher: same HTTP semantics as the desktop one, minus libcurl. A request
+// with `end` set is a segment of a parallel download: the fetcher then runs on
+// several threads at once, so its bookkeeping is under a mutex.
 class TestFetcher final : public IHttpFetcher {
 public:
     // 0 = run to completion. Otherwise the transfer is aborted after this many
@@ -190,6 +197,17 @@ public:
     uint64_t abort_after = 0;
     int head_calls = 0;
     std::vector<uint64_t> range_offsets;
+
+    // Parallel download controls.
+    bool hide_ranges = false;        // head() says the server offers no byte ranges
+    uint64_t stop_after_total = 0;   // 0 = off; else every request stops once this many bytes
+                                     // were written by all requests together
+    int chunk_delay_ms = 0;          // per received chunk: lets a test catch transfers midway
+    int wait_for_peers = 0;          // a segment waits (up to 3 s) until this many are in flight
+    uint64_t total_written = 0;      // bytes written by all requests (read after fetch returns)
+    std::vector<std::pair<uint64_t, uint64_t>> segment_ranges;  // (offset, end) of each segment
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
 
     Result<HttpResource> head(const std::string& url) override {
         ++head_calls;
@@ -204,41 +222,91 @@ public:
         const std::string length = response->get_header_value("Content-Length");
         resource.content_length = length.empty() ? 0 : std::strtoull(length.c_str(), nullptr, 10);
         resource.range_supported =
-            contains(response->get_header_value("Accept-Ranges"), "bytes");
+            !hide_ranges && contains(response->get_header_value("Accept-Ranges"), "bytes");
         return Result<HttpResource>::success(resource);
     }
 
     Status download(const FetchRequest& request) override {
+        const bool segment = request.end != 0;
         const UrlParts parts = parse_url(request.url);
         httplib::Client client(parts.host, parts.port);
         std::error_code error;
         std::filesystem::create_directories(request.destination.parent_path(), error);
 
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            range_offsets.push_back(request.offset);
+            if (segment) segment_ranges.emplace_back(request.offset, request.end);
+        }
+        struct Flight {
+            TestFetcher& fetcher;
+            explicit Flight(TestFetcher& owner) : fetcher(owner) {
+                const int now = ++fetcher.in_flight;
+                int seen = fetcher.max_in_flight.load();
+                while (now > seen && !fetcher.max_in_flight.compare_exchange_weak(seen, now)) {}
+            }
+            ~Flight() { --fetcher.in_flight; }
+        } flight(*this);
+        if (segment && wait_for_peers > 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (in_flight.load() < wait_for_peers && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
         std::FILE* file = std::fopen(request.destination.string().c_str(),
-                                     request.offset > 0 ? "ab" : "wb");
+                                     segment ? "r+b" : (request.offset > 0 ? "ab" : "wb"));
         if (file == nullptr) return Status::error("cannot open the test destination");
+        if (segment) {
+            // Unbuffered, like the real fetchers: written counts bytes that are in the file.
+            std::fseek(file, static_cast<long>(request.offset), SEEK_SET);
+            std::setvbuf(file, nullptr, _IONBF, 0);
+        }
 
         httplib::Headers headers;
-        if (request.offset > 0) {
+        if (segment) {
+            headers.emplace("Range", "bytes=" + std::to_string(request.offset) + "-" +
+                                         std::to_string(request.end - 1));
+        } else if (request.offset > 0) {
             headers.emplace("Range", "bytes=" + std::to_string(request.offset) + "-");
         }
-        range_offsets.push_back(request.offset);
 
         uint64_t written = 0;
         bool aborted = false;
+        bool cancelled = false;
         const auto response = client.Get(
             parts.path, headers,
             [&](const char* data, size_t length) {
+                if (request.cancelled && request.cancelled()) {
+                    cancelled = true;
+                    return false;
+                }
+                if (chunk_delay_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(chunk_delay_ms));
+                }
                 size_t take = length;
                 if (abort_after > 0 && written + take >= abort_after) {
                     take = static_cast<size_t>(abort_after - written);
                     aborted = true;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (stop_after_total > 0) {
+                        const uint64_t room =
+                            stop_after_total > total_written ? stop_after_total - total_written : 0;
+                        if (take >= room) {
+                            take = static_cast<size_t>(room);
+                            aborted = true;
+                        }
+                    }
+                    total_written += take;
                 }
                 if (take > 0 && std::fwrite(data, 1, take, file) != take) {
                     aborted = true;
                     return false;
                 }
                 written += take;
+                if (request.written != nullptr) request.written->store(written);
                 if (request.progress != nullptr && request.total_bytes > 0) {
                     request.progress->report(static_cast<float>(
                                                  static_cast<double>(request.offset + written) /
@@ -250,11 +318,13 @@ public:
             [](uint64_t, uint64_t) { return true; });
         std::fclose(file);
 
+        if (cancelled) return Status::error("download cancelled");
         if (aborted) return Status::error("interrupted");
         if (!response) return Status::error(httplib::to_string(response.error()));
         if (response->status != 200 && response->status != 206) {
             return Status::error("HTTP " + std::to_string(response->status));
         }
+        if (segment && response->status != 206) return Status::error("the range was ignored");
         return Status::success();
     }
 
@@ -271,6 +341,9 @@ public:
         }
         return Result<std::string>::success(response->body);
     }
+
+private:
+    std::mutex mutex_;
 };
 
 // Test converter: writes a tiny GGUF carrying exactly the metadata
@@ -692,4 +765,297 @@ TEST_CASE("model manager: import requires the official file name") {
     CHECK(record.value().state == ModelState::Ready);
     CHECK(std::filesystem::exists(named));  // a user copy is not moved
     CHECK(std::filesystem::exists(temp.path() / "downloads" / "model.bin"));
+}
+
+// ---- parallel (segmented) download, 0.6.0 ---------------------------------------
+// A payload this size with segment_min_bytes lowered to 1 KiB runs as four ranged
+// requests of 50 000 bytes into the one .part, as the real 2.8 GB file does with
+// the default 64 MiB threshold.
+
+namespace {
+
+constexpr size_t kSegmentPayload = 200000;
+
+ModelManagerOptions segmented_options(const Path& state_dir, const ModelBackendSpec& spec,
+                                      IHttpFetcher* fetcher) {
+    ModelManagerOptions options = options_for(state_dir, spec, fetcher);
+    options.segment_min_bytes = 1024;
+    options.segment_count = 4;
+    return options;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> sorted(std::vector<std::pair<uint64_t, uint64_t>> ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    return ranges;
+}
+
+uint64_t requested_bytes(const std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+    uint64_t bytes = 0;
+    for (const auto& range : ranges) bytes += range.second - range.first;
+    return bytes;
+}
+
+}  // namespace
+
+TEST_CASE("model manager: a big download runs as four parallel ranged segments") {
+    splat_test::TempDir temp("model-segments");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    TestFetcher fetcher;
+    fetcher.wait_for_peers = 4;  // a sequential download would stall here and fail the check below
+    ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    Progress progress;
+    const Status fetched = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+
+    const auto ranges = sorted(fetcher.segment_ranges);
+    REQUIRE(ranges.size() == 4);
+    CHECK(ranges[0] == std::make_pair<uint64_t, uint64_t>(0, 50000));
+    CHECK(ranges[1] == std::make_pair<uint64_t, uint64_t>(50000, 100000));
+    CHECK(ranges[2] == std::make_pair<uint64_t, uint64_t>(100000, 150000));
+    CHECK(ranges[3] == std::make_pair<uint64_t, uint64_t>(150000, kSegmentPayload));
+    CHECK(fetcher.max_in_flight.load() == 4);
+
+    const Result<ModelRecord> ready = manager.status("sharp");
+    REQUIRE_MESSAGE(ready.ok(), ready.message());
+    CHECK(ready.value().state == ModelState::Ready);
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    CHECK_FALSE(std::filesystem::exists(temp.path() / "downloads" / "model.bin.part"));
+    CHECK_FALSE(std::filesystem::exists(temp.path() / "downloads" / "model.bin.part.segments"));
+    CHECK(progress.fraction() == doctest::Approx(1.0f));
+}
+
+TEST_CASE("model manager: a download stopped mid-segment resumes every segment to the same SHA") {
+    splat_test::TempDir temp("model-segments-resume");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    TestFetcher fetcher;
+    ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    fetcher.stop_after_total = 120000;
+    Progress progress;
+    const Status interrupted = manager.fetch("sharp", progress);
+    REQUIRE_FALSE(interrupted.ok());
+    CHECK(contains(interrupted.message(), "interrupted"));
+    CHECK(fetcher.total_written == 120000);
+
+    // The resume state holds exactly what the requests wrote, and those bytes are
+    // the right ones, in the right places.
+    const Path part = temp.path() / "downloads" / "model.bin.part";
+    REQUIRE(std::filesystem::exists(part));
+    std::vector<splat::DownloadSegment> segments;
+    REQUIRE(splat::read_segments(part, payload.size(), &segments) == splat::SegmentsState::valid);
+    CHECK(splat::segments_done(segments) == 120000);
+    const std::string on_disk = read_file(part);
+    for (const splat::DownloadSegment& segment : segments) {
+        if (segment.done == 0) continue;  // a segment that had not started has nothing to check
+        REQUIRE(on_disk.size() >= segment.begin + segment.done);
+        CHECK(on_disk.compare(segment.begin, segment.done, payload, segment.begin, segment.done) == 0);
+    }
+    const Result<ModelRecord> paused = manager.status("sharp");
+    REQUIRE(paused.ok());
+    CHECK(paused.value().state == ModelState::Failed);
+    CHECK(paused.value().downloaded_bytes == 120000);  // not the sparse file's size
+
+    // Second attempt: only the missing bytes are requested, each segment from
+    // where it stopped.
+    fetcher.stop_after_total = 0;
+    fetcher.total_written = 0;
+    fetcher.segment_ranges.clear();
+    const Status resumed = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(resumed.ok(), resumed.message());
+    CHECK(requested_bytes(fetcher.segment_ranges) == payload.size() - 120000);
+    for (const auto& range : fetcher.segment_ranges) {
+        bool at_a_stop = false;
+        for (const splat::DownloadSegment& segment : segments) {
+            if (range.first == segment.begin + segment.done && range.second == segment.end) at_a_stop = true;
+        }
+        CHECK(at_a_stop);
+    }
+
+    const Result<ModelRecord> ready = manager.status("sharp");
+    REQUIRE_MESSAGE(ready.ok(), ready.message());
+    CHECK(ready.value().state == ModelState::Ready);
+    CHECK(ready.value().source_sha256 == sha256_of(payload));
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    CHECK_FALSE(std::filesystem::exists(part));
+    CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
+}
+
+TEST_CASE("model manager: cancel stops every segment and the download resumes") {
+    splat_test::TempDir temp("model-segments-cancel");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    TestFetcher fetcher;
+    fetcher.chunk_delay_ms = 50;  // each segment arrives in several chunks: well past the cancel point
+    ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto cancelled = [&started] {
+        return std::chrono::steady_clock::now() - started > std::chrono::milliseconds(40);
+    };
+    Progress progress;
+    const Status stopped = manager.fetch("sharp", progress, cancelled);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE_FALSE(stopped.ok());
+    CHECK(contains(stopped.message(), "cancelled"));
+    CHECK(fetcher.in_flight.load() == 0);  // every segment has returned
+    CHECK(fetcher.total_written > 0);
+    CHECK(fetcher.total_written < payload.size());
+    CHECK(elapsed < std::chrono::milliseconds(1500));
+
+    const Path part = temp.path() / "downloads" / "model.bin.part";
+    std::vector<splat::DownloadSegment> segments;
+    REQUIRE(splat::read_segments(part, payload.size(), &segments) == splat::SegmentsState::valid);
+    CHECK(splat::segments_done(segments) == fetcher.total_written);
+
+    fetcher.chunk_delay_ms = 0;
+    const Status resumed = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(resumed.ok(), resumed.message());
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+}
+
+TEST_CASE("model manager: one GET without byte ranges and for a small file") {
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+
+    {  // the server does not offer ranges
+        splat_test::TempDir temp("model-segments-noranges");
+        TestFetcher fetcher;
+        fetcher.hide_ranges = true;
+        ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+        REQUIRE(manager.accept_license("sharp", "accepted").ok());
+        Progress progress;
+        const Status fetched = manager.fetch("sharp", progress);
+        REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+        CHECK(fetcher.segment_ranges.empty());
+        CHECK(fetcher.range_offsets == std::vector<uint64_t>{0});
+        CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+        CHECK_FALSE(std::filesystem::exists(temp.path() / "downloads" / "model.bin.part.segments"));
+    }
+    {  // ranges are offered, but the file is under the default 64 MiB threshold
+        splat_test::TempDir temp("model-segments-small");
+        TestFetcher fetcher;
+        ModelManager manager(options_for(temp.path(), spec, &fetcher));
+        REQUIRE(manager.accept_license("sharp", "accepted").ok());
+        Progress progress;
+        REQUIRE_MESSAGE(manager.fetch("sharp", progress).ok(), "small file");
+        CHECK(fetcher.segment_ranges.empty());
+        CHECK(fetcher.range_offsets == std::vector<uint64_t>{0});
+        CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    }
+}
+
+TEST_CASE("model manager: a segmented partial restarts as one GET when ranges are gone") {
+    splat_test::TempDir temp("model-segments-lost-ranges");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    TestFetcher fetcher;
+    ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    fetcher.stop_after_total = 100000;
+    Progress progress;
+    REQUIRE_FALSE(manager.fetch("sharp", progress).ok());
+    REQUIRE(std::filesystem::exists(splat::segments_path(temp.path() / "downloads" / "model.bin.part")));
+
+    fetcher.stop_after_total = 0;
+    fetcher.hide_ranges = true;
+    fetcher.segment_ranges.clear();
+    fetcher.range_offsets.clear();
+    const Status fetched = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+    CHECK(fetcher.segment_ranges.empty());
+    CHECK(fetcher.range_offsets == std::vector<uint64_t>{0});  // from the start: the sparse .part is no prefix
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+}
+
+TEST_CASE("model manager: a sequential partial download becomes the first finished segment") {
+    splat_test::TempDir temp("model-segments-prefix");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    TestFetcher fetcher;
+    ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    // What the one-connection download of an earlier version leaves: no segments file.
+    write_file(temp.path() / "downloads" / "model.bin.part", payload.substr(0, 70000));
+
+    Progress progress;
+    const Status fetched = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+    const auto ranges = sorted(fetcher.segment_ranges);
+    REQUIRE(ranges.size() == 4);
+    CHECK(ranges.front().first == 70000);
+    CHECK(ranges.back().second == payload.size());
+    CHECK(requested_bytes(ranges) == payload.size() - 70000);
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+}
+
+TEST_CASE("model manager: a segments file that cannot be trusted never leaves a corrupt file") {
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+    const auto segments_json = [&](uint64_t first_done) {
+        return "{\"version\":1,\"total\":" + std::to_string(payload.size()) + ",\"segments\":[[0,50000," +
+               std::to_string(first_done) +
+               "],[50000,100000,0],[100000,150000,0],[150000," + std::to_string(payload.size()) + ",0]]}";
+    };
+
+    {  // unreadable: the partial file is dropped and the download starts clean
+        splat_test::TempDir temp("model-segments-garbage");
+        TestFetcher fetcher;
+        ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+        REQUIRE(manager.accept_license("sharp", "accepted").ok());
+        const Path part = temp.path() / "downloads" / "model.bin.part";
+        write_file(part, std::string(90000, 'x'));
+        write_file(splat::segments_path(part), "not json {{{");
+        Progress progress;
+        const Status fetched = manager.fetch("sharp", progress);
+        REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+        CHECK(requested_bytes(fetcher.segment_ranges) == payload.size());
+        CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    }
+    {  // a valid layout whose .part is gone: the unfinished parts are fetched again
+        splat_test::TempDir temp("model-segments-nofile");
+        TestFetcher fetcher;
+        ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+        REQUIRE(manager.accept_license("sharp", "accepted").ok());
+        write_file(splat::segments_path(temp.path() / "downloads" / "model.bin.part"), segments_json(30000));
+        Progress progress;
+        const Status fetched = manager.fetch("sharp", progress);
+        REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+        CHECK(requested_bytes(fetcher.segment_ranges) == payload.size());
+        CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    }
+    {  // the file claims bytes the .part holds wrongly: the SHA-256 refuses it
+        splat_test::TempDir temp("model-segments-wrong-bytes");
+        TestFetcher fetcher;
+        ModelManager manager(segmented_options(temp.path(), spec, &fetcher));
+        REQUIRE(manager.accept_license("sharp", "accepted").ok());
+        const Path part = temp.path() / "downloads" / "model.bin.part";
+        write_file(part, std::string(30000, '\0'));
+        write_file(splat::segments_path(part), segments_json(30000));
+        Progress progress;
+        const Status refused = manager.fetch("sharp", progress);
+        REQUIRE_FALSE(refused.ok());
+        CHECK(contains(refused.message(), "SHA-256"));
+        CHECK_FALSE(std::filesystem::exists(part));
+        CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
+        CHECK_FALSE(std::filesystem::exists(temp.path() / "downloads" / "model.bin"));
+
+        const Status again = manager.fetch("sharp", progress);  // a clean second attempt
+        REQUIRE_MESSAGE(again.ok(), again.message());
+        CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    }
 }

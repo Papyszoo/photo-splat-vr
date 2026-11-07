@@ -13,6 +13,7 @@
 
 #include "common/half.h"
 #include "render/overlay.h"
+#include "render/tv_view.h"
 
 namespace splat {
 namespace {
@@ -25,7 +26,7 @@ constexpr float kDefaultHorizontalFovDegrees = 60.0f;
 constexpr float kNearPlane = 0.05f;
 constexpr float kFarPlane = 1000.0f;
 constexpr uint32_t kProjectLocalSize = 256;
-constexpr uint32_t kTimestampCount = 4;
+constexpr uint32_t kTimestampCount = 5;
 
 struct CameraUniforms {
     float view[16];         // world -> camera, column-major
@@ -275,6 +276,10 @@ void SplatRenderer::destroy() {
         destroy_vulkan_buffer(*context_, draw_);
         destroy_vulkan_buffer(*context_, camera_);
         destroy_vulkan_buffer(*context_, readback_);
+        for (VulkanBuffer& slot : tv_slots_) destroy_vulkan_buffer(*context_, slot);
+        tv_slots_.clear();
+        for (VulkanImage& image : tv_images_) destroy_vulkan_image(*context_, image);
+        tv_width_ = tv_height_ = 0;
     }
     context_ = nullptr;
 }
@@ -953,6 +958,147 @@ Status SplatRenderer::set_overlay_quads(std::vector<OverlayQuad> quads) {
     return overlay_->set_quads(std::move(quads));
 }
 
+Status SplatRenderer::set_tv_overlay_quads(std::vector<OverlayQuad> quads) {
+    const Status status = ensure_overlay();
+    if (!status.ok()) return status;
+    return overlay_->set_tv_quads(std::move(quads));
+}
+
+Status SplatRenderer::enable_tv_capture(uint32_t width, uint32_t height, int slots) {
+    if (context_ == nullptr) return Status::error("renderer has no context");
+    if (tv_width_ != 0) return Status::success();
+    if (width == 0 || height == 0 || slots < 1) {
+        return Status::error("the TV picture needs a size and at least one slot");
+    }
+    // One image per blend space: the frame's own target is either the renderer's
+    // format or its UNORM/sRGB counterpart (Display > Blending), and the blit, the
+    // quads and the bytes read back all have to be in that same space.
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkExtent2D extent{width, height};
+    VulkanImage images[2];
+    for (int i = 0; i < 2; ++i) {
+        const VkFormat format = i == 0 ? options_.target_format : alt_format_;
+        if (i == 1 && (format == options_.target_format || format == VK_FORMAT_UNDEFINED)) break;
+        auto image = create_vulkan_color_image(*context_, format, extent, usage);
+        if (!image.ok()) {
+            for (VulkanImage& made : images) destroy_vulkan_image(*context_, made);
+            return Status::error("TV image: " + image.message());
+        }
+        images[i] = image.take();
+    }
+    std::vector<VulkanBuffer> buffers;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4;
+    for (int i = 0; i < slots; ++i) {
+        auto buffer = create_vulkan_buffer(*context_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!buffer.ok()) {
+            for (VulkanBuffer& made : buffers) destroy_vulkan_buffer(*context_, made);
+            for (VulkanImage& made : images) destroy_vulkan_image(*context_, made);
+            return Status::error("TV slot: " + buffer.message());
+        }
+        buffers.push_back(buffer.take());
+    }
+    tv_images_[0] = images[0];
+    tv_images_[1] = images[1];
+    tv_slots_ = std::move(buffers);
+    tv_width_ = width;
+    tv_height_ = height;
+    return Status::success();
+}
+
+const uint8_t* SplatRenderer::tv_frame_pixels(int slot) const {
+    if (slot < 0 || static_cast<size_t>(slot) >= tv_slots_.size()) return nullptr;
+    return static_cast<const uint8_t*>(tv_slots_[static_cast<size_t>(slot)].mapped);
+}
+
+void SplatRenderer::record_tv_frame(VkCommandBuffer command_buffer, const RenderTarget& target,
+                                    bool blend_alt, bool srgb_target,
+                                    const CameraIntrinsics& intrinsics, int slot) {
+    VulkanImage& tv = tv_images_[blend_alt ? 1 : 0];
+    const TvCrop crop = tv_crop(
+        intrinsics.cx + (options_.stereo ? options_.eye_center_shift[0] : 0.0f), intrinsics.cy,
+        options_.eye_width, options_.eye_height, tv_width_, tv_height_);
+    if (!crop.valid()) return;   // no usable eye: the slot keeps its last picture
+
+    // The finished scene (comfort pass included, no overlay yet) is the blit
+    // source: the target leaves attachment layout for the copy ...
+    image_barrier(command_buffer, target.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT);
+    image_barrier(command_buffer, tv.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                  VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {crop.x0, crop.y0, 0};   // eye 0 is the left half of the target
+    blit.srcOffsets[1] = {crop.x1, crop.y1, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {static_cast<int32_t>(tv_width_), static_cast<int32_t>(tv_height_), 1};
+    vkCmdBlitImage(command_buffer, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tv.image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    // ... and goes straight back to attachment layout for the eyes' overlay pass.
+    image_barrier(command_buffer, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    if (overlay_ != nullptr && overlay_->has_tv_quads()) {
+        // The flat menu (and the waiting banner): the TV quad list, with the TV
+        // camera, on top of the copy.
+        image_barrier(command_buffer, tv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        color.imageView = tv.view;
+        color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, {tv_width_, tv_height_}};
+        rendering.layerCount = 1;
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &color;
+        vkCmdBeginRendering(command_buffer, &rendering);
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(tv_width_);
+        viewport.height = static_cast<float>(tv_height_);
+        viewport.maxDepth = 1.0f;
+        VkRect2D scissor{{0, 0}, {tv_width_, tv_height_}};
+        vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+        vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+        overlay_->record_tv(command_buffer, tv_overlay_camera(tv_width_, tv_height_), srgb_target);
+        vkCmdEndRendering(command_buffer);
+        image_barrier(command_buffer, tv.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_READ_BIT);
+    } else {
+        image_barrier(command_buffer, tv.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
+
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {tv_width_, tv_height_, 1};
+    vkCmdCopyImageToBuffer(command_buffer, tv.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           tv_slots_[static_cast<size_t>(slot)].buffer, 1, &region);
+    memory_barrier(command_buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                   VK_ACCESS_2_HOST_READ_BIT);
+}
+
 void SplatRenderer::clear_overlay_quads() {
     if (overlay_ != nullptr) overlay_->set_quads({});
 }
@@ -962,6 +1108,9 @@ bool SplatRenderer::has_overlay_quads() const {
 }
 
 Status SplatRenderer::render(const FrameView& view, const RenderTarget& target, bool readback) {
+    // The TV request is for this frame only, even when the frame fails below.
+    const int tv_slot = tv_request_slot_;
+    tv_request_slot_ = -1;
     if (context_ == nullptr) return Status::error("renderer has no context");
     const VkExtent2D expected = target_extent();
     if (target.extent.width != expected.width || target.extent.height != expected.height) {
@@ -1274,6 +1423,20 @@ Status SplatRenderer::render(const FrameView& view, const RenderTarget& target, 
         vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 3);
     }
 
+    // The TV's picture of this frame, taken before any overlay is drawn: nothing
+    // the eyes' overlay list holds (the VR window, the label, the HUD) can be in
+    // it. Skipped entirely unless the caller asked for a slot this frame.
+    const bool tv_frame = tv_slot >= 0 && tv_width_ != 0 &&
+                          static_cast<size_t>(tv_slot) < tv_slots_.size() &&
+                          tv_images_[blend_alt ? 1 : 0].image != VK_NULL_HANDLE &&
+                          options_.eye_width >= 2;
+    if (tv_frame) {
+        record_tv_frame(command_buffer, target, blend_alt, srgb_target, intrinsics, tv_slot);
+    }
+    if (query_pool_ != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 4);
+    }
+
     // Overlay UI (scene label, tooltips): world-space quads drawn after the
     // splats and after the comfort pass, so neither the splat depth nor the
     // fade can dim or hide them. LOAD keeps the finished frame; the quads
@@ -1383,6 +1546,7 @@ Status SplatRenderer::render(const FrameView& view, const RenderTarget& target, 
             timings_.project_ms = static_cast<double>(ticks[1] - ticks[0]) * ns / 1.0e6;
             timings_.sort_ms = static_cast<double>(ticks[2] - ticks[1]) * ns / 1.0e6;
             timings_.draw_ms = static_cast<double>(ticks[3] - ticks[2]) * ns / 1.0e6;
+            timings_.tv_ms = tv_frame ? static_cast<double>(ticks[4] - ticks[3]) * ns / 1.0e6 : 0.0;
         }
     }
 

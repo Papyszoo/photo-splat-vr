@@ -30,10 +30,12 @@
 #include "scene/scene_folder.h"
 #include "scene/scene_view.h"
 #include "test_util.h"
+#include "tree_filesystem.h"
 #include "ui/fakes.h"
 #include "ui/screens/placeholder.h"
 #include "ui/screens/scenes.h"
 #include "ui/screen_stack.h"
+#include "vfs/io.h"
 
 using splat::Path;
 
@@ -607,6 +609,89 @@ TEST_CASE("ui_scenes shows conversions into this folder until they finish") {
     fixture.stack.update(fixture.context, splat::UiInput{});
     CHECK(fixture.scenes->pending() == 0);
     CHECK(fixture.scenes->grid().cells().size() == 2);
+}
+
+TEST_CASE("ui_scenes counts a scene waiting for its network folder as a pending tile") {
+    Fixture fixture;
+    std::vector<std::string> toasts;
+    fixture.context.toast_sink = [&toasts](std::string text, double) { toasts.push_back(text); };
+    write_scene(fixture.root / "trip" / "s1", "sharp", 4, 1.0, false);
+
+    splat::JobView waiting;
+    waiting.name = "one.jpg";
+    waiting.photo = Path("one.jpg");
+    waiting.album = "trip";
+    waiting.kind = "convert";
+    waiting.state = "waiting";
+    waiting.message = "Waiting for NAS";
+    waiting.output_root = Path("smb0:/out");  // saved on the Output folder
+    fixture.jobs.inject_job(waiting);
+    waiting.name = "elsewhere.jpg";
+    waiting.album = "other";
+    fixture.jobs.inject_job(waiting);
+    fixture.enter("trip");
+
+    // "+", the waiting photo, then the scene; the other folder's job is not here.
+    REQUIRE(fixture.scenes->pending() == 1);
+    const std::vector<splat::GridCell>& cells = fixture.scenes->grid().cells();
+    REQUIRE(cells.size() == 3);
+    CHECK(cells[1].caption == "one");
+    CHECK(cells[1].badge == "Waiting");
+    CHECK(cells[1].progress == 0.0f);
+
+    // Cross on it says which share it waits for; it does not view anything.
+    fixture.stack.update(fixture.context, press(splat::Left));
+    fixture.stack.update(fixture.context, press(splat::Select));
+    CHECK(fixture.commands.empty());
+    REQUIRE_FALSE(toasts.empty());
+    CHECK(toasts.back() == "Waiting for NAS");
+
+    // The share is back and the scene is saved: the tile goes.
+    fixture.jobs.set_job_state(fixture.jobs.snapshot()[0].id, "done");
+    fixture.stack.update(fixture.context, splat::UiInput{});
+    CHECK(fixture.scenes->pending() == 0);
+}
+
+TEST_CASE("ui_scenes a network shelf shows only the jobs saved into its own library") {
+    struct Remove {
+        ~Remove() { splat::vfs::file_systems().remove("smb0"); }
+    } removed;
+    auto share = std::make_shared<splat_test::TreeFileSystem>("smb0");
+    share->files["lib/Trips/s1/scene.psplat"] = {1};
+    splat::vfs::file_systems().add(share);
+
+    Fixture fixture;
+    splat::JobView job;
+    job.photo = Path("one.jpg");
+    job.name = "one.jpg";
+    job.album = "Trips";
+    job.kind = "convert";
+    job.state = "waiting";
+    job.message = "Waiting for NAS";
+    job.output_root = Path("smb0:/lib");  // this library
+    fixture.jobs.inject_job(job);
+    job.name = "two.jpg";
+    job.output_root = Path("smb0:/other");  // another folder of the share
+    fixture.jobs.inject_job(job);
+    job.name = "three.jpg";
+    job.output_root = Path();  // the console's own album of the same name
+    job.state = "queued";
+    fixture.jobs.inject_job(job);
+
+    splat::ScreenArgs args;
+    args.a = "Trips";
+    args.b = "smb0:/lib";
+    REQUIRE(fixture.stack.push(splat::ScreenId::Scenes, args));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+    while (fixture.scenes->names().empty() &&
+           std::chrono::steady_clock::now() < deadline) {
+        fixture.stack.update(fixture.context, splat::UiInput{});
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    REQUIRE(fixture.scenes->names().size() == 1);
+    REQUIRE(fixture.scenes->pending() == 1);
+    CHECK(fixture.scenes->grid().cells()[1].caption == "one");
+    CHECK(fixture.scenes->grid().cells()[1].badge == "Waiting");
 }
 
 TEST_CASE("ui_scenes draws one calm placeholder for a scene without a thumbnail") {

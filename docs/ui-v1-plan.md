@@ -35,9 +35,28 @@ LAN-page album editing, cloud anything.
   small and a window that keeps re-centring itself cannot be read (user,
   2026-11-06). **Cross held 1 s with the panel open recentres the window** in
   front of the user; the same hold with the panel closed recentres the scene
-  ("same button, context"). A Cross tap is still the panel's select.
+  ("same button, context"). A Cross tap is still the panel's select. The
+  window is a rigid object: `overlay.vert` projects with clip `w` = view depth so
+  the panel texture is mapped perspective-correctly, and each eye sees every
+  content texel through one homography of the fixed world quad
+  (`tests/overlay_perspective_test.cpp`). With `w = 1` (through 0.5.0) the
+  content skewed along the diagonal whenever the window was seen at an angle.
+- **The TV in VR: one menu, two views** (0.6.0, user 2026-11-07). The canvas is
+  the same; the TV sees it flat and fixed on the whole screen, the headset sees
+  the world-fixed window. The Hmd2 mirror can only show the eye buffers (VR
+  window included), so the title drives the TV itself: `UiHost::tv_quads()` is
+  the plate and canvas quads for the TV camera (`render/tv_view.h`,
+  `tv_panel_quad`), `SplatRenderer::set_tv_overlay_quads()` holds them apart
+  from the eyes' list, and the renderer takes the TV picture (the left eye's
+  centre 16:9 crop, between the comfort and overlay passes, so no window, label
+  or HUD) into a slot for the `TvOutput` worker (`platform/ps5/viewer/tv_output.h`,
+  `VideoOutDisplay`). It starts with the session, so the menu works on the TV
+  before the headset is worn; a port that will not open falls back to the Hmd2
+  mirror.
 - **Input map** (identical on DualSense and Sense, `pad_input.h` stays the one
-  table). In a scene: Options = open menu (no longer quits), Cross hold 1 s =
+  table). In a scene: Options tap = open menu on release (no longer quits),
+  Options hold 1 s = recentre the scene and the open window (the PSVR2
+  standard, never also a tap: `OptionsGate`, ui_mode.h), Cross hold 1 s =
   recentre, L1/R1 = previous/next scene in the album, L2/R2 shrink/grow, sticks
   move/turn, Triangle = toggle tooltips, Create untouched. In the UI:
   d-pad/left stick = move focus, Cross = select (it resolves on release while
@@ -99,12 +118,12 @@ services adapters (`core/ui/services_*`: jobs, models; PS5 specifics under
 `AlbumEntry{Path dir; std::string name; size_t scene_count; Path cover;}`,
 `SceneEntry{Path folder; std::string name, album; SceneMeta meta; bool has_thumb;}`,
 `PhotoSource{id,label,Path dir,bool removable}`,
-`PhotoEntry{Path path; std::string name; uint64_t size; int64_t mtime;}`;
+`FolderEntry{Path path; std::string name; bool folder, splat; uint64_t size;}`;
 `list_albums(root)` (album "" = loose scenes, shown as "All scenes"),
 `list_scenes(root, album)`, `create_album`, `rename_album`, `delete_album` (empty
 only), `move_scene(root, folder, to_album)`, `default_album_name(time_t, root)`,
-`discover_sources(const SourceRoots&)`, `list_photos(source)`
-(jpg/jpeg/png, case-insensitive, depth <= 3, newest first),
+`discover_sources(const SourceRoots&)`, `list_folder(dir)`
+(one level: folders, then photos, then splat files, by name),
 `load_thumb(path, max_edge)` -> `Image` RGBA. `SceneMeta` gains optional
 `captured_at`, `source` (old files still read). `ScenePlaylist::from_entries` for
 an album.
@@ -124,7 +143,7 @@ with `enum UiAction: Up Down Left Right Select Back PagePrev PageNext Secondary 
 Each has a deterministic fake in `core/ui/fakes.h` (used by tests, `ui_preview`
 and fake-mode console runs).
 
-**platform/ps5/viewer**: `UiHost{UiHost(SplatRenderer&, IPanelContent&, Mode tv|vr); init(); frame(UiInput, head pose); visible(); set_visible(); quads(); }`
+**platform/ps5/viewer**: `UiHost{UiHost(SplatRenderer&, IPanelContent&, Mode tv|vr); init(); frame(UiInput, head pose); visible(); set_visible(); quads(); tv_quads(); }`
 — the only thing `main.cpp`/`vr_mode.cpp` talk to. In VR the panel is a
 **world-fixed window** (`PanelAnchor`, `render/hmd_view.h`): it is latched 1.6 m
 in front of the pose it opened from, parallel to that pose's view plane (yaw and
@@ -276,4 +295,7 @@ measure.
   No Sony assets.
 - Photo picker sources: Inbox (`/data/ps5-splat-vr/inbox`, the FTP upload
   target, path shown), Console (folder browser over title-visible roots `/data`
-  and `/mnt/ext*`), USB, Captures.
+  and `/mnt/ext*`), USB, Captures. From 0.6.0 every file-backed tab (Inbox,
+  Console, USB, network locations) is the same folder browser: folder tiles
+  first, then that folder's photos and splat files, Cross opens a folder and
+  Circle goes up; no recursive search and no folder-level import.

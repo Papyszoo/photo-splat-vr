@@ -2,7 +2,8 @@
 // the panel opens and closes, and what the scene may still do while it is up.
 //
 // The panel itself is UiApp over UiHost, exactly as on the TV (ui_setup.h,
-// core/ui). This file is only the routing: Options toggles the panel, an open
+// core/ui). This file is only the routing: Options (a tap, on release: see
+// OptionsGate) opens the panel, an open
 // panel takes every button and the left stick through pad::ui_actions_for (the
 // one input map, pad_input.h), and the scene's own controls - Cross hold,
 // sticks, L2/R2, L1/R1 - are suspended while it is up. The scene keeps being
@@ -22,6 +23,63 @@
 #include "pad_input.h"
 
 namespace viewer {
+
+// Options is a button that resolves on RELEASE (0.6.0, "hold Options recentres
+// like the PSVR2 standard, tap Options keeps opening the menu"): a press that
+// ends before kRecentreHoldSeconds is one tap, which the panel sees as a
+// one-frame Options press (open the menu / its Settings, exactly as before but
+// on release); a press that reaches the second is one recentre of the scene
+// AND the open window, and the panel never sees it, so a hold can never also
+// toggle anything. HLA-PSVR2 splits the same button the same way
+// (psvr2.c menu_hold: a tap on release, a one-second hold recentres), because
+// the system hands a title no reset-view event.
+//
+// It wraps pad::TapHold (the Cross-in-the-panel machine, same 1 s clock) and is
+// pure and time-driven like it, so the console and the desktop test run the
+// same code. `buttons` is the OR of every pad's held word (the DualSense and
+// the right Sense controller carry Options); the returned word is what
+// PanelMode::route() should be given instead. A press that is already down on
+// the very first frame (the title was launched with it) is ignored until it is
+// let go, the same "launch press" rule PanelMode applies to its first frame.
+class OptionsGate {
+public:
+    struct Step {
+        uint32_t buttons = 0;   // the word for PanelMode::route(): Options only on a tap
+        bool recentre = false;  // the hold completed this frame: recentre scene + window
+        bool pending = false;   // Options is down and unresolved
+        float progress = 0.0f;  // 0..1 while down
+        // What the HUD's hold bar shows: the progress once the press has lasted
+        // kBarAfterSeconds, otherwise 0 (no bar). A plain tap opens the menu and
+        // must not flash "Hold to recentre" every time.
+        float bar = 0.0f;
+    };
+
+    static constexpr double kBarAfterSeconds = 0.25;
+
+    Step update(uint32_t buttons, double now_seconds) {
+        Step step;
+        step.buttons = buttons & ~pad::kOptions;
+        bool down = (buttons & pad::kOptions) != 0;
+        if (!armed_) {
+            // Launched with Options down: not a press until it is released.
+            if (!down) armed_ = true;
+            return step;
+        }
+        const pad::TapHold::Step hold = hold_.update(down, now_seconds);
+        if (hold.tap) step.buttons |= pad::kOptions;
+        step.recentre = hold.hold;
+        step.pending = hold.pending;
+        step.progress = hold.progress;
+        if (static_cast<double>(hold.progress) * pad::kRecentreHoldSeconds >= kBarAfterSeconds) {
+            step.bar = hold.progress;
+        }
+        return step;
+    }
+
+private:
+    pad::TapHold hold_;
+    bool armed_ = false;
+};
 
 // One frame's routing decision.
 struct UiRoute {

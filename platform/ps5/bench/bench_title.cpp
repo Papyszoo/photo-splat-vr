@@ -218,7 +218,8 @@ int main(int, char**) {
         status = convert_inbox_run(0, nullptr);
     } else if (bench == "http") {
         // The sceHttp/sceSsl/sceNet probe (platform/ps5/bench/http_probe.cpp):
-        // HEAD, a 1 MiB ranged GET and a bounded text GET, no GPU.
+        // timed ranged downloads (variants A/B/C; HTTP_VARIANT=smoke is the old
+        // HEAD + 1 MiB + text GET check), no GPU.
         status = http_probe_run(0, nullptr);
     } else {
         splat::bench::title_log(

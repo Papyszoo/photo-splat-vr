@@ -366,6 +366,50 @@ TEST_CASE("vr8 the panel recentre puts the window in front of the new pose") {
     }
 }
 
+// 0.6.0: "the menu always opens in front of the current head pose", whichever
+// way the head points. UiHost::set_visible(true) clears the anchor and the next
+// visible frame latches it from the frame's camera (the scene-frame yaw/pitch
+// and position the renderer is given), so this is the geometry of that latch at
+// every heading the first launch and the user can produce: straight ahead, a
+// quarter turn either way, behind, and looking up or down from an offset head.
+TEST_CASE("vr8 the window opens in front of the head at any heading") {
+    const double headings[] = {0.0, 90.0, 180.0, -90.0, 270.0, 45.0, -135.0};
+    const double pitches[] = {0.0, 25.0, -40.0};
+    const float eyes[][3] = {{0.0f, 0.0f, 0.0f}, {0.34f, -0.12f, 0.55f}, {-1.2f, 0.3f, -0.8f}};
+    for (const double heading : headings) {
+        for (const double pitch : pitches) {
+            for (const auto& eye : eyes) {
+                CAPTURE(heading);
+                CAPTURE(pitch);
+                const double yaw = heading * kPi / 180.0;
+                const double pitch_rad = pitch * kPi / 180.0;
+                splat::PanelAnchor panel;
+                CHECK_FALSE(panel.latched());   // opening starts from an empty anchor
+                panel.latch(eye, yaw, pitch_rad);
+                REQUIRE(panel.latched());
+                const splat::OverlayQuad& quad = panel.quad();
+                float forward[3];
+                pose_forward(yaw, pitch_rad, forward);
+                float to_window[3];
+                for (int axis = 0; axis < 3; ++axis) {
+                    to_window[axis] = quad.center[axis] - eye[axis];
+                }
+                // Dead ahead: the window centre is on the gaze ray at 1.6 m.
+                CHECK(dot3(to_window, to_window) ==
+                      doctest::Approx(splat::kPanelDistanceMetres * splat::kPanelDistanceMetres)
+                          .epsilon(1e-4));
+                CHECK(dot3(to_window, forward) ==
+                      doctest::Approx(splat::kPanelDistanceMetres).epsilon(1e-4));
+                // Its front faces the head and it stands upright.
+                float front[3];
+                cross3(quad.right, quad.up, front);
+                CHECK(dot3(front, forward) == doctest::Approx(-1.0f).epsilon(1e-4));
+                CHECK(quad.right[1] == doctest::Approx(0.0f).epsilon(1e-5));
+            }
+        }
+    }
+}
+
 TEST_CASE("vr8 a rolled and pitched head projects the panel as a rigid rectangle") {
     // The window is latched at this head pose, so its plane is parallel to that
     // pose's view plane; the head's roll (0.30 rad) then rotates the image but

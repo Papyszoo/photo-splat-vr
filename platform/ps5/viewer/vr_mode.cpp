@@ -22,7 +22,10 @@
 //      frame for a second or two after the session opens - a scene anchored
 //      before that reset ends up ~90 deg to the side). The capture camera is
 //      then placed at that pose through the recentre path, looking forward, at
-//      world scale 1.0, and the scene stays anchored there;
+//      world scale 1.0, and the scene stays anchored there - unless the tracker
+//      re-anchors its frame afterwards (a jump of 25+ deg in one sample, hmd_view.h
+//      ReanchorWatch), which places the scene and the open window in front of
+//      the user again through the same path;
 //   5. render one frame per 60 Hz slot with hmd2's pacing, copy it into the eye
 //      buffer Hmd2 gave us (GPU copy, no CPU pixels), submit, and repeat until
 //      the panel's Quit item, the quit file or SECONDS (a dev cap only: 0, the
@@ -40,9 +43,12 @@
 // of columns is in docs/console-runbook.md, step 1d.
 //
 // Input is the DualSense and the two PSVR2 Sense controllers, opened through
-// scePad for the same user the Hmd2 session uses (hmd2::user_id()): Options opens
-// the panel (on the DualSense or the right Sense controller; the panel's Quit
-// item ends the session), L1/R1 step through the scenes, L2/R2 grow/shrink the
+// scePad for the same user the Hmd2 session uses (hmd2::user_id()): an Options
+// tap opens the panel on release (on the DualSense or the right Sense
+// controller; the panel's Quit item ends the session), Options held for one
+// second recentres the scene and the open window (the PSVR2 standard; the system
+// sends a title no reset-view event, ui_mode.h OptionsGate), L1/R1 step through
+// the scenes, L2/R2 grow/shrink the
 // scene about the cone pivot (Capture: the photo's capture point, the default;
 // Front: 5th-percentile depth; Centre: median with a 0.5 m near guard; the
 // viewer never moves), the left stick walks
@@ -84,7 +90,7 @@
 // The background is black: the renderer's clear colour and the comfort fade's
 // backdrop are the same value (RendererOptions::backdrop), set to 0 here, so
 // the void around the photo and the fade past the comfort radius are black in
-// both eyes and on the TV mirror, which shows the same eye buffers.
+// both eyes and on the TV (its picture is the same scene, taken before any overlay).
 //
 // Bounded waits, leak-on-timeout: the display wait, the pose wait and every
 // copy fence have a timeout. If a GPU wait fails, the Hmd2/VideoOut side is
@@ -122,6 +128,7 @@
 #include "render/scene_playlist.h"
 #include "render/splat_renderer.h"
 #include "render/text_raster.h"
+#include "render/tv_view.h"
 #include "render/viewer_state.h"
 #include "render/vulkan_context.h"
 #include "scene/psplat.h"
@@ -138,6 +145,7 @@
 #include "pad_input.h"
 #include "scene_switch.h"
 #include "title_common.h"
+#include "tv_output.h"
 #include "ui_mode.h"
 #include "ui_setup.h"
 
@@ -1014,11 +1022,19 @@ int run_vr(const VrOptions& options) {
     Pad sense_right(pad::Device::sense_right, "right Sense", kPadTypeSenseRight);
     RunState run;
     bool hmd2_up = false;
+    // 0.6.0: the TV's own output (tv_output.h). `tv_up` says it opened and has
+    // not been given up; the Hmd2 mirror carries the TV when it is false.
+    viewer::TvOutput tv_output;
+    bool tv_up = false;
 
     auto teardown = [&]() {
         const double started = now_ms();
         // The pose log first: the last rows of the run are the interesting ones.
         pose_log.close();
+        // The TV worker reads the renderer's slot buffers: it stops (and the
+        // port closes) before anything of the renderer is freed or leaked.
+        tv_output.stop();
+        tv_up = false;
         // The pads first, before the headset's tracker/Hmd2 teardown, which is
         // HLA-PSVR2's order for its Sense controllers (psvr2.c:1593-1613). We
         // have nothing to unregister: the only VrTracker2 handle in this title is
@@ -1083,10 +1099,30 @@ int run_vr(const VrOptions& options) {
     config.external_count = kEyeBufferCount;
     config.image_width = 2 * kEyeWidth;
     config.image_height = kEyeHeight;
-    // The TV mirror (viewer.env MIRROR, on by default): Hmd2's social screen
-    // shows the headset's view on the TV, so the console's own recording of
-    // this title carries it (runs/video_test2: without it the capture is black).
-    config.mirror = options.mirror;
+    // The TV (0.6.0, "one menu, two views"): the title drives it itself through
+    // the main VideoOut port, from the first second of the session, so the TV
+    // person has the menu before the headset is worn and the TV never shows the
+    // VR window (tv_output.h, render/tv_view.h). The port is opened here, before
+    // Hmd2, because it decides the mirror: with the port open the mirror stays
+    // off (it can only show the eye buffers, VR window and HUD included); with
+    // no port - TV_OUTPUT=0, or a port the system refused - the TV is Hmd2's
+    // social screen as it was through 0.5.x (viewer.env MIRROR, on by default,
+    // so the console's own recording of this title carries it; runs/video_test2:
+    // without it the capture is black).
+    std::string tv_error;
+    if (!options.tv_output) {
+        line("viewer: vr tv output: off (TV_OUTPUT=0 in viewer.env); the TV is the Hmd2 mirror");
+    } else if (tv_output.start(tv_error)) {
+        tv_up = true;
+        line("viewer: vr tv output: main VideoOut port open (%ux%u, 30 fps): the TV shows the "
+             "scene without the VR window or HUD, and the flat menu while it is open",
+             splat::kTvWidth, splat::kTvHeight);
+    } else {
+        line("viewer: vr tv output: FAIL the main VideoOut port would not open (%s); the Hmd2 "
+             "mirror carries the TV instead",
+             tv_error.c_str());
+    }
+    config.mirror = options.mirror && !tv_up;
     if (!hmd2::init(config)) {
         const hmd2::Error hmd_error = hmd2::error();
         line("viewer: FAIL hmd2 init at %s (rc 0x%08x) - see the hmd2 lines above",
@@ -1112,8 +1148,10 @@ int run_vr(const VrOptions& options) {
     // compositor produces it next to the flips this loop already submits (no
     // extra frame, thread or copy on the title's side), so the achieved rate is
     // the display's own and is logged once with the first second's stats.
-    const bool mirror_ok = hmd2::mirroring();
-    if (!options.mirror) {
+    bool mirror_ok = hmd2::mirroring();
+    if (tv_up) {
+        line("viewer: vr mirror: off (the title drives the TV itself, see vr tv output)");
+    } else if (!options.mirror) {
         line("viewer: vr mirror: off (MIRROR=0 in viewer.env); the TV keeps the console UI");
     } else if (!mirror_ok) {
         line("viewer: vr mirror: unavailable (Hmd2 refused the social screen, return codes above); "
@@ -1148,7 +1186,7 @@ int run_vr(const VrOptions& options) {
     // Black everywhere the photo is not: the clear colour and the comfort fade's
     // backdrop are one value (splat_renderer.h), so the void around the photo
     // and the fade past the comfort radius are black in both eyes and on the TV
-    // mirror, which shows the same eye buffers.
+    // picture.
     renderer_options.backdrop[0] = 0.0f;
     renderer_options.backdrop[1] = 0.0f;
     renderer_options.backdrop[2] = 0.0f;
@@ -1179,6 +1217,38 @@ int run_vr(const VrOptions& options) {
     line("viewer: vr renderer: %ux%u stereo (side by side), shaders %s, create %.1f ms",
          renderer->eye_width(), renderer->eye_height(), options.shader_dir.c_str(),
          now_ms() - renderer_started);
+
+    // The TV output gave up (it could not be set up, or the port stopped
+    // working): the Hmd2 mirror carries the TV again, as through 0.5.x, and one
+    // line says why. The VR loop never waits for any of this.
+    // Set by a fall-back: with the TV output up the wait for the headset has no
+    // limit, so the limit's clock starts again when the output is given up (the
+    // loop restarts it, wait_started does not exist yet here).
+    bool wait_restart = false;
+    auto tv_fall_back = [&](const std::string& why) {
+        tv_output.stop();
+        tv_up = false;
+        wait_restart = true;
+        const bool mirror_started = options.mirror && hmd2::start_mirror();
+        mirror_ok = hmd2::mirroring();
+        line("viewer: vr tv output: FAIL %s; back to the Hmd2 mirror (%s)", why.c_str(),
+             mirror_started ? "mirror on" : options.mirror
+                                                ? "the mirror would not start either, the TV keeps the console UI"
+                                                : "MIRROR=0, the TV keeps the console UI");
+    };
+    if (tv_up) {
+        // The renderer takes the TV picture of every frame it is asked to (a
+        // blit between the comfort and overlay passes), into slot buffers the
+        // TV worker reads; nothing here costs a frame that does not ask.
+        const splat::Status tv_status = renderer->enable_tv_capture(
+            splat::kTvWidth, splat::kTvHeight, viewer::TvOutput::kSlots);
+        if (tv_status.ok()) {
+            splat::SplatRenderer* tv_renderer = renderer.get();
+            tv_output.attach([tv_renderer](int slot) { return tv_renderer->tv_frame_pixels(slot); });
+        } else {
+            tv_fall_back("the TV picture could not be set up: " + tv_status.message());
+        }
+    }
     // The renderer owns the scene's GPU copy now; drop the CPU copy (~34 MiB)
     // before the preload slot allocates its own. meta.json stays: its capture
     // intrinsics are what the comfort fade was created with.
@@ -1236,9 +1306,9 @@ int run_vr(const VrOptions& options) {
     const bool boot_open_panel = ui_options.ui || !boot_has_scene || options.scene.empty();
     viewer::PanelMode panel(panel_available, panel_available && boot_open_panel);
     if (ui_runtime != nullptr) {
-        line("viewer: vr ui: panel %s (UI %s, %s); Options opens and closes it, Cross 1 s "
-             "recentres the window while it is open, Quit is its last "
-             "item%s",
+        line("viewer: vr ui: panel %s (UI %s, %s); an Options tap opens it (Settings once it is "
+             "open), Options held 1 s recentres the scene and the window, Cross 1 s recentres the "
+             "window while it is open, Quit is its last item%s",
              panel.open() ? "open at boot" : "available",
              ui_options.ui_given ? (ui_options.ui ? "=1" : "=0") : "not set, VR default",
              ui_options.ui_fake ? "fake services" : "models, jobs and captures real",
@@ -1422,8 +1492,9 @@ int run_vr(const VrOptions& options) {
     dualsense.open(user, pads_started);
     sense_left.open(user, pads_started);
     sense_right.open(user, pads_started);
-    line("viewer: vr input: Options opens the menu (DualSense or right Sense; its Quit item ends "
-         "the session), hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
+    line("viewer: vr input: an Options tap opens the menu on release (DualSense or right Sense; "
+         "its Quit item ends the session), hold Options 1 s to recentre the scene and the open "
+         "window, hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
          "scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene: by default "
          "Capture zooms about the photo's capture point (Settings > Scale can pick Front or "
          "Centre), left stick walks "
@@ -1514,6 +1585,62 @@ int run_vr(const VrOptions& options) {
         }
     }
     hud_textures.solid = solid_texture;
+
+    // ---- the TV's own quads (0.6.0) --------------------------------------------
+    // Drawn only onto the TV picture (SplatRenderer::set_tv_overlay_quads), never
+    // into the eyes: the same menu canvas flat on the whole screen while the menu
+    // is open (UiHost::tv_quads), and, while the headset has not been put on, a
+    // banner at the bottom saying so - the TV person sees what is going on and
+    // can open the menu before anyone wears the headset. The banner is one plate
+    // (the solid texture) and one text mask, placed in TV pixels.
+    std::vector<splat::OverlayQuad> tv_banner;
+    if (tv_up && solid_texture != UINT32_MAX) {
+        constexpr uint32_t kBannerScale = 3;   // font pixels on the 1920x1080 picture
+        const splat::TextImage text = splat::rasterise_text(
+            {"Waiting for the headset - put it on, or use this menu"}, kBannerScale);
+        auto texture = renderer->add_overlay_texture(text.width, text.height, text.pixels.data());
+        if (!text.empty() && texture.ok()) {
+            const splat::OverlayCamera camera = splat::tv_overlay_camera();
+            const float text_w = static_cast<float>(text.width);
+            const float text_h = static_cast<float>(text.height);
+            const float text_x = 0.5f * (static_cast<float>(splat::kTvWidth) - text_w);
+            const float text_y = static_cast<float>(splat::kTvHeight) - 96.0f - text_h;
+            constexpr float kPad = 24.0f;
+            splat::OverlayQuad plate = splat::tv_screen_quad(
+                camera, text_x - kPad, text_y - kPad, text_w + 2.0f * kPad, text_h + 2.0f * kPad);
+            plate.texture = solid_texture;
+            plate.tint[0] = plate.tint[1] = plate.tint[2] = 0.0f;
+            plate.tint[3] = 0.6f;
+            splat::OverlayQuad words = splat::tv_screen_quad(camera, text_x, text_y, text_w, text_h);
+            words.texture = texture.value();
+            tv_banner = {plate, words};
+        } else {
+            line("viewer: vr tv output: no banner text (%s); the TV shows the scene alone while "
+                 "it waits for the headset",
+                 text.empty() ? "empty text" : texture.message().c_str());
+        }
+    }
+    bool tv_quads_dirty = true;
+    bool tv_menu_shown = false;
+    bool tv_banner_shown = false;
+    // Rebuilds the TV's quad list when what it shows changes (the menu opening or
+    // closing, the banner appearing at launch and going once the scene is placed).
+    auto update_tv_quads = [&](bool waiting) {
+        if (!tv_up) return;
+        const bool menu = ui_runtime != nullptr && ui_runtime->host->visible();
+        if (!tv_quads_dirty && menu == tv_menu_shown && waiting == tv_banner_shown) return;
+        tv_quads_dirty = false;
+        tv_menu_shown = menu;
+        tv_banner_shown = waiting;
+        std::vector<splat::OverlayQuad> quads;
+        if (waiting) quads.insert(quads.end(), tv_banner.begin(), tv_banner.end());
+        if (menu) {
+            const std::vector<splat::OverlayQuad> panel_quads = ui_runtime->host->tv_quads();
+            quads.insert(quads.end(), panel_quads.begin(), panel_quads.end());
+        }
+        const splat::Status quads_status = renderer->set_tv_overlay_quads(std::move(quads));
+        if (!quads_status.ok()) line("viewer: vr tv quads: %s", quads_status.message().c_str());
+    };
 
     // The scale press's pivot marker: a 64x64 R8 ring, drawn as a small
     // world-locked billboard at the pivot (nothing to model, one texture).
@@ -1870,7 +1997,7 @@ int run_vr(const VrOptions& options) {
     } counters;
     bool placed = false;
     uint64_t wait_submit_errors = 0;
-    const double wait_started = now_ms();
+    double wait_started = now_ms();
     double next_wait_log = 0.0;
     double placed_at = 0.0;
     double second_started = 0.0;
@@ -1911,6 +2038,22 @@ int run_vr(const VrOptions& options) {
     pad::TapHold panel_tap;
     bool panel_tap_open = false;
     splat::PlacementWait placement_wait;
+    // 0.6.0: Options resolves on release (ui_mode.h OptionsGate): a tap is the
+    // panel's Options, a 1 s hold recentres the scene and the open window.
+    viewer::OptionsGate options_gate;
+    // 0.6.0: the tracker re-anchoring after the scene was placed (hmd_view.h
+    // ReanchorWatch). `window_recentre` carries "put the open window back in
+    // front" from where the scene was re-placed (before this frame's camera
+    // exists) to the panel block (after it).
+    splat::ReanchorWatch reanchor_watch;
+    bool window_recentre = false;
+    // 0.6.0 TV: when the next TV picture is due (30 fps next to the 60 fps loop),
+    // and the per-second numbers the log line reports.
+    double next_tv_ms = 0.0;
+    uint64_t tv_presents_seen = 0;
+    double tv_tile_sum_seen = 0.0;
+    double tv_gpu_ms_second = 0.0;
+    uint64_t tv_frames_second = 0;
     double last_input_ms = now_ms();
     bool scale_gesture = false;
     double scale_gesture_started = 0.0;   // for the press's ease-in
@@ -2041,7 +2184,13 @@ int run_vr(const VrOptions& options) {
         // the viewer behind it.
         const float ui_x = pad::clamp_unit(dualsense.axes().left_x + sense_left.axes().left_x);
         const float ui_y = pad::clamp_unit(dualsense.axes().left_y + sense_left.axes().left_y);
-        const viewer::UiRoute route = panel.route(held_buttons, ui_x, ui_y);
+        // Options resolves on release: the panel is given the word with Options
+        // only on a tap, and a 1 s hold is a recentre of the scene and the open
+        // window instead (the PSVR2 standard; nothing the system sends us, see
+        // ui_mode.h). It needs the placed scene, so it waits for the placement.
+        const viewer::OptionsGate::Step options_step =
+            options_gate.update(held_buttons, (now_loop - session_started) / 1000.0);
+        const viewer::UiRoute route = panel.route(options_step.buttons, ui_x, ui_y);
         if (route.opened) line("viewer: ui open");
         if (now_loop >= next_quit_check) {
             next_quit_check = now_loop + 1000.0;
@@ -2053,7 +2202,17 @@ int run_vr(const VrOptions& options) {
                 break;
             }
         }
-        if (!placed && (now_loop - wait_started) / 1000.0 >= kPoseWaitLimitSeconds) {
+        // With the TV output up the session has a user at the TV, who may be in
+        // the menu for as long as they like before the headset is worn; Quit
+        // ends it. Without a TV output the wait still gives up after the limit,
+        // counted from the moment the output was given up: a TV that fails after
+        // a long wait must not end the session on the spot.
+        if (wait_restart) {
+            wait_restart = false;
+            wait_started = now_ms();
+            next_wait_log = 0.0;
+        }
+        if (!placed && !tv_up && (now_loop - wait_started) / 1000.0 >= kPoseWaitLimitSeconds) {
             line("viewer: FAIL no usable pose after %.0f s (headset worn and a tracker pose are "
                  "both required); is the headset on and the play area set up?",
                  kPoseWaitLimitSeconds);
@@ -2102,6 +2261,22 @@ int run_vr(const VrOptions& options) {
         renderer->set_low_pass_eps(settings->edge_softness);
 
         hold_progress = -1.0f;
+        // Options held (any pad): the same bar as the Cross hold, once the press
+        // is long enough not to be a menu tap, and one recentre of the scene when
+        // it completes. The window follows in the panel block (it needs this
+        // frame's camera). Before the placement there is nothing to recentre.
+        if (options_step.bar > 0.0f) hold_progress = options_step.bar;
+        if (options_step.recentre && placed) {
+            const double removed_yaw = place_scene_at_head();
+            window_recentre = true;
+            log_actions |= pad::kRecentre;
+            std::snprintf(log_event, sizeof log_event, "%s", "recentre");
+            line("viewer: vr recentred: Options held %.1f s, capture camera placed at the head "
+                 "(%.1f deg of yaw removed), scale reset to %.2fx, offset and rotation cleared%s",
+                 pad::kRecentreHoldSeconds, removed_yaw,
+                 static_cast<double>(headset.hud_scale()),
+                 panel.open() ? "; the open window follows" : "");
+        }
         if (placed && route.scene_controls) {
             // ---- Sense grab (W26) ------------------------------------------
             // L1 (left Sense) and R1 (right Sense) are the grips (pad_input.h
@@ -2280,7 +2455,7 @@ int run_vr(const VrOptions& options) {
             // completion frame shows (and logs) a full 1.0. A negative value is
             // the HUD's "draw nothing" marker; the CSV clamps it to 0.
             if (recentre_hold.active()) {
-                hold_progress = recentre_hold.progress();
+                hold_progress = std::max(hold_progress, recentre_hold.progress());
             }
 
             // The D-pad and Square have no scene action: the viewer has no
@@ -2447,12 +2622,17 @@ int run_vr(const VrOptions& options) {
         // hands Hmd2 as the render pose (same sample, same display time).
         last_raw = tracked;
 
+        // A frame of the wait for the headset that still runs the menu and renders
+        // the TV (0.6.0, only with the TV output up).
+        bool wait_frame = false;
+        double waited = 0.0;
+        splat::PlacementWait::Step settle;
         if (!placed) {
             // Still waiting for the headset. The eye buffer is untouched (zero)
             // and the flip keeps Hmd2's queue and the predicted pose moving.
-            const double waited = (now_ms() - wait_started) / 1000.0;
+            waited = (now_ms() - wait_started) / 1000.0;
             const bool worn = hmd2::worn();
-            const splat::PlacementWait::Step settle = placement_wait.update(
+            settle = placement_wait.update(
                 worn, poses.head.tracked, tracked.head, (now_ms() - session_started) / 1000.0);
             if (!settle.place) {
                 if (!hmd2::submit() && ++wait_submit_errors > 5) {
@@ -2478,8 +2658,14 @@ int run_vr(const VrOptions& options) {
                          worn ? 1 : 0, poses.head.tracked ? 1 : 0, settle.stable_seconds, waited,
                          kPoseWaitLimitSeconds, splat::kPlaceStableSeconds);
                 }
-                continue;
+                // Nobody at the TV: the old wait, next slot. With the TV up the
+                // frame goes on without a head: the menu runs, and the TV gets
+                // the scene at the capture pose plus the flat menu and a banner.
+                if (!tv_up) continue;
+                wait_frame = true;
             }
+        }
+        if (!placed && !wait_frame) {
             // Worn, tracked and held for kPlaceStableSeconds: place the scene
             // at this pose, through the recentre path the Cross hold uses. The
             // 2026-10-27 runs placed on the first frame and the tracker's SLAM
@@ -2509,21 +2695,43 @@ int run_vr(const VrOptions& options) {
                                                            : "from the 63 mm default");
         }
 
-        if (poses.head.tracked) {
+        if (wait_frame) {
+            // No head yet: nothing to follow, no tracker jump to watch.
+        } else if (poses.head.tracked) {
             headset.update(tracked);
             if (run.tracking_lost) {
                 run.tracking_lost = false;
                 line("viewer: vr tracking regained");
+            }
+            // The tracker re-anchoring after the placement (it boots in a stale
+            // frame ~90 deg off and latches to the real one seconds later; the
+            // half-second gate above cannot see that). The scene and the open
+            // window were put in the old frame, so they are put in front of the
+            // user again, through the same placement the Cross and Options holds
+            // use. Only a jump between two tracked samples counts.
+            if (reanchor_watch.update(true, tracked.head, now_ms() / 1000.0)) {
+                const double removed_yaw = place_scene_at_head();
+                window_recentre = true;
+                log_actions |= pad::kRecentre;
+                std::snprintf(log_event, sizeof log_event, "%s", "reanchor");
+                line("viewer: vr tracker re-anchored (a jump of %.0f deg or more in one sample): "
+                     "the scene is placed in front of the user again (%.1f deg of yaw removed)%s",
+                     static_cast<double>(splat::kReanchorMinDegrees), removed_yaw,
+                     panel.open() ? ", the open window with it" : "");
             }
         } else if (!run.tracking_lost) {
             // Hold the last good pose: a lost tracker must not teleport the user
             // to the origin. Hmd2 reports the pose it could not track.
             run.tracking_lost = true;
             line("viewer: vr tracking lost; holding the last pose");
+            reanchor_watch.update(false, tracked.head, now_ms() / 1000.0);
         }
 
-        const splat::FrameView view = headset.frame();
-        last_fade = view.comfort_fade;
+        // Waiting for the headset the view is the capture pose (what the scene
+        // will be placed at): the menu is built against it and the TV gets that
+        // scene, so the TV person sees what the headset will show.
+        const splat::FrameView view = wait_frame ? splat::FrameView{} : headset.frame();
+        if (!wait_frame) last_fade = view.comfort_fade;
 
         // ---- the panel (W16, Sense pointer W25, world-fixed window U2) --------
         // The host draws its canvas into the renderer's RGBA overlay texture
@@ -2550,6 +2758,16 @@ int run_vr(const VrOptions& options) {
             // Latch the window on its first visible frame (set_visible(true)
             // cleared it); a latched window is never moved here.
             ui_host.update_panel(view.midpoint);
+            // The scene was just re-placed (an Options hold or a tracker
+            // re-anchor): the open window goes in front of the user with it. The
+            // ray below tests this same quad, so the two never disagree.
+            if (window_recentre) {
+                ui_host.recenter_panel(view.midpoint);
+                if (ui_host.visible()) {
+                    line("viewer: vr panel recentred with the scene (window %.1f m ahead)",
+                         static_cast<double>(splat::kPanelDistanceMetres));
+                }
+            }
             // U3: one frame in the pointer mode, before the ray: the joystick
             // drives the menu and the Sense pointer is off until R2 arms it.
             // `route.ui_pressed`/`ui_held` already carry the d-pad and the left
@@ -2823,6 +3041,8 @@ int run_vr(const VrOptions& options) {
             if (panel_quit) break;
         }
 
+        window_recentre = false;
+
         // The overlay: scene label moved with the scene's scale/offset, plus the
         // head-locked HUD (hold bar, scale readout) while it is up, plus the panel
         // when it is (update_overlay appends UiHost::quads()).
@@ -2835,20 +3055,53 @@ int run_vr(const VrOptions& options) {
         scale_vignette += (vignette_target - scale_vignette) * vignette_alpha;
         renderer->set_scale_vignette(scale_vignette);
         update_overlay(view, now_loop);
+        update_tv_quads(!placed);
         // Display > Blending chooses the attachment: sRGB (linear-light blend,
         // the default) or its UNORM counterpart (gamma-space blend like Spark).
         splat::RenderTarget& frame_target =
             (alt_target_ready && !settings->blend_linear) ? alt_target : target;
+
+        // The TV's picture of this frame (30 fps next to the 60 fps loop): a slot
+        // if one is free, otherwise the TV simply skips this frame - the loop
+        // never waits for the TV. A TV output that gave up hands the TV back to
+        // the Hmd2 mirror here, once.
+        int tv_slot = -1;
+        if (tv_up) {
+            if (tv_output.failed()) {
+                tv_fall_back(tv_output.failure());
+            } else if (now_loop + 8.0 >= next_tv_ms) {
+                tv_slot = tv_output.acquire();
+                if (tv_slot >= 0) {
+                    next_tv_ms += 1000.0 / 30.0;
+                    if (next_tv_ms < now_loop) next_tv_ms = now_loop + 1000.0 / 30.0;
+                }
+            }
+        }
+        // Waiting for the headset a frame exists only for the TV: with no TV
+        // picture due there is nothing to render (the eye buffer stays black).
+        if (wait_frame && tv_slot < 0) continue;
+        renderer->request_tv_frame(tv_slot);
         const double frame_started = now_ms();
         const splat::Status rendered = renderer->render(view, frame_target, false);
         if (!rendered.ok()) {
+            if (tv_slot >= 0) tv_output.cancel(tv_slot);
             line("viewer: FAIL render: %s", rendered.message().c_str());
             run.gpu_ok = false;
             status = 7;
             reason = "FAIL render";
             break;
         }
+        if (tv_slot >= 0) {
+            tv_output.publish(tv_slot);
+            tv_gpu_ms_second += renderer->timings().tv_ms;
+            ++tv_frames_second;
+        }
         frame_target.initial_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        if (wait_frame) {
+            // Waiting for the headset the frame was for the TV alone: the eye
+            // buffer stays black and Hmd2 already got its submit above. Next slot.
+            continue;
+        }
         const splat::PassTimings& timings = renderer->timings();
         project_second += timings.project_ms;
         sort_second += timings.sort_ms;
@@ -2908,9 +3161,28 @@ int run_vr(const VrOptions& options) {
                 std::snprintf(mirror_text, sizeof mirror_text, "%s",
                               options.mirror ? "failed" : "off");
             }
+            // The TV: `on` is the title's own output (render/tv_view.h picture at
+            // 30 fps through the main VideoOut port), `mirror` the Hmd2 social
+            // screen (also what a failed output falls back to), `none` neither
+            // (MIRROR=0 and no output). The rate is the flips the worker made
+            // this second; tile is the CPU tile write per flip, gpu the TV copy's
+            // GPU time per TV frame, drop the frames skipped because the worker
+            // was behind (never a wait of the loop).
+            const viewer::TvOutput::Stats tv_stats = tv_output.stats();
+            const double tv_fps =
+                static_cast<double>(tv_stats.presents - tv_presents_seen) / seconds;
+            const double tv_tile_ms =
+                tv_stats.presents > tv_presents_seen
+                    ? (tv_stats.tile_ms_sum - tv_tile_sum_seen) /
+                          static_cast<double>(tv_stats.presents - tv_presents_seen)
+                    : 0.0;
+            tv_presents_seen = tv_stats.presents;
+            tv_tile_sum_seen = tv_stats.tile_ms_sum;
+            const char* tv_text = tv_up ? "on" : (mirror_ok ? "mirror" : "none");
             line("viewer: vr t=%.0fs fps=%.1f project=%.2f sort=%.2f draw=%.2f (per eye %.2f) "
                  "copy=%.2f gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx ipd=%.1f mm "
-                 "slow=%llu/%llu missed=%d shown=%llu repeated=%d queue-full=%d err=%d worn=%d mirror=%s",
+                 "slow=%llu/%llu missed=%d shown=%llu repeated=%d queue-full=%d err=%d worn=%d mirror=%s "
+                 "tv=%s tvfps=%.1f tvtile=%.2f ms tvgpu=%.2f ms tvdrop=%llu tverr=%llu",
                  (now - placed_at) / 1000.0, frames / seconds,
                  frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
                  frames ? draw_second / frames : 0.0, frames ? draw_second / frames / 2.0 : 0.0,
@@ -2922,7 +3194,10 @@ int run_vr(const VrOptions& options) {
                  static_cast<unsigned long long>(counters.frames), missed_now,
                  static_cast<unsigned long long>(flip.shown), hmd2::repeated_frames(),
                  hmd2::queue_full_waits(), hmd2::frame_errors(),
-                 hmd2::device_state().worn ? 1 : 0, mirror_text);
+                 hmd2::device_state().worn ? 1 : 0, mirror_text, tv_text, tv_fps, tv_tile_ms,
+                 tv_frames_second ? tv_gpu_ms_second / static_cast<double>(tv_frames_second) : 0.0,
+                 static_cast<unsigned long long>(tv_output.dropped()),
+                 static_cast<unsigned long long>(tv_stats.errors));
             if (mirror_ok && !mirror_logged) {
                 // Logged once, when there is a measurement to give: the mirror
                 // costs the loop nothing itself, so this is the display's rate.
@@ -2951,6 +3226,8 @@ int run_vr(const VrOptions& options) {
                  static_cast<unsigned long long>(counters.frames));
             pose_log.flush();
             counters.frames_this_second = 0;
+            tv_gpu_ms_second = 0.0;
+            tv_frames_second = 0;
             counters.copy_second = 0.0;
             project_second = 0.0;
             sort_second = 0.0;

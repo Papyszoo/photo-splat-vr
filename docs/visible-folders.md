@@ -56,6 +56,9 @@ The screen is grouped **Scene folders** (Unsorted + every album), **Network**
 by **Change passcode** and **Turn off passcode**.
 
 A location that is only a photo source has no row: it is not part of this list.
+Choosing an Output folder on a location (Settings > Output folder) switches its
+splat library on, so it gets a row here like any other; until the owner ticks it,
+a conversion into it is refused with "That folder is not visible".
 
 Rules that follow from the table:
 

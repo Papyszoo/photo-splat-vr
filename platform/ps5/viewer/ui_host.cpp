@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "render/splat_renderer.h"
+#include "render/tv_view.h"
 #include "render/ui_panel.h"
 
 #include "title_common.h"
@@ -161,24 +162,39 @@ bool UiHost::upload_canvas() {
     return true;
 }
 
+namespace {
+
+// The plate and the canvas on one panel geometry, plate first (behind). Both
+// quads share the geometry and a white, opaque tint: the textures carry their
+// own colour and alpha. A zero-size panel has no viewport to fill (and its
+// geometry is meaningless): no quads, so no draw call.
+std::vector<splat::OverlayQuad> plate_and_canvas(const splat::OverlayQuad& panel,
+                                                 uint32_t plate_texture,
+                                                 uint32_t canvas_texture) {
+    std::vector<splat::OverlayQuad> quads;
+    if (!(panel.width > 0.0f) || !(panel.height > 0.0f)) return quads;
+    splat::OverlayQuad plate = panel;
+    plate.texture = plate_texture;
+    quads.push_back(plate);
+    splat::OverlayQuad canvas = panel;
+    canvas.texture = canvas_texture;
+    quads.push_back(canvas);
+    return quads;
+}
+
+}  // namespace
+
 void UiHost::build_quads(const splat::CameraPose& camera) {
     quads_.clear();
     if (!initialised_ || !visible_ || !backdrop_ready_) return;
+    quads_ = plate_and_canvas(panel_quad(camera), backdrop_texture_, panel_texture_);
+}
 
-    const splat::OverlayQuad panel = panel_quad(camera);
-    // A zero-size panel has no viewport to fill (and its geometry is
-    // meaningless); drawing it would only cost a draw call.
-    if (!(panel.width > 0.0f) || !(panel.height > 0.0f)) return;
-
-    // Both quads share the panel geometry and a white, opaque tint: the
-    // textures carry their own colour and alpha.
-    splat::OverlayQuad backdrop = panel;
-    backdrop.texture = backdrop_texture_;
-    quads_.push_back(backdrop);
-
-    splat::OverlayQuad quad = panel;
-    quad.texture = panel_texture_;
-    quads_.push_back(quad);
+std::vector<splat::OverlayQuad> UiHost::tv_quads() const {
+    if (!initialised_ || !visible_ || !backdrop_ready_) return {};
+    return plate_and_canvas(
+        splat::tv_panel_quad(splat::tv_overlay_camera(), canvas_.width(), canvas_.height()),
+        backdrop_texture_, panel_texture_);
 }
 
 splat::OverlayQuad UiHost::panel_quad(const splat::CameraPose& camera) {

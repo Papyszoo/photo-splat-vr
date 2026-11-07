@@ -150,6 +150,11 @@ Small's time, same capture-pose PSNR); Small is the one kept.
   the VR menu (it would occlude the view). The TV person gets a separate TV-only
   menu (DualSense) fixed on the TV screen, so the headset person need not hold
   still for it; the TV shows only one menu.
+  **Decided 2026-11-07 ("One menu, two views", DECISIONS.md "TV menu and
+  recenter"): not a separate menu.** One shared menu, drawn flat and fixed on
+  the TV and as the world-fixed window in VR; any controller drives it; the TV
+  image never contains the VR window. Built in 0.6.0 (`tv_output.h`,
+  `render/tv_view.h`).
 
 ## Headset test 6 feedback (2026-10-27) and decisions
 

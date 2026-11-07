@@ -175,7 +175,8 @@ bool VideoOutDisplay::wait_shown(uint64_t serial) {
     }
 }
 
-bool VideoOutDisplay::present(const void* pixels, double* tile_ms, std::string& error) {
+bool VideoOutDisplay::present(const void* pixels, double* tile_ms, std::string& error,
+                              bool rgba_source) {
     if (!registered_ || mapped_ == nullptr || handle_ < 0) {
         error = "present without an open VideoOut output";
         return false;
@@ -195,6 +196,7 @@ bool VideoOutDisplay::present(const void* pixels, double* tile_ms, std::string& 
     // display that stopped reporting falls back to unpaced flips (tearing)
     // instead of a stalled title.
     if (buffer_serial_[index] != 0 && !wait_shown(buffer_serial_[index])) {
+        ++unconfirmed_;
         if (!unpaced_reported_) {
             unpaced_reported_ = true;
             error = "a flip could not be confirmed shown within " +
@@ -230,7 +232,14 @@ bool VideoOutDisplay::present(const void* pixels, double* tile_ms, std::string& 
                     const uint32_t off = vertical ^ ((x << 2) & 0xc) ^ ((x << 5) & 0x380) ^
                                          ((x << 4) & 0x400) ^ ((x << 6) & 0x800) ^
                                          ((x << 9) & 0xa000);
-                    *reinterpret_cast<uint32_t*>(tile + off) = row[x];
+                    uint32_t pixel = row[x];
+                    if (rgba_source) {
+                        // R, G, B, A in memory is 0xAABBGGRR as a little-endian
+                        // word; VideoOut wants B, G, R, A = 0xAARRGGBB.
+                        pixel = (pixel & 0xff00ff00u) | ((pixel & 0xffu) << 16) |
+                                ((pixel >> 16) & 0xffu);
+                    }
+                    *reinterpret_cast<uint32_t*>(tile + off) = pixel;
                 }
             }
             writeback(tile, kTileBytes);

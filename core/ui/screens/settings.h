@@ -1,7 +1,9 @@
 // Settings, reached with Options from anywhere in the panel (UiApp): the
 // comfort controls (scale pivot, move speed, turn speed), the display test
 // toggles (edge softness, blending), the models (download, licence, delete),
-// the conversion queue and Quit. Rows whose service is missing are drawn dim
+// the conversion queue, the Output folder (where new scenes are saved: the
+// console, or a folder on a network location picked by browsing it) and Quit.
+// Rows whose service is missing are drawn dim
 // but still open their screen, which then explains what this build lacks. Quit
 // is an ordinary row (the app also closes from the PS5 system menu like any
 // game).
@@ -41,6 +43,7 @@ public:
         SystemHeader,
         Models,
         Conversions,
+        OutputFolder,
         Locations,
         VisibleFolders,
         Quit,

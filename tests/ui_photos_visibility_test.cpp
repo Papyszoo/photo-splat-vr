@@ -180,7 +180,7 @@ TEST_CASE("ui_photos_visibility nothing ticked still lists every console folder 
     fixture.idle();
     // One storage: the browser starts inside it and shows every folder and the
     // file directly in the root (nothing is hidden by the passcode).
-    CHECK(fixture.screen.console_dir() == fixture.data);
+    CHECK(fixture.screen.browse_dir() == fixture.data);
     std::vector<std::string> captions = fixture.cell_captions();
     std::sort(captions.begin(), captions.end());
     CHECK(captions == (std::vector<std::string>{"Hidden", "Photos", "root.jpg"}));
@@ -196,7 +196,7 @@ TEST_CASE("ui_photos_visibility nothing ticked still lists every console folder 
     for (int step = 0; step < photos; ++step) fixture.screen.update(fixture.context, press(splat::Right));
     fixture.screen.update(fixture.context, press(splat::Select));
     fixture.idle();
-    CHECK(fixture.screen.console_dir() == fixture.data / "Photos");
+    CHECK(fixture.screen.browse_dir() == fixture.data / "Photos");
     std::vector<std::string> inside = fixture.cell_captions();
     std::sort(inside.begin(), inside.end());
     CHECK(inside == (std::vector<std::string>{"a.jpg", "fam"}));

@@ -365,3 +365,37 @@ TEST_CASE("ui_queue shows the empty state and repaints while a job runs") {
     CHECK(fixture.screen.jobs().empty());
     CHECK(fixture.screen.list().rows().empty());
 }
+
+TEST_CASE("ui_queue shows a job waiting for its share and Square cancels it") {
+    Fixture fixture;
+    StubJobService jobs;
+
+    // The scene is finished and the network folder is off: the row names the
+    // location, offers Cancel (not View), and Square cancels it like a queued job.
+    JobView waiting = make_view("job-000040", "trip.jpg", "waiting");
+    waiting.message = "Waiting for Home NAS";
+    waiting.output_root = splat::Path("smb0:/scenes");
+    jobs.views = {waiting};
+    fixture.services.jobs = &jobs;
+    fixture.enter();
+
+    REQUIRE(fixture.screen.list().rows().size() == 1);
+    CHECK(fixture.screen.list().rows()[0].right == "Waiting for Home NAS");
+    bool cancel_hint = false;
+    bool view_hint = false;
+    for (const splat::Hint& hint : fixture.screen.hints()) {
+        cancel_hint = cancel_hint || (hint.button == "Square" && hint.label == "Cancel");
+        view_hint = view_hint || hint.label == "View";
+    }
+    CHECK(cancel_hint);
+    CHECK_FALSE(view_hint);
+
+    // Cross on it opens nothing.
+    fixture.press(splat::Select);
+    CHECK(fixture.commands.empty());
+
+    fixture.press(splat::Secondary);
+    REQUIRE(jobs.cancelled.size() == 1);
+    CHECK(jobs.cancelled[0] == "job-000040");
+    CHECK(fixture.toasts.back() == "Cancelled");
+}

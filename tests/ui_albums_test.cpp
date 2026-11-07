@@ -2,26 +2,35 @@
 // then the folders by name, "New folder" last), the per-tile captions, the
 // empty state, Open -> Scenes args, the New folder tile and the Triangle menu
 // (Rename, Delete for an empty folder) -> Keyboard args, and the re-list plus
-// focus restore when the screen is revealed again.
+// focus restore when the screen is revealed again. The same screen is a network
+// library's home (ScreenArgs::b): the share's folders that hold scenes are albums.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/path.h"
 #include "gallery/gallery.h"
+#include "gallery/visibility.h"
 #include "scene/scene_folder.h"
 #include "test_util.h"
+#include "tree_filesystem.h"
+#include "ui/fakes.h"
 #include "ui/screens/albums.h"
+#include "ui/screens/locations.h"
 #include "ui/screen_stack.h"
+#include "ui/ui_state.h"
+#include "vfs/io.h"
 
 using splat::Path;
 
@@ -288,4 +297,189 @@ TEST_CASE("ui_albums keeps the focused album after returning") {
     REQUIRE(fixture.stack.push(splat::ScreenId::Scenes));
     REQUIRE(fixture.stack.pop());
     CHECK(fixture.albums->grid().focus() == 1);
+}
+
+// ---- a network library -------------------------------------------------------
+
+namespace {
+
+// A share "smb0" with a library at lib/: two albums with scenes, scenes loose in
+// the library folder, and folders that are not scene libraries.
+struct ShareFixture : Fixture {
+    std::shared_ptr<splat_test::TreeFileSystem> share =
+        std::make_shared<splat_test::TreeFileSystem>("smb0");
+
+    ShareFixture() {
+        share->files["lib/Trips/s1/scene.psplat"] = {1};
+        share->files["lib/Trips/s1/meta.json"] = {2};
+        share->files["lib/Trips/s2/scene.psplat"] = {3};
+        share->files["lib/Made/m1/scene.psplat"] = {4};
+        share->files["lib/loose/scene.psplat"] = {5};
+        share->files["lib/Documents/notes.txt"] = {6};      // not a scene library
+        share->files["lib/Documents/old/readme.txt"] = {7};
+        splat::vfs::file_systems().add(share);
+    }
+    ~ShareFixture() { splat::vfs::file_systems().remove("smb0"); }
+
+    void enter_library(const std::string& root) {
+        splat::ScreenArgs args;
+        args.b = root;
+        REQUIRE(stack.push(splat::ScreenId::Albums, args));
+        pump();
+    }
+
+    // A screen revealed again re-lists its share on the worker; frames pass until
+    // that listing has been published, then input is read again.
+    void settle() {
+        for (int frame = 0; frame < 50; ++frame) {
+            stack.update(context, splat::UiInput{});
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
+    // The listing runs on a worker and is published by update().
+    void pump() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        while (albums->grid().cells().empty() && albums->error().empty() && !albums->blocked() &&
+               std::chrono::steady_clock::now() < deadline) {
+            stack.update(context, splat::UiInput{});
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+};
+
+}  // namespace
+
+TEST_CASE("ui_albums a network library lists the folders that hold scenes as albums") {
+    ShareFixture fixture;
+    fixture.enter_library("smb0:/lib");
+    REQUIRE(fixture.albums->root() == Path("smb0:/lib"));
+
+    // "Unsorted" holds the scenes directly in the library folder; the albums are
+    // the subfolders with scenes; a folder with none (Documents) is not one; there
+    // is no "New folder" tile on a share.
+    const std::vector<std::string> names = fixture.albums->names();
+    REQUIRE(names.size() == 3);
+    CHECK(names[0] == "Unsorted");
+    CHECK(names[1] == "Made");
+    CHECK(names[2] == "Trips");
+    const std::vector<splat::GridCell>& cells = fixture.albums->grid().cells();
+    CHECK(cells[0].sublabel == "1 scene");
+    CHECK(cells[1].sublabel == "1 scene");
+    CHECK(cells[2].sublabel == "2 scenes");
+    CHECK_FALSE(fixture.albums->empty_state());
+    CHECK(fixture.albums->error().empty());
+}
+
+TEST_CASE("ui_albums opens a share's album with the library root and returns to the same tile") {
+    ShareFixture fixture;
+    fixture.enter_library("smb0:/lib");
+
+    fixture.stack.update(fixture.context, press(splat::Right));  // Made
+    fixture.stack.update(fixture.context, press(splat::Right));  // Trips
+    fixture.stack.update(fixture.context, press(splat::Select));
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::Scenes);
+    CHECK(fixture.scenes->last.a == "Trips");
+    CHECK(fixture.scenes->last.b == "smb0:/lib");
+    fixture.scenes = nullptr;
+    REQUIRE(fixture.stack.pop());  // back to the albums, on the same tile
+    fixture.settle();
+    CHECK(fixture.albums->grid().focus() == 2);
+
+    // The loose scenes travel as the empty album, with the root.
+    fixture.stack.update(fixture.context, press(splat::Left));
+    fixture.stack.update(fixture.context, press(splat::Left));
+    fixture.stack.update(fixture.context, press(splat::Select));
+    REQUIRE(fixture.scenes != nullptr);
+    CHECK(fixture.scenes->last.a.empty());
+    CHECK(fixture.scenes->last.b == "smb0:/lib");
+}
+
+TEST_CASE("ui_albums a share's folders cannot be changed from the console") {
+    ShareFixture fixture;
+    fixture.enter_library("smb0:/lib");
+    fixture.stack.update(fixture.context, press(splat::Right));  // Made
+    for (const splat::Hint& hint : fixture.albums->hints()) CHECK(hint.button != "Triangle");
+    fixture.stack.update(fixture.context, press(splat::Context));
+    CHECK_FALSE(fixture.albums->menu().is_open());
+    REQUIRE_FALSE(fixture.toasts.empty());
+    CHECK(fixture.toasts.back() == splat::kRemoteMutationRefusal);
+}
+
+TEST_CASE("ui_albums an offline or missing share says so instead of an empty library") {
+    ShareFixture fixture;
+    fixture.enter_library("smb0:/no-such-folder");
+    CHECK(fixture.albums->error().find("no-such-folder") != std::string::npos);
+    CHECK(fixture.albums->names().empty());
+}
+
+TEST_CASE("ui_albums a library with no scene yet still offers Unsorted") {
+    ShareFixture fixture;
+    fixture.share->files.clear();
+    fixture.share->files["lib/readme.txt"] = {1};
+    fixture.enter_library("smb0:/lib");
+    REQUIRE(fixture.albums->names().size() == 1);
+    CHECK(fixture.albums->names()[0] == "Unsorted");
+    CHECK(fixture.albums->empty_state());
+}
+
+TEST_CASE("ui_albums a hidden network library is blocked and not even listed") {
+    ShareFixture fixture;
+    splat::Visibility state = splat::Visibility::all_visible(splat::VisibilityContext{});
+    state.enabled = true;
+    state.allowed.push_back(splat::VisibilityKey::location("smb1"));  // smb0 unticked
+    splat::VisibilityScope scope(std::move(state));
+
+    fixture.share->forget_list_calls();
+    fixture.enter_library("smb0:/lib");
+    CHECK(fixture.albums->blocked());
+    CHECK(fixture.albums->names().empty());
+    CHECK(fixture.share->list_calls().empty());
+    REQUIRE(fixture.albums->hints().size() == 1);
+    CHECK(fixture.albums->hints()[0].label == "Back");
+}
+
+TEST_CASE("ui_albums an Output folder inside a location's Path leaves its scenes visible") {
+    // The location smb0 has its Path at "scenes". Scenes were there before the
+    // Output folder was chosen; the Output folder (scenes/Made) holds the albums
+    // new scenes are saved into.
+    ShareFixture fixture;
+    fixture.share->files.clear();
+    fixture.share->files["scenes/old/s1/scene.psplat"] = {1};
+    fixture.share->files["scenes/loose/scene.psplat"] = {2};
+    fixture.share->files["scenes/Made/Trips/n1/scene.psplat"] = {3};
+    fixture.share->files["scenes/Made/Trips/n2/scene.psplat"] = {4};
+
+    splat::FakeLocationService locations;
+    splat::UiState state;
+    state.output_folder = "smb0:/scenes/Made";
+    fixture.services.locations = &locations;
+    fixture.services.state = &state;
+    fixture.registry.add(splat::ScreenId::Locations,
+                         [] { return std::make_unique<splat::LocationsScreen>(); });
+    REQUIRE(fixture.stack.push(splat::ScreenId::Locations));
+    fixture.stack.update(fixture.context, splat::UiInput{});
+
+    // The location's row opens its Path, exactly as without an Output folder:
+    // the existing album "old" and the loose scene are there.
+    fixture.stack.update(fixture.context, press(splat::Select));
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::Albums);
+    fixture.pump();
+    CHECK(fixture.albums->root() == Path("smb0:/scenes"));
+    REQUIRE(fixture.albums->names().size() == 2);
+    CHECK(fixture.albums->names()[0] == "Unsorted");
+    CHECK(fixture.albums->names()[1] == "old");
+    CHECK(fixture.albums->grid().cells()[0].sublabel == "1 scene");
+    REQUIRE(fixture.stack.pop());
+
+    // The Output folder is the next row: the albums new scenes are saved into.
+    fixture.stack.update(fixture.context, press(splat::Down));
+    fixture.stack.update(fixture.context, press(splat::Select));
+    REQUIRE(fixture.stack.top_id() == splat::ScreenId::Albums);
+    fixture.pump();
+    CHECK(fixture.albums->root() == Path("smb0:/scenes/Made"));
+    REQUIRE(fixture.albums->names().size() == 2);
+    CHECK(fixture.albums->names()[0] == "Unsorted");
+    CHECK(fixture.albums->names()[1] == "Trips");
+    CHECK(fixture.albums->grid().cells()[1].sublabel == "2 scenes");
 }

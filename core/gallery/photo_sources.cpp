@@ -14,7 +14,6 @@ namespace splat {
 namespace {
 
 constexpr size_t kMaxPhotos = 500;
-constexpr int kMaxDepth = 3;
 
 std::string lowercase(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(),
@@ -68,72 +67,6 @@ std::vector<Numbered> numbered_dirs(const Path& mnt, const std::string& prefix) 
     return found;
 }
 
-void add_file_entry(const Path& path, const vfs::DirEntry& entry, bool splat,
-                    std::vector<PhotoEntry>* out) {
-    PhotoEntry photo;
-    photo.path = path;
-    photo.name = entry.name;
-    photo.size = entry.size;
-    photo.mtime = entry.mtime;
-    photo.splat = splat;
-    out->push_back(std::move(photo));
-}
-
-void walk_photos(const Path& directory, int level, bool include_splats,
-                 std::vector<PhotoEntry>* out);
-
-// Files at most three levels below `source`: the recursion rule of the old
-// recursive scan, rebuilt on the VFS (a location cannot be walked by the C++
-// filesystem library at all). A directory at level 3 is listed but not entered,
-// so a file at level 3 is the deepest one collected.
-void collect_photos(const Path& directory, const std::vector<vfs::DirEntry>& entries, int level,
-                    bool include_splats, std::vector<PhotoEntry>* out) {
-    for (const vfs::DirEntry& entry : entries) {
-        const Path path = directory / entry.name;
-        if (entry.symlink) continue;
-        // A dot name is not a photo. macOS File Sharing (the user's own network
-        // drive) writes ".DS_Store" and one "._<name>" AppleDouble per file into
-        // every folder it serves, and "._IMG_0001.jpg" ends in .jpg: shown as a
-        // tile, it would be the first entry in a folder and could never open.
-        // list_folder() (the console browser) already skips them.
-        if (entry.name.empty() || entry.name[0] == '.') continue;
-        if (entry.directory) {
-            if (level < kMaxDepth) walk_photos(path, level + 1, include_splats, out);
-            continue;
-        }
-        if (is_photo_file(path)) {
-            add_file_entry(path, entry, false, out);
-        } else if (include_splats && is_splat_file(path)) {
-            add_file_entry(path, entry, true, out);
-        }
-    }
-}
-
-// The unchecked walk used for sub-directories: a folder that refuses to list
-// is skipped, which is what list_photos() has always promised.
-void walk_photos(const Path& directory, int level, bool include_splats,
-                 std::vector<PhotoEntry>* out) {
-    if (out->size() >= kMaxPhotos * 4) return;  // runaway guard only; sorted below
-    collect_photos(directory, entries_of(directory), level, include_splats, out);
-}
-
-void walk_splats(const Path& directory, int level, int max_depth, std::size_t max_files,
-                 std::vector<Path>* out) {
-    if (out->size() >= max_files) return;
-    for (const vfs::DirEntry& entry : entries_of(directory)) {
-        if (out->size() >= max_files) return;
-        if (entry.symlink) continue;
-        if (entry.name.empty() || entry.name[0] == '.') continue;  // .DS_Store, ._*
-
-        const Path path = directory / entry.name;
-        if (entry.directory) {
-            if (level < max_depth) walk_splats(path, level + 1, max_depth, max_files, out);
-        } else if (is_splat_file(path)) {
-            out->push_back(path);
-        }
-    }
-}
-
 }  // namespace
 
 std::vector<PhotoSource> discover_sources(const SourceRoots& roots) {
@@ -145,37 +78,6 @@ std::vector<PhotoSource> discover_sources(const SourceRoots& roots) {
         sources.push_back(PhotoSource{"usb" + number, "USB " + number, stick.dir, true});
     }
     return sources;
-}
-
-Result<std::vector<PhotoEntry>> list_photos_checked(const PhotoSource& source,
-                                                    bool include_splats) {
-    vfs::FileStat status;
-    const Status looked = vfs::stat(source.dir, &status);
-    if (!looked.ok()) return Result<std::vector<PhotoEntry>>::failure(looked.message());
-    if (!status.directory) {
-        return Result<std::vector<PhotoEntry>>::failure("not a folder: " + source.dir.string());
-    }
-    // The top level is listed here, not through the silent walk: an offline or
-    // wrong share must reach the screen as its error, not as "no photos".
-    std::vector<vfs::DirEntry> entries;
-    const Status listed = vfs::list(source.dir, &entries);
-    if (!listed.ok()) return Result<std::vector<PhotoEntry>>::failure(listed.message());
-
-    std::vector<PhotoEntry> photos;
-    collect_photos(source.dir, entries, 0, include_splats, &photos);
-
-    std::sort(photos.begin(), photos.end(), [](const PhotoEntry& a, const PhotoEntry& b) {
-        if (a.mtime != b.mtime) return a.mtime > b.mtime;
-        return a.path.string() < b.path.string();
-    });
-    if (photos.size() > kMaxPhotos) photos.resize(kMaxPhotos);
-    return Result<std::vector<PhotoEntry>>::success(std::move(photos));
-}
-
-std::vector<PhotoEntry> list_photos(const PhotoSource& source, bool include_splats) {
-    Result<std::vector<PhotoEntry>> photos = list_photos_checked(source, include_splats);
-    if (!photos.ok()) return {};
-    return std::move(photos.value());
 }
 
 std::vector<PhotoSource> console_roots(const SourceRoots& roots) {
@@ -192,15 +94,23 @@ std::vector<PhotoSource> console_roots(const SourceRoots& roots) {
     return out;
 }
 
-std::vector<FolderEntry> list_folder(const Path& dir) {
+Result<std::vector<FolderEntry>> list_folder_checked(const Path& dir) {
+    std::vector<vfs::DirEntry> items;
+    const Status read = vfs::list(dir, &items);
+    if (!read.ok()) return Result<std::vector<FolderEntry>>::failure(read.message());
+
     std::vector<FolderEntry> folders;
     std::vector<FolderEntry> photos;
     std::vector<FolderEntry> splats;
     const auto listed = [&] {
         return folders.size() + photos.size() + splats.size() < kMaxPhotos;
     };
-    for (const vfs::DirEntry& item : entries_of(dir)) {
+    for (const vfs::DirEntry& item : items) {
         if (!listed()) break;
+        // A dot name is never shown. macOS File Sharing (the user's own network
+        // drive) writes ".DS_Store" and one "._<name>" AppleDouble per file into
+        // every folder it serves, and "._IMG_0001.jpg" ends in .jpg: shown as a
+        // tile, it would be the first entry in a folder and could never open.
         if (item.name.empty() || item.name[0] == '.') continue;
         FolderEntry entry;
         entry.path = dir / item.name;
@@ -232,19 +142,13 @@ std::vector<FolderEntry> list_folder(const Path& dir) {
         out.insert(out.end(), std::make_move_iterator(group->begin()),
                    std::make_move_iterator(group->end()));
     }
-    return out;
+    return Result<std::vector<FolderEntry>>::success(std::move(out));
 }
 
-std::vector<Path> list_splat_files(const Path& dir, int max_depth, std::size_t max_files) {
-    std::vector<Path> splats;
-    vfs::FileStat status;
-    if (!vfs::stat(dir, &status).ok() || !status.directory) return splats;
-
-    walk_splats(dir, 0, max_depth, max_files, &splats);
-    std::sort(splats.begin(), splats.end(),
-              [](const Path& a, const Path& b) { return a.string() < b.string(); });
-    if (splats.size() > max_files) splats.resize(max_files);
-    return splats;
+std::vector<FolderEntry> list_folder(const Path& dir) {
+    Result<std::vector<FolderEntry>> folder = list_folder_checked(dir);
+    if (!folder.ok()) return {};
+    return std::move(folder.value());
 }
 
 }  // namespace splat

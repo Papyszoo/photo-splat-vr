@@ -342,6 +342,7 @@ TEST_CASE("ui_model_screens shows the download state and cancels with Square") {
     REQUIRE(sharp != nullptr);
     CHECK(sharp->state == "downloading");
     CHECK(screen->list().rows()[0].right.find("%") != std::string::npos);
+    CHECK(screen->list().rows()[0].right.find(", less than a minute left") != std::string::npos);
     CHECK(screen->hints()[0].button == "Square");
     CHECK(screen->hints()[0].label == "Cancel");
 

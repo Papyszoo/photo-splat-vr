@@ -2,6 +2,9 @@
 
 #include "ui/job_service.h"
 
+#include <algorithm>
+#include <chrono>
+#include <optional>
 #include <utility>
 
 #include "gallery/visibility.h"
@@ -94,14 +97,26 @@ void JobService::worker_main() {
         if (stop_.load()) break;
 
         // Nothing queued (or the runner refused the job): sleep until enqueue or
-        // cancel wakes this thread instead of spinning.
-        if (!outcome.ok() || !outcome.value()) wait_for_work();
+        // cancel wakes this thread instead of spinning. A job Waiting for its
+        // network folder sets the alarm: the thread also wakes when the retry is
+        // due. After a failed run the alarm is never shorter than a second, so a
+        // queue file that cannot be written does not turn into a busy loop.
+        if (!outcome.ok() || !outcome.value()) {
+            std::optional<double> retry = runner_.next_retry_seconds();
+            if (retry && !outcome.ok()) retry = std::max(*retry, 1.0);
+            wait_for_work(retry);
+        }
     }
 }
 
-void JobService::wait_for_work() {
+void JobService::wait_for_work(std::optional<double> alarm_seconds) {
     std::unique_lock<std::mutex> lock(wake_mutex_);
-    wake_cv_.wait(lock, [this] { return stop_.load() || wake_; });
+    const auto ready = [this] { return stop_.load() || wake_; };
+    if (alarm_seconds) {
+        wake_cv_.wait_for(lock, std::chrono::duration<double>(*alarm_seconds), ready);
+    } else {
+        wake_cv_.wait(lock, ready);
+    }
     wake_ = false;
 }
 
@@ -293,6 +308,7 @@ std::vector<JobView> JobService::snapshot() const {
 Status JobService::cancel(const std::string& id) {
     Status status = Status::success();
     bool running = false;
+    bool waiting = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         const Job* job = queue_.find(id);
@@ -301,12 +317,21 @@ Status JobService::cancel(const std::string& id) {
             cancel_id_ = id;
             running = true;
         } else {
+            waiting = job->state == JobState::Waiting;
             status = queue_.cancel(id);
         }
     }
+    // A Waiting job keeps its finished scene in the staging folder; cancelling
+    // it leaves nothing behind on the console, and the worker removes the hidden
+    // temporary folder a dropped upload may have left on the share. (A retry in
+    // flight is still Waiting: the runner sees the job Cancelled when its upload
+    // returns and removes the scene it put on the share, and the staging folder,
+    // again.)
+    const bool cleanup = waiting && status.ok();
+    if (cleanup) runner_.discard_waiting(id);
 
     publish();
-    if (running) {
+    if (running || cleanup) {
         {
             std::lock_guard<std::mutex> lock(wake_mutex_);
             wake_ = true;

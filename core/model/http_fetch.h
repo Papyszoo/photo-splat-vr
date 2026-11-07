@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -34,8 +35,27 @@ struct FetchRequest {
     Progress* progress = nullptr;
     // Returns true to stop the transfer. The partial file stays for a resume.
     std::function<bool()> cancelled;
+
+    // Segment mode (end != 0): this request is one part of a download that
+    // several requests run at the same time into the same file (0.6.0, see
+    // core/model/segmented_download.h). It covers the bytes [offset, end):
+    //  - ask for `Range: bytes=<offset>-<end - 1>`;
+    //  - `destination` already exists and holds the other parts: write the body
+    //    at `offset`, never truncate and never append;
+    //  - a server that ignores the range (200 instead of 206) is an error,
+    //    because restarting the file would erase the other segments;
+    //  - the body must be exactly end - offset bytes, anything else is an error;
+    //  - every byte is in the file (not in a user-space buffer) before it is
+    //    added to `written`.
+    uint64_t end = 0;
+    // Segment mode only: bytes of this request written so far, counted from 0 at
+    // `offset` and only ever increasing. The segmented download saves it as the
+    // resume position, so an implementation must keep it exact. May be null.
+    std::atomic<uint64_t>* written = nullptr;
 };
 
+// download() may be called from several threads at once (segment mode); head()
+// and get_text() must also stay usable while a download runs.
 class IHttpFetcher {
 public:
     virtual ~IHttpFetcher() = default;

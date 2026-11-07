@@ -95,6 +95,43 @@ private:
 // sample: a tracker re-anchor (a new local frame), not a fast turn.
 bool pose_jumped(const TrackedPose& a, const TrackedPose& b);
 
+// The angle between the orientations of two poses, degrees (0..180). A zero
+// quaternion is not a pose and gives infinity. pose_jumped() and ReanchorWatch
+// both measure with this, so the two rules cannot disagree about an angle.
+double pose_angle_degrees(const TrackedPose& a, const TrackedPose& b);
+
+// The tracker re-anchoring AFTER the scene was placed (0.6.0, "the scene was 90
+// degrees to the right when I first launched the app"). PlacementWait only
+// guards the first half second: the tracker boots in a stale default frame
+// (head yaw about 90.5 deg, runs/vr7/*.csv row 1) and latches to the real one
+// 1.3-2 s later with a 94-97 deg jump in a single sample, and a stale pose that
+// holds still for half a second is accepted. Whatever was placed or opened in
+// the old frame (the scene, a window) then sits 90 deg to the side with no way
+// to tell it from a real turn. docs/BACKLOG.md carried it as an open case.
+//
+// A re-anchor is a change of at least kReanchorMinDegrees between two
+// consecutive TRACKED samples at a rate of at least kReanchorMinDegreesPerSecond.
+// The fastest real head turn in the 2026-10-27 vr8 log is 7.5 deg in a sample
+// and 444 deg/s; the re-anchors there are 94 and 97 deg in one 16.7 ms sample
+// (5600+ deg/s). Both limits have to hold, so a long frame (a scene load) that
+// carries an ordinary turn is not a re-anchor. A lost pose clears the previous
+// sample: a gap is never a jump, and the user's own Options/Cross hold is the
+// way back from whatever the tracker did while it was blind.
+inline constexpr float kReanchorMinDegrees = 25.0f;
+inline constexpr float kReanchorMinDegreesPerSecond = 1200.0f;
+
+class ReanchorWatch {
+public:
+    // One sample per frame, after the scene is placed. `tracked` false is a
+    // lost pose. Returns true on exactly the sample that is a re-anchor.
+    bool update(bool tracked, const TrackedPose& pose, double now_seconds);
+
+private:
+    bool have_ = false;
+    TrackedPose previous_;
+    double previous_seconds_ = 0.0;
+};
+
 // The headset's half-angle tangents, as hmd2::Fov reports them: `out` to the
 // temporal side, `in` to the nasal side, `top`/`bottom` up and down. HLA-PSVR2
 // builds OpenXR's per-eye FOV from the same four numbers (xr_session.c:532-548):

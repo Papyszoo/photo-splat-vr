@@ -152,11 +152,11 @@ TEST_CASE("ui_app quit is a settings row") {
     Fixture fixture;
     fixture.app.start();
     fixture.app.update(press(splat::Menu));
-    // Ten focusable rows reach Quit: the three comfort rows, the three display
-    // rows (Thumbnail size is stage T's), Models, Conversions, Network
-    // locations, Visible folders and then Quit (L3 added the locations row,
-    // stage H the visible-folders row).
-    for (int i = 0; i < 10; ++i) fixture.app.update(press(splat::Down));
+    // Eleven focusable rows reach Quit: the three comfort rows, the three display
+    // rows (Thumbnail size is stage T's), Models, Conversions, Output folder,
+    // Network locations, Visible folders and then Quit (L3 added the locations
+    // row, stage H the visible-folders row, 0.6.0 the output folder row).
+    for (int i = 0; i < 11; ++i) fixture.app.update(press(splat::Down));
     fixture.app.update(press(splat::Select));
 
     const std::optional<splat::UiCommand> command = fixture.app.take_command();

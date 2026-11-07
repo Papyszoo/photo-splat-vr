@@ -1,27 +1,38 @@
 // The picker's splat import: a splat tile with its SPLAT badge and format
-// caption, Cross importing one file into the picker's album, Square importing a
-// folder's splat files, and a folder with none queueing nothing.
+// caption, and Cross importing one file into the picker's album from any source
+// (Console, USB, Inbox, a network folder). Files are picked one by one as in a
+// file browser; Square on a folder tile does nothing (0.6.0, user decision
+// 2026-11-07).
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "common/path.h"
 #include "gallery/photo_sources.h"
+#include "jobs/gpu_phase_guard.h"
+#include "jobs/job_queue.h"
+#include "jobs/job_runner.h"
+#include "scene/ply.h"
+#include "scene/scene_folder.h"
 #include "test_util.h"
+#include "tree_filesystem.h"
 #include "ui/fakes.h"
 #include "ui/screens/photos.h"
 #include "ui/screen_stack.h"
+#include "vfs/io.h"
 
 using splat::Path;
 
@@ -142,9 +153,9 @@ TEST_CASE("a splat tile shows its badge and Cross imports it") {
     write_splat_file(photos / "robot.spz");
 
     fixture.open_console();
-    REQUIRE(fixture.screen.console_dir() == fixture.data);
+    REQUIRE(fixture.screen.browse_dir() == fixture.data);
     fixture.update(press(splat::Select));  // into photos/
-    REQUIRE(fixture.screen.console_dir() == photos);
+    REQUIRE(fixture.screen.browse_dir() == photos);
 
     fixture.idle();
     const std::vector<splat::GridCell>& cells = fixture.screen.grid().cells();
@@ -177,93 +188,172 @@ TEST_CASE("a splat tile shows its badge and Cross imports it") {
     CHECK(fixture.jobs.snapshot()[0].album == "trip");
 }
 
-TEST_CASE("Square on a folder queues every splat file below it") {
+TEST_CASE("Square on a folder tile imports nothing and offers nothing") {
     Fixture fixture;
     const Path photos = fixture.data / "photos";
     const Path trip = photos / "trip";
     write_splat_file(trip / "a.spz");
     write_splat_file(trip / "sub" / "c.compressed.ply");
-    // One level too deep to be included (the picker stops at depth 3).
-    write_splat_file(trip / "sub" / "deeper" / "deepest" / "far.spz");
-    write_splat_file(trip / "sub" / "deeper" / "deepest" / "farther" / "too_far.spz");
     write_jpeg(trip / "photo.jpg", 30);
 
     fixture.open_console();
     fixture.update(press(splat::Select));  // into photos/
-    REQUIRE(fixture.screen.console_dir() == photos);
+    REQUIRE(fixture.screen.browse_dir() == photos);
     fixture.idle();
     REQUIRE(fixture.screen.grid().cells().size() == 1);
     CHECK(fixture.screen.grid().cells()[0].caption == "trip");
-    CHECK(has_hint(fixture.screen.hints(), "Square", "Import splats"));
+    // No folder action in the hint bar: a folder is opened, files are picked.
+    CHECK(has_hint(fixture.screen.hints(), "Cross", "Open"));
+    for (const splat::Hint& hint : fixture.screen.hints()) {
+        CHECK(hint.button != "Square");
+        CHECK(hint.label.find("Import") == std::string::npos);
+    }
 
     fixture.update(press(splat::Secondary));
-    REQUIRE(fixture.jobs.last_import().size() == 3);
-    CHECK(fixture.jobs.last_import()[0] == trip / "a.spz");
-    CHECK(fixture.jobs.last_import()[1] == trip / "sub" / "c.compressed.ply");
-    CHECK(fixture.jobs.last_import()[2] == trip / "sub" / "deeper" / "deepest" / "far.spz");
-    CHECK(fixture.jobs.last_import_album() == "trip");
-    CHECK(has_toast(fixture.toasts, "Queued 3 imports"));
+    CHECK(fixture.jobs.last_import().empty());
+    CHECK(fixture.jobs.snapshot().empty());
+    CHECK(fixture.toasts.empty());
+    CHECK(fixture.screen.selection().empty());
+    CHECK(fixture.screen.browse_dir() == photos);  // Square did not enter it either
+}
+
+TEST_CASE("splat files are imported one by one with Cross, each on its own press") {
+    Fixture fixture;
+    const Path export_dir = fixture.data / "photos" / "export";
+    write_splat_file(export_dir / "a.spz");
+    write_splat_file(export_dir / "b.splat");
+    write_splat_file(export_dir / "sub" / "c.spz");  // one level down: not listed here
+
+    fixture.open_console();
+    fixture.update(press(splat::Select));  // photos/
+    fixture.idle();
+    fixture.update(press(splat::Select));  // export/
+    REQUIRE(fixture.screen.browse_dir() == export_dir);
+    fixture.idle();
+    // The sub-folder, then the two splat files of this folder only.
+    REQUIRE(fixture.screen.grid().cells().size() == 3);
+    CHECK(fixture.screen.grid().cells()[0].caption == "sub");
+
+    fixture.update(press(splat::Right));  // a.spz
+    fixture.update(press(splat::Select));
+    REQUIRE(fixture.jobs.last_import().size() == 1);
+    CHECK(fixture.jobs.last_import()[0] == export_dir / "a.spz");
+    CHECK(fixture.jobs.snapshot().size() == 1);
+
+    fixture.update(press(splat::Right));  // b.splat
+    fixture.update(press(splat::Select));
+    REQUIRE(fixture.jobs.last_import().size() == 1);
+    CHECK(fixture.jobs.last_import()[0] == export_dir / "b.splat");
+    CHECK(fixture.jobs.snapshot().size() == 2);
+    CHECK(has_toast(fixture.toasts, "Importing a.spz"));
+    CHECK(has_toast(fixture.toasts, "Importing b.splat"));
     CHECK(fixture.screen.selection().empty());
 }
 
-TEST_CASE("the folder toast counts what the queue actually took") {
+TEST_CASE("a splat file on a USB stick imports from its folder") {
     Fixture fixture;
-    const Path photos = fixture.data / "photos";
-    const Path trip = photos / "trip";
-    write_splat_file(trip / "a.spz");
-    write_splat_file(trip / "b.spz");
+    write_jpeg(fixture.mnt / "usb0" / "stick.jpg", 10);
+    write_splat_file(fixture.mnt / "usb0" / "export" / "robot.spz");
 
-    // a.spz is already queued (the fake marks it running), so the folder press
-    // adds only b.spz: the toast must not claim two.
-    const splat::Status queued =
-        fixture.jobs.enqueue_import({trip / "a.spz"}, "trip");
-    REQUIRE_MESSAGE(queued.ok(), queued.message());
-    REQUIRE(fixture.jobs.snapshot().size() == 1);
+    fixture.enter();
+    REQUIRE(fixture.screen.tabs().size() == 4);
+    REQUIRE(fixture.screen.tabs()[2].id == "usb0");
+    fixture.screen.set_tab(fixture.context, 2);
+    fixture.idle();
+    REQUIRE(fixture.screen.grid().cells().size() == 2);  // export/, stick.jpg
+    CHECK(fixture.screen.grid().cells()[0].caption == "export");
 
-    fixture.open_console();
-    fixture.update(press(splat::Select));  // into photos/
-    REQUIRE(fixture.screen.console_dir() == photos);
+    fixture.update(press(splat::Select));  // export/
     fixture.idle();
     REQUIRE(fixture.screen.grid().cells().size() == 1);
-
-    fixture.update(press(splat::Secondary));
-    REQUIRE(fixture.jobs.last_import().size() == 2);
-    CHECK(fixture.jobs.snapshot().size() == 2);
-    CHECK(has_toast(fixture.toasts, "Queued 1 import"));
-    CHECK(!has_toast(fixture.toasts, "Queued 2 imports"));
+    CHECK(fixture.screen.grid().cells()[0].badge == "SPLAT");
+    CHECK(has_hint(fixture.screen.hints(), "Cross", "Import"));
+    fixture.update(press(splat::Select));
+    REQUIRE(fixture.jobs.last_import().size() == 1);
+    CHECK(fixture.jobs.last_import()[0] == fixture.mnt / "usb0" / "export" / "robot.spz");
+    CHECK(fixture.jobs.last_import_album() == "trip");
+    CHECK(has_toast(fixture.toasts, "Importing robot.spz"));
 }
 
-TEST_CASE("a folder import stops at 50 files") {
+TEST_CASE("a splat file in a network folder imports through the VFS, without any listing") {
     Fixture fixture;
-    const Path photos = fixture.data / "photos";
-    for (int i = 0; i < 55; ++i) {
-        char name[16];
-        std::snprintf(name, sizeof(name), "s%02d.spz", i);
-        write_splat_file(photos / "many" / name);
+    splat::FakeLocationService locations;
+    fixture.services.locations = &locations;
+    auto share = std::make_shared<splat_test::TreeFileSystem>("smb0");
+    splat::vfs::file_systems().add(share);
+    struct Unmount {
+        ~Unmount() { splat::vfs::file_systems().remove("smb0"); }
+    } unmount;
+
+    // A real scene, exported to a PLY, is what the share serves for robot.ply.
+    splat_test::TempDir work("ui-import-vfs");
+    const splat::SplatScene scene = splat_test::make_test_scene(4);
+    REQUIRE(splat::export_ply(work.path() / "robot.ply", scene).ok());
+    std::vector<uint8_t> bytes;
+    {
+        std::ifstream in(work.path() / "robot.ply", std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     }
+    REQUIRE_FALSE(bytes.empty());
+    share->files["scenes/export/robot.ply"] = bytes;
+    share->files["scenes/export/deeper/far.spz"] = {3};
+    share->files["scenes/photo.jpg"] = {4};
 
-    fixture.open_console();
+    fixture.enter();
+    int tab = -1;
+    for (std::size_t index = 0; index < fixture.screen.tabs().size(); ++index) {
+        if (fixture.screen.tabs()[index].id == "smb0") tab = static_cast<int>(index);
+    }
+    REQUIRE(tab >= 0);
+    const auto wait_cells = [&fixture](std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+        while (fixture.screen.grid().cells().size() != count &&
+               std::chrono::steady_clock::now() < deadline) {
+            fixture.idle();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        REQUIRE(fixture.screen.grid().cells().size() == count);
+    };
+    fixture.screen.set_tab(fixture.context, tab);
+    wait_cells(2);  // export/, photo.jpg
+    CHECK(fixture.screen.grid().cells()[0].caption == "export");
+    fixture.update(press(splat::Select));  // export/
+    wait_cells(2);                         // deeper/, robot.ply
+    CHECK(fixture.screen.grid().cells()[1].caption == "robot.ply");
+    CHECK(fixture.screen.grid().cells()[1].badge == "SPLAT");
+
+    fixture.update(press(splat::Right));
+    CHECK(has_hint(fixture.screen.hints(), "Cross", "Import"));
     fixture.update(press(splat::Select));
-    fixture.idle();
-    REQUIRE(fixture.screen.grid().cells().size() == 1);
-    fixture.update(press(splat::Secondary));
-    CHECK(fixture.jobs.last_import().size() == 50);
-    CHECK(has_toast(fixture.toasts, "Queued 50 imports"));
-}
+    REQUIRE(fixture.jobs.last_import().size() == 1);
+    // The job gets the location path itself; the destination is the local library.
+    const Path remote = fixture.jobs.last_import()[0];
+    CHECK(remote == Path("smb0:/scenes/export/robot.ply"));
+    CHECK(fixture.jobs.last_import_album() == "trip");
+    CHECK(fixture.jobs.last_output_root().empty());
+    CHECK(has_toast(fixture.toasts, "Importing robot.ply"));
+    // Two listings for two visits, none for the import: nothing walked the share.
+    CHECK(share->list_calls() == std::vector<std::string>{"scenes", "scenes/export"});
 
-TEST_CASE("a folder with no splats queues nothing") {
-    Fixture fixture;
-    const Path photos = fixture.data / "photos";
-    write_jpeg(photos / "plain" / "a.jpg", 40);
-    write_jpeg(photos / "plain" / "b.jpg", 60);
-
-    fixture.open_console();
-    fixture.update(press(splat::Select));
-    fixture.idle();
-    REQUIRE(fixture.screen.grid().cells().size() == 1);
-    fixture.update(press(splat::Secondary));
-    CHECK(fixture.jobs.last_import().empty());
-    CHECK(has_toast(fixture.toasts, "No splat files in this folder"));
+    // And the importer behind that path reads the file through the VFS.
+    auto opened = splat::JobQueue::open(work.path() / "state" / "jobs.json");
+    REQUIRE_MESSAGE(opened.ok(), opened.message());
+    splat::JobQueue queue = opened.take();
+    const auto id = queue.enqueue_import(remote, std::string());
+    REQUIRE_MESSAGE(id.ok(), id.message());
+    splat::GpuPhaseGuard guard;
+    splat::JobRunnerConfig config;
+    config.output_root = work.path() / "scenes-local";
+    splat::JobRunner runner(queue, guard, nullptr, config);
+    const auto outcome = runner.run_next();
+    REQUIRE_MESSAGE(outcome.ok(), outcome.message());
+    REQUIRE(outcome.value().has_value());
+    CHECK_MESSAGE(outcome.value()->state == splat::JobState::Done, outcome.value()->message);
+    const auto loaded = splat::read_scene_folder(outcome.value()->scene_folder);
+    REQUIRE_MESSAGE(loaded.ok(), loaded.message());
+    CHECK(loaded.value().scene.count() == 4);
+    CHECK(loaded.value().meta.backend == "import");
+    CHECK(outcome.value()->scene_folder.filename() == "robot");
 }
 
 TEST_CASE("the Inbox tab lists splat files too, and imports them") {
@@ -287,7 +377,7 @@ TEST_CASE("the Inbox tab lists splat files too, and imports them") {
     CHECK(found);
     REQUIRE(splat_index >= 0);
 
-    // The listing is newest first, so walk to the tile rather than assuming it.
+    // Walk to the tile rather than assuming where the name order puts it.
     for (int step = 0; step < splat_index; ++step) fixture.update(press(splat::Right));
     fixture.update(press(splat::Select));
     REQUIRE(fixture.jobs.last_import().size() == 1);
@@ -313,14 +403,4 @@ TEST_CASE("list_folder sorts folders, photos, then splat files") {
     CHECK(entries[2].source_count == 0);
     CHECK(entries[3].name == "zz.spz");
     CHECK(entries[3].splat);
-
-    // list_photos keeps them out unless the caller asks, and flags them when it
-    // does (the network tabs in L3 ask).
-    const splat::PhotoSource source{"data", "Data", root, false};
-    CHECK(splat::list_photos(source).size() == 1);
-    const std::vector<splat::PhotoEntry> with_splats = splat::list_photos(source, true);
-    REQUIRE(with_splats.size() == 3);
-    size_t splats = 0;
-    for (const splat::PhotoEntry& entry : with_splats) splats += entry.splat ? 1 : 0;
-    CHECK(splats == 2);
 }

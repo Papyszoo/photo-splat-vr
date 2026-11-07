@@ -16,6 +16,7 @@ int sharp_bench_run(int argc, char** argv);
 // only exists as a title mode (BENCH=convert), so it has no payload main().
 int convert_inbox_run(int argc, char** argv);
 
-// BENCH=http: the sceHttp probe (head, ranged download, bounded text GET). Like
-// convert it is title-only -- sceHttp from a *title* is what needs measuring.
+// BENCH=http: the sceHttp probe (timed ranged downloads A/B/C; HTTP_VARIANT=smoke
+// is head, ranged download, bounded text GET). Like convert it is title-only --
+// sceHttp from a *title* is what needs measuring.
 int http_probe_run(int argc, char** argv);

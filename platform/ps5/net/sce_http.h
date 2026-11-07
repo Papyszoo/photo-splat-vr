@@ -29,6 +29,9 @@ int sceHttpTerm(int httpCtxId);
 int sceHttpCreateTemplate(int httpCtxId, const char* userAgent, int httpVer, int autoProxyConf);
 int sceHttpDeleteTemplate(int tmplId);
 int sceHttpSetResponseHeaderMaxSize(int id, size_t headerSize);
+// id is a template, connection or request id. In the stub, never called by
+// ProsperoMgr; the console probe showed 262144 accepted.
+int sceHttpSetRecvBlockSize(int id, unsigned int blockSize);
 int sceHttpSetAutoRedirect(int id, int enable);
 int sceHttpSetResolveTimeOut(int id, unsigned int usec);
 int sceHttpSetConnectTimeOut(int id, unsigned int usec);

@@ -1,9 +1,13 @@
 // The network locations screen (L3-C, stage U1): one row per configured share
 // and an "Add location" row, always.
 //
-// Cross opens the share as a library: ScreenId::Scenes is pushed with
-// a = "" and b = "<id>:/<path>", so the folder grid lists the scenes that are
-// on the NAS, through the VFS. Square shows a delete card (the share's files are
+// Cross opens the share as a library: ScreenId::Albums is pushed with
+// b = "<id>:/<path>", so the folders of the NAS that hold scenes are shown as
+// albums, the way the console shows its own, through the VFS. The row of the
+// location that holds the Output folder (Settings) is followed by a row of its
+// own for that folder when it is not the library the location row opens; it
+// opens the same way, rooted at the Output folder, where the new scenes are. The
+// location's row never changes. Square shows a delete card (the share's files are
 // not touched; only the configuration is removed). Triangle opens the fields.
 // The state column is the last mount result: "ready", "mounting", or
 // "offline: <reason>" from the adapter (a NAS that is off says so here).
@@ -44,15 +48,18 @@ public:
 
 private:
     void refresh(UiContext& ctx);
-    void open_library(UiContext& ctx, const std::string& id);
+    void open_library(UiContext& ctx, int row);
     void open_edit(UiContext& ctx, const std::string& id);
     void ask_delete(UiContext& ctx);
 
     ListView list_;
     ConfirmCard confirm_;
-    // One id per row; "" for the "Add location" row.
+    // One id per row; "" for the "Add location" row. The Output folder's row
+    // carries its location's id, so edit and delete act on the location.
     std::vector<std::string> ids_;
     std::vector<std::string> names_;
+    // The library each row opens: "<id>:/<path>", or the Output folder.
+    std::vector<std::string> roots_;
     std::string deleting_;
     int last_count_ = -1;
     std::string last_states_;

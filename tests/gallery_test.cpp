@@ -67,18 +67,6 @@ void write_file(const Path& path, const std::string& content) {
     REQUIRE(static_cast<bool>(out));
 }
 
-void set_mtime(const Path& path, int seconds_from_now) {
-    const auto written =
-        std::filesystem::file_time_type::clock::now() + std::chrono::seconds(seconds_from_now);
-    std::filesystem::last_write_time(path, written);
-}
-
-std::vector<std::string> names(const std::vector<splat::PhotoEntry>& photos) {
-    std::vector<std::string> out;
-    for (const splat::PhotoEntry& photo : photos) out.push_back(photo.name);
-    return out;
-}
-
 // Restores the working directory at scope exit: the relative-root cases below
 // change it, and the other tests expect the harness's directory.
 class WorkingDirGuard {
@@ -461,7 +449,6 @@ TEST_CASE("gallery discovers the inbox and usb sources") {
     REQUIRE(alone.size() == 1);
     CHECK(alone[0].id == "inbox");
     CHECK(alone[0].dir == bare.inbox);
-    CHECK(splat::list_photos(alone[0]).empty());
 }
 
 TEST_CASE("gallery offers the console roots for the folder browser") {
@@ -523,7 +510,7 @@ TEST_CASE("gallery lists one folder level: folders, then photos") {
     CHECK(splat::list_folder(temp.path() / "missing").empty());
 }
 
-TEST_CASE("gallery lists photos by extension, depth and mtime") {
+TEST_CASE("gallery lists photos by extension and skips dot names") {
     splat_test::TempDir temp("gallery-photos");
     const Path dir = temp.path() / "inbox";
     write_file(dir / "a.jpg", "aaaa");
@@ -531,59 +518,41 @@ TEST_CASE("gallery lists photos by extension, depth and mtime") {
     write_file(dir / "c.PnG", "ccc");
     write_file(dir / "d.txt", "ignored");
     write_file(dir / "e.jxr", "ignored");
-    write_file(dir / "sub" / "f.jpg", "fffff");
-    write_file(dir / "sub" / "sub2" / "g.png", "gg");
-    write_file(dir / "sub" / "sub2" / "sub3" / "h.jpeg", "hhh");
-    write_file(dir / "sub" / "sub2" / "sub3" / "sub4" / "i.jpg", "too deep");
     // A folder served by macOS File Sharing carries these: the system writes
     // ".DS_Store" and one "._<name>" AppleDouble per file, and "._a.jpg" ends
     // in .jpg. Shown as photos, the first tile of every shared folder would be
     // an entry that can never open (mac-share PROBE.md, item 3).
     write_file(dir / ".DS_Store", "store");
     write_file(dir / "._a.jpg", "apple double");
-    write_file(dir / "sub" / "._f.jpg", "apple double");
     write_file(dir / ".Spotlight-V100", "volume index");
 
-    set_mtime(dir / "a.jpg", 60);
-    set_mtime(dir / "B.JPEG", 50);
-    set_mtime(dir / "c.PnG", 40);
-    set_mtime(dir / "sub" / "f.jpg", 30);
-    set_mtime(dir / "sub" / "sub2" / "g.png", 20);
-    set_mtime(dir / "sub" / "sub2" / "sub3" / "h.jpeg", 10);
-
-    const splat::PhotoSource source{"inbox", "Inbox", dir, false};
-    const std::vector<splat::PhotoEntry> photos = splat::list_photos(source);
-    REQUIRE(photos.size() == 6);
-    CHECK(names(photos) == std::vector<std::string>{"a.jpg", "B.JPEG", "c.PnG", "f.jpg", "g.png",
-                                                   "h.jpeg"});
-    for (const splat::PhotoEntry& photo : photos) {
-        CHECK(photo.name.rfind("._", 0) != 0);
-        CHECK(photo.name.rfind(".", 0) != 0);
+    const std::vector<splat::FolderEntry> photos = splat::list_folder(dir);
+    REQUIRE(photos.size() == 3);
+    CHECK(photos[0].name == "a.jpg");
+    CHECK(photos[1].name == "B.JPEG");
+    CHECK(photos[2].name == "c.PnG");
+    for (const splat::FolderEntry& photo : photos) {
+        CHECK_FALSE(photo.folder);
+        CHECK_FALSE(photo.splat);
     }
     CHECK(photos[0].path == dir / "a.jpg");
     CHECK(photos[0].size == 4);
-    CHECK(photos[0].mtime > 0);
-    CHECK(photos[0].mtime > photos[1].mtime);
 
     CHECK(splat::is_photo_file("x.JPG"));
     CHECK(splat::is_photo_file("x.jpeg"));
     CHECK(splat::is_photo_file("x.png"));
     CHECK_FALSE(splat::is_photo_file("x.jxr"));
     CHECK_FALSE(splat::is_photo_file("x"));
-
-    const splat::PhotoSource missing{"inbox", "Inbox", temp.path() / "missing", false};
-    CHECK(splat::list_photos(missing).empty());
 }
 
-TEST_CASE("gallery caps a photo listing at 500 entries") {
+TEST_CASE("gallery caps a folder listing at 500 entries") {
     splat_test::TempDir temp("gallery-photo-cap");
     const Path dir = temp.path() / "inbox";
     std::filesystem::create_directories(dir);
     for (int i = 0; i < 505; ++i) {
         write_file(dir / ("p" + std::to_string(i) + ".jpg"), "x");
     }
-    const splat::PhotoSource source{"inbox", "Inbox", dir, false};
-    CHECK(splat::list_photos(source).size() == 500);
+    CHECK(splat::list_folder(dir).size() == 500);
 }
 
 TEST_CASE("gallery loads photo and scene thumbnails") {

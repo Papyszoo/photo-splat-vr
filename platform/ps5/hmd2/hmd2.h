@@ -231,6 +231,11 @@ size_t image_bytes();
 // display buffer's byte count is what Hmd2 asked for (its resolution is the
 // system's, not the title's).
 bool mirroring();
+// Turns the mirror on after init(), when Config::mirror was false (the viewer
+// asks for it only when its own TV output cannot be used, 0.6.0). The sequence
+// is the one init() runs before VR mode; this one runs with VR mode already on,
+// so it can be refused, and false then means the TV keeps the console UI.
+bool start_mirror();
 size_t mirror_display_bytes();
 int refresh_hz();             // output mode asked for: 120
 int frames_submitted();       // submit() calls that reached SetParam+SubmitFlip

@@ -16,6 +16,7 @@
 #include "ui/screen_stack.h"
 #include "ui/screens/location_edit.h"
 #include "ui/text_fit.h"
+#include "ui/ui_state.h"
 #include "vfs/io.h"
 
 namespace splat {
@@ -29,8 +30,75 @@ constexpr int kGridTop = 96;
 constexpr int kThumbEdge = 256;
 constexpr const char* kCrumb = " \xE2\x80\xBA ";  // " > " as a single angle quote
 
+// How many photo and splat files lie directly in `dir` (the number a source's
+// tab carries); folders are not counted and nothing below the top is opened.
+std::size_t top_level_files(const Path& dir) {
+    std::size_t files = 0;
+    for (const FolderEntry& entry : list_folder(dir)) files += entry.folder ? 0 : 1;
+    return files;
+}
+
 bool same_path(const Path& a, const Path& b) {
     return !a.empty() && !b.empty() && a.lexically_normal() == b.lexically_normal();
+}
+
+// The part of a location path after "<id>:/", without a trailing separator ("" is
+// the location's root, and also what a local path yields).
+std::string location_relative(const Path& path) {
+    std::string relative;
+    if (!vfs::split(path, nullptr, &relative)) return std::string();
+    while (!relative.empty() && relative.back() == '/') relative.pop_back();
+    return relative;
+}
+
+// Whether `dir` is `top` or a folder below it on the same location. Compared by
+// the text after "<id>:/", so "smb0:/photos" and "smb0:/photos/" agree and
+// "smb0:/photos2" is not inside "smb0:/photos".
+bool within_location(const Path& dir, const Path& top) {
+    if (!vfs::is_remote(dir) || vfs::location_id(dir) != vfs::location_id(top)) return false;
+    const std::string below = location_relative(dir);
+    const std::string base = location_relative(top);
+    if (base.empty() || below == base) return true;
+    return below.size() > base.size() && below.compare(0, base.size(), base) == 0 &&
+           below[base.size()] == '/';
+}
+
+// The names of the folders that lead from `top` down to `dir` (none when they
+// are the same place). False - and `names` empty - when `dir` is not `top` or a
+// folder below it. One rule for every tab that has a fixed top: a network
+// location ("smb0:/photos") and a local source (the Inbox, a USB stick).
+bool folders_below(const Path& dir, const Path& top, std::vector<std::string>* names) {
+    if (names != nullptr) names->clear();
+    if (dir.empty() || top.empty()) return false;
+    if (vfs::is_remote(dir) || vfs::is_remote(top)) {
+        if (!within_location(dir, top)) return false;
+        const std::string below = location_relative(dir);
+        const std::string rest = below.substr(location_relative(top).size());
+        std::size_t start = 0;
+        while (names != nullptr && start < rest.size()) {
+            const std::size_t slash = rest.find('/', start);
+            const std::string part = rest.substr(
+                start, slash == std::string::npos ? std::string::npos : slash - start);
+            if (!part.empty()) names->push_back(part);
+            if (slash == std::string::npos) break;
+            start = slash + 1;
+        }
+        return true;
+    }
+    const Path relative = dir.lexically_normal().lexically_relative(top.lexically_normal());
+    const std::string text = relative.generic_string();
+    if (text.empty() || text.compare(0, 2, "..") == 0) return false;
+    if (text != "." && names != nullptr) {
+        for (const Path& part : relative) names->push_back(part.string());
+    }
+    return true;
+}
+
+// "a > b > c" under the tab strip.
+std::string crumb_line(const std::vector<std::string>& parts) {
+    std::string line;
+    for (const std::string& part : parts) line += (line.empty() ? "" : kCrumb) + part;
+    return line;
 }
 
 // The format token under a splat tile ("spz", "splat", "compressed ply"). It is
@@ -117,8 +185,11 @@ bool PhotosScreen::on_add_location() const {
 void PhotosScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
     // A reveal (back from the model choice) keeps the tab, the folder and the
     // basket; a fresh push starts at the Inbox.
+    const bool pick = args.a == kPickFolderMode;
     const Path root = args.b.empty() ? ctx.svc.paths.scenes : Path(args.b);
-    const bool returning = !tabs_.empty() && args.a == album_ && root == root_;
+    const std::string album = pick ? std::string() : args.a;
+    const bool returning =
+        !tabs_.empty() && pick == pick_folder_ && album == album_ && root == root_;
     // A reveal also keeps the entry the focus was on: opening Settings and
     // changing the thumbnail size must not send the picker back to the first
     // tile. The path is applied once the listing is back.
@@ -129,13 +200,14 @@ void PhotosScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
             restore_path_ = entries_[static_cast<std::size_t>(focus)].path;
         }
     }
-    album_ = args.a;
+    pick_folder_ = pick;
+    album_ = album;
     root_ = root;
     if (!returning) {
         selection_.clear();
         tab_ = 0;
         tabs_.clear();
-        console_dir_.clear();
+        browse_dir_.clear();
     }
     // The saved turns live in <state>/photo-turns.json and belong to the files,
     // not to one tab: a relaunch, a tab switch and a re-list all read them
@@ -156,7 +228,20 @@ bool PhotosScreen::on_console() const {
     return !tabs_.empty() && tabs_[static_cast<std::size_t>(tab_)].console;
 }
 
+bool PhotosScreen::on_browser() const {
+    if (tabs_.empty()) return false;
+    const PhotoTab& tab = tabs_[static_cast<std::size_t>(tab_)];
+    // Every tab with a place to list: the console, and a source with a folder
+    // (the Inbox, a USB stick, a network location). Captures, the add tab and a
+    // USB tab without a stick have none.
+    return tab.console || (!tab.captures && !tab.add_location && !tab.dir.empty());
+}
+
 void PhotosScreen::refresh(UiContext& ctx) {
+    if (pick_folder_) {
+        refresh_output_tabs(ctx);
+        return;
+    }
     const std::string keep = tabs_.empty() ? std::string() : tabs_[static_cast<std::size_t>(tab_)].id;
 
     // Stage U1: the photo picker is not filtered by the visible-folders list.
@@ -188,7 +273,7 @@ void PhotosScreen::refresh(UiContext& ctx) {
         tab.title = source.label;
         tab.dir = source.dir;
         tab.removable = source.removable;
-        tab.count = list_photos(source, true).size();
+        tab.count = top_level_files(source.dir);
         (source.removable ? sticks : tabs).push_back(std::move(tab));
     }
     // The console test reads what the title itself sees (W23/W24): the inbox
@@ -237,6 +322,38 @@ void PhotosScreen::refresh(UiContext& ctx) {
         add.add_location = true;
         tabs.push_back(std::move(add));
     }
+    install_tabs(ctx, std::move(tabs), keep);
+}
+
+void PhotosScreen::refresh_output_tabs(UiContext& ctx) {
+    std::string keep = tabs_.empty() ? std::string() : tabs_[static_cast<std::size_t>(tab_)].id;
+    if (tabs_.empty() && ctx.svc.state != nullptr && !ctx.svc.state->output_folder.empty()) {
+        // The chooser opens where the current choice is.
+        browse_dir_ = Path(ctx.svc.state->output_folder);
+        keep = vfs::location_id(browse_dir_);
+    }
+    std::vector<PhotoTab> tabs;
+    PhotoTab console;
+    console.id = kConsoleOutputTab;
+    console.title = "Console";
+    tabs.push_back(std::move(console));
+    // Every configured location is a place to save to, whether or not it is a
+    // photo source.
+    if (ctx.svc.locations != nullptr) {
+        for (const LocationView& location : ctx.svc.locations->list()) {
+            PhotoTab tab;
+            tab.id = location.id;
+            tab.title = location.name.empty() ? location.id : location.name;
+            tab.dir = vfs::join(location.id, location.path);
+            tab.location = true;
+            tabs.push_back(std::move(tab));
+        }
+    }
+    install_tabs(ctx, std::move(tabs), keep);
+}
+
+void PhotosScreen::install_tabs(UiContext& ctx, std::vector<PhotoTab> tabs,
+                                const std::string& keep) {
     for (PhotoTab& tab : tabs) tab.label = tab.title;
 
     tabs_ = std::move(tabs);
@@ -251,7 +368,7 @@ void PhotosScreen::refresh(UiContext& ctx) {
     if (tabs_.empty() || tabs_[static_cast<std::size_t>(tab_)].id != keep) {
         selection_.clear();
         restore_path_.clear();
-        if (tabs_.empty()) console_dir_.clear();
+        browse_dir_.clear();
     }
     load_tab(ctx);
 }
@@ -261,7 +378,7 @@ void PhotosScreen::set_tab(UiContext& ctx, int index) {
     const int clamped = count == 0 ? 0 : std::max(0, std::min(index, count - 1));
     if (clamped != tab_) {
         selection_.clear();
-        console_dir_.clear();
+        browse_dir_.clear();
         rotations_ = PhotoTurnStore(ctx.svc.paths.state).load_all();
     }
     tab_ = clamped;
@@ -285,6 +402,10 @@ void PhotosScreen::load_tab(UiContext& ctx) {
         // Nothing is listed here: Cross opens the editor and the tab is
         // replaced by the new source's tab when the editor returns.
         message_ = kAddLocationHint;
+        return;
+    }
+    if (pick_folder_ && tab.id == kConsoleOutputTab) {
+        message_ = "New scenes are saved on this console.";
         return;
     }
     if (tab.captures) {
@@ -312,12 +433,18 @@ void PhotosScreen::load_tab(UiContext& ctx) {
         message_ = "That location is not configured";
         return;
     }
-    if (tab.console && console_dir_.empty() && console_roots_.size() == 1) {
+    if (!tab.console && !folders_below(browse_dir_, tab.dir, nullptr)) {
+        // A source opens at its own top (the Inbox, the stick, a share's path); a
+        // folder left over from a location that was edited to point elsewhere is
+        // not a place in this one.
+        browse_dir_ = tab.dir;
+    }
+    if (tab.console && browse_dir_.empty() && console_roots_.size() == 1) {
         // Exactly one storage: start inside it, so a console with one root does
         // not show a one-row root list.
-        console_dir_ = console_roots_.front().dir;
+        browse_dir_ = console_roots_.front().dir;
     }
-    if (tab.console && console_dir_.empty()) {
+    if (tab.console && browse_dir_.empty()) {
         for (std::size_t index = 0; index < console_roots_.size(); ++index) {
             entries_.push_back(Entry{console_roots_[index].dir, root_label(index), 0, true, true,
                                      quarters_for(console_roots_[index].dir), false, 0});
@@ -334,13 +461,26 @@ void PhotosScreen::load_tab(UiContext& ctx) {
 
 void PhotosScreen::request_tab() {
     const PhotoTab tab = tabs_[static_cast<std::size_t>(tab_)];
-    const Path dir = tab.console ? console_dir_ : tab.dir;
+    // Every file-backed tab is the one folder browser: one level of the current
+    // folder, folders first, then that folder's photos and splat files. A
+    // network listing runs on the worker, a local one inline.
+    const Path dir = browse_dir_;
     const Path hidden = hidden_dir_;
-    const bool console = tab.console;
-    vfs::AsyncListing::Job job = [tab, dir, hidden, console] {
+    // The Output folder chooser lists folders only: it picks a place, not files.
+    const bool folders_only = pick_folder_;
+    vfs::AsyncListing::Job job = [tab, dir, hidden, folders_only] {
         auto listing = std::make_shared<TabListing>();
-        if (console) {
-            for (const FolderEntry& item : list_folder(dir)) {
+        // A location that cannot be read is an error, not an empty folder: the
+        // screen has an error line for it, and an offline share used to read
+        // "No photos in this location" with nothing in the log. A local folder
+        // that cannot be read stays an empty one.
+        Result<std::vector<FolderEntry>> items = list_folder_checked(dir);
+        if (!items.ok() && vfs::is_remote(dir)) {
+            return Result<vfs::AsyncListing::Snapshot>::failure(items.message());
+        }
+        if (items.ok()) {
+            for (const FolderEntry& item : items.value()) {
+                if (folders_only && !item.folder) continue;
                 if (item.folder && same_path(item.path, hidden)) continue;
                 Entry entry;
                 entry.path = item.path;
@@ -351,37 +491,19 @@ void PhotosScreen::request_tab() {
                 entry.source_count = item.source_count;
                 listing->entries.push_back(std::move(entry));
             }
-            if (listing->entries.empty()) listing->message = "No folders or photos here";
-        } else {
-            // Splat files are listed with the photos: an FTP upload of a
-            // converted scene to the Inbox is the shortest import there is.
-            const PhotoSource source{tab.id, tab.title, tab.dir, tab.removable};
-            const bool remote = vfs::is_remote(tab.dir);
-            // A location that cannot be read is an error, not an empty folder:
-            // the screen has an error line for it, and an offline share used to
-            // read "No photos in this location" with nothing in the log.
-            Result<std::vector<PhotoEntry>> photos = list_photos_checked(source, true);
-            if (!photos.ok() && remote) {
-                return Result<vfs::AsyncListing::Snapshot>::failure(photos.message());
-            }
-            if (photos.ok()) {
-                for (const PhotoEntry& photo : photos.value()) {
-                    Entry entry;
-                    entry.path = photo.path;
-                    entry.name = photo.name;
-                    entry.size = photo.size;
-                    entry.splat = photo.splat;
-                    listing->entries.push_back(std::move(entry));
-                }
-            }
-            if (!listing->entries.empty()) {
-                // listed
-            } else if (tab.removable) {
-                listing->message = "No photos on this USB drive";
-            } else if (remote) {
-                listing->message = "No photos in this location";
-            } else {
+        }
+        if (listing->entries.empty()) {
+            // The Inbox and a stick name themselves at their top; any other
+            // empty place is just an empty folder.
+            const bool top = dir == tab.dir || same_path(dir, tab.dir);
+            if (folders_only) {
+                listing->message = "No folders here";
+            } else if (top && tab.id == "inbox") {
                 listing->message = "No photos in the Inbox yet";
+            } else if (top && tab.removable) {
+                listing->message = "No photos on this USB drive";
+            } else {
+                listing->message = "No folders or photos here";
             }
         }
         vfs::AsyncListing::Snapshot snapshot;
@@ -456,26 +578,56 @@ std::string PhotosScreen::source_key(const Path& path) const {
 }
 
 void PhotosScreen::enter_folder(UiContext& ctx, const Path& dir) {
-    console_dir_ = dir;
+    browse_dir_ = dir;
     load_tab(ctx);
 }
 
-bool PhotosScreen::at_console_top() const {
-    if (!on_console() || console_dir_.empty()) return true;
-    return root_index(console_dir_) >= 0;
+Path PhotosScreen::browse_top() const {
+    // The console's top is the list of storages (an empty path); every other
+    // tab opens at its own source folder.
+    if (!on_browser() || on_console()) return Path();
+    return tabs_[static_cast<std::size_t>(tab_)].dir;
 }
 
+bool PhotosScreen::at_browse_top() const {
+    if (!on_browser() || browse_dir_.empty()) return true;
+    if (on_console()) return root_index(browse_dir_) >= 0;
+    std::vector<std::string> names;
+    return !folders_below(browse_dir_, browse_top(), &names) || names.empty();
+}
+
+Path PhotosScreen::browse_parent() const {
+    if (on_console()) {
+        return root_index(browse_dir_) >= 0 ? Path() : browse_dir_.parent_path();
+    }
+    // Inside a source the parent is cut from the folders below its top and never
+    // goes above it (a plain parent_path() would turn "smb0:/a" into "smb0:",
+    // which is not a place).
+    const Path top = browse_top();
+    std::vector<std::string> names;
+    if (!folders_below(browse_dir_, top, &names) || names.empty()) return top;
+    names.pop_back();
+    if (names.empty()) return top;
+    if (!vfs::is_remote(top)) return browse_dir_.parent_path();
+    std::string relative = location_relative(top);
+    for (const std::string& name : names) relative += (relative.empty() ? "" : "/") + name;
+    return vfs::join(vfs::location_id(top), relative);
+}
 
 bool PhotosScreen::handle_back(UiContext& ctx) {
     if (tabs_.empty()) return false;
-    if (!on_console() || console_dir_.empty()) return false;
-    const bool at_root = root_index(console_dir_) >= 0;
-    // The only storage is where the browser starts: Circle leaves the picker
-    // instead of showing a one-row root list.
-    if (at_root && console_roots_.size() <= 1) return false;
-    const Path from = console_dir_;
-    enter_folder(ctx, at_root ? Path() : console_dir_.parent_path());
-    // Keep the focus on the folder we came out of.
+    if (!on_browser() || browse_dir_.empty()) return false;
+    // A source's top (the Inbox, a stick, a share's path) and the only storage a
+    // console has (where its browser starts) are the places Circle leaves the
+    // picker from. A console with several storages shows them as folder tiles
+    // above their roots, and Circle goes up to that list first.
+    if (at_browse_top() && (!on_console() || console_roots_.size() <= 1)) return false;
+    const Path from = browse_dir_;
+    // Keep the focus on the folder we came out of: at once for a local folder
+    // (listed inside enter_folder), and through restore_path_ for a location,
+    // whose listing arrives a few frames later.
+    restore_path_ = from;
+    enter_folder(ctx, browse_parent());
     for (std::size_t index = 0; index < entries_.size(); ++index) {
         if (same_path(entries_[index].path, from)) grid_.set_focus(static_cast<int>(index));
     }
@@ -494,12 +646,17 @@ std::string PhotosScreen::display_path(const Path& path) const {
 }
 
 std::vector<std::string> PhotosScreen::breadcrumb() const {
-    // The tab already says "Console": the crumbs start below it.
+    // The tab already says "Console", "Inbox" or the share's name: the crumbs
+    // start below it.
     std::vector<std::string> parts;
-    if (console_dir_.empty()) return parts;
+    if (browse_dir_.empty()) return parts;
+    if (!on_console()) {
+        folders_below(browse_dir_, browse_top(), &parts);
+        return parts;
+    }
     for (std::size_t index = 0; index < console_roots_.size(); ++index) {
         const Path& root = console_roots_[index].dir;
-        const Path relative = console_dir_.lexically_normal().lexically_relative(root.lexically_normal());
+        const Path relative = browse_dir_.lexically_normal().lexically_relative(root.lexically_normal());
         const std::string text = relative.generic_string();
         if (text.empty() || text.compare(0, 2, "..") == 0) continue;
         if (console_roots_.size() > 1) parts.push_back(root_label(index));
@@ -514,15 +671,21 @@ std::vector<std::string> PhotosScreen::breadcrumb() const {
 std::string PhotosScreen::location() const {
     if (tabs_.empty()) return {};
     const PhotoTab& tab = tabs_[static_cast<std::size_t>(tab_)];
-    if (tab.console) {
-        std::string line;
-        for (const std::string& part : breadcrumb()) line += (line.empty() ? "" : kCrumb) + part;
-        return line;
+    if (pick_folder_) {
+        if (tab.id == kConsoleOutputTab) return "New scenes stay on this console";
+        const std::string place = crumb_line(breadcrumb());
+        return place.empty() ? "Top folder of " + tab.title : place;
     }
+    if (tab.console) return crumb_line(breadcrumb());
     if (tab.add_location) return std::string();
     if (tab.captures) return "Screenshots from this console";
-    if (tab.removable) return tab.dir.empty() ? std::string() : "Photos on the USB drive";
-    if (tab.location) return tab.dir.empty() ? std::string() : "Photos on " + tab.title;
+    if (tab.dir.empty()) return std::string();
+    // At a source's top the line says where these photos come from; inside a
+    // folder it is the place, the same crumb the console browser shows.
+    const std::string place = crumb_line(breadcrumb());
+    if (!place.empty()) return place;
+    if (tab.removable) return "Photos on the USB drive";
+    if (tab.location) return "Photos on " + tab.title;
     return "Upload photos by FTP to " + display_path(tab.dir);
 }
 
@@ -534,7 +697,7 @@ Rect PhotosScreen::grid_area(const Rect& content, const UiTheme& theme) {
 void PhotosScreen::sync_cells(UiContext& ctx, const Rect& area) {
     const std::size_t count = entries_.size();
     const std::string key = (tabs_.empty() ? std::string() : tabs_[static_cast<std::size_t>(tab_)].id) +
-                            ":" + console_dir_.string() + ":" + std::to_string(count);
+                            ":" + browse_dir_.string() + ":" + std::to_string(count);
 
     bool resized = false;
     if (thumbs_owned_.size() != count || thumb_keys_.size() != count) {
@@ -701,10 +864,17 @@ void PhotosScreen::update(UiContext& ctx, const UiInput& input) {
                 if (ctx.svc.jobs == nullptr) {
                     ctx.toast("Imports are not available in this build");
                 } else {
-                    const Status status = ctx.svc.jobs->enqueue_import(
-                        {entry.path}, album_, nullptr, vfs::is_remote(root_) ? root_ : Path(),
-                        source_key(entry.path));
-                    ctx.toast(status.ok() ? "Importing " + entry.name : status.message());
+                    // The shelf's own network library, else the Output folder.
+                    const Result<SceneTarget> target =
+                        scene_target(ctx.svc.state, ctx.svc.locations, root_, album_);
+                    if (!target.ok()) {
+                        ctx.toast(target.message());
+                    } else {
+                        const Status status = ctx.svc.jobs->enqueue_import(
+                            {entry.path}, target.value().album, nullptr, target.value().root,
+                            source_key(entry.path));
+                        ctx.toast(status.ok() ? "Importing " + entry.name : status.message());
+                    }
                 }
             } else if (!entry.supported) {
                 ctx.toast(entry.name + " is HDR, not supported");
@@ -715,7 +885,13 @@ void PhotosScreen::update(UiContext& ctx, const UiInput& input) {
         }
     }
 
-    if ((input.pressed & Secondary) != 0) secondary(ctx);
+    if ((input.pressed & Secondary) != 0) {
+        // The chooser closes itself when a folder is chosen, which destroys this
+        // screen: nothing of it may run after that.
+        const bool chooser = pick_folder_;
+        secondary(ctx);
+        if (chooser) return;
+    }
     if (copying_) poll_copy(ctx);
     if (thumbs_.pending()) ctx.invalidate();
 }
@@ -801,8 +977,61 @@ void PhotosScreen::rotate_focused(UiContext& ctx, int delta_quarters) {
     ctx.invalidate();
 }
 
+void PhotosScreen::use_folder(UiContext& ctx) {
+    UiState* state = ctx.svc.state;
+    if (state == nullptr) {
+        ctx.toast("Settings are not available in this build");
+        return;
+    }
+    const PhotoTab& tab = tabs_[static_cast<std::size_t>(tab_)];
+    std::string chosen;  // "" = the console
+    if (tab.id != kConsoleOutputTab) {
+        if (!tab.location || !on_browser() || browse_dir_.empty()) {
+            ctx.toast("Open a folder on a network location first");
+            return;
+        }
+        chosen = canonical_output_folder(browse_dir_);
+        if (chosen.empty()) {
+            ctx.toast("That folder cannot be used");
+            return;
+        }
+        // The location's scene library is switched on, so the scenes saved here
+        // show in its library (Visible folders lists it by this switch).
+        if (ctx.svc.locations != nullptr) {
+            for (LocationView view : ctx.svc.locations->list()) {
+                if (view.id != tab.id || view.splat_library) continue;
+                view.splat_library = true;
+                const Status updated = ctx.svc.locations->update(view);
+                if (!updated.ok()) {
+                    ctx.toast(updated.message());
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    const std::string previous = state->output_folder;
+    state->output_folder = chosen;
+    const Status saved = save_ui_state(ctx.svc.paths.state, *state);
+    if (!saved.ok()) {
+        state->output_folder = previous;
+        ctx.toast("Could not save settings");
+        if (ctx.svc.log) ctx.svc.log("ui: output folder: " + saved.message());
+        return;
+    }
+    const std::string text = output_folder_text(state, ctx.svc.locations);
+    if (ctx.svc.log) ctx.svc.log("ui: output folder: " + text);
+    ctx.toast(chosen.empty() ? std::string("New scenes are saved on this console")
+                             : "New scenes are saved to " + text);
+    ctx.nav.pop();
+}
+
 void PhotosScreen::secondary(UiContext& ctx) {
     if (tabs_.empty()) return;
+    if (pick_folder_) {
+        use_folder(ctx);
+        return;
+    }
     if (on_captures()) {
         if (ctx.svc.captures == nullptr) return;
         if (copying_) {
@@ -835,20 +1064,16 @@ void PhotosScreen::secondary(UiContext& ctx) {
         return;
     }
 
-    // Square on a folder row imports everything splat-shaped below it: one
-    // press brings a whole export in.
-    const int focus = grid_.focus();
-    if (on_console() && focus >= 0 && focus < static_cast<int>(entries_.size()) &&
-        entries_[static_cast<std::size_t>(focus)].folder) {
-        import_splat_folder(ctx, entries_[static_cast<std::size_t>(focus)].path);
-        return;
-    }
-
     // Cross marks a photo for the basket and Square converts the basket. The
     // turn is the file action on L3/R3, so it is not hidden behind Square on a
     // photo that is not selected.
     if (selection_.empty()) {
-        ctx.toast("Select photos with Cross first");
+        // Square on a folder tile has nothing to do: a folder is opened with
+        // Cross, and files are picked one by one (user, 2026-11-07).
+        const int focus = grid_.focus();
+        const bool on_folder = focus >= 0 && focus < static_cast<int>(entries_.size()) &&
+                               entries_[static_cast<std::size_t>(focus)].folder;
+        if (!on_folder) ctx.toast("Select photos with Cross first");
         return;
     }
     ScreenArgs args;
@@ -866,26 +1091,6 @@ void PhotosScreen::secondary(UiContext& ctx) {
                                                           : pick.source_folder);
     }
     ctx.nav.push(ScreenId::ConvertDialog, args);
-}
-
-void PhotosScreen::import_splat_folder(UiContext& ctx, const Path& dir) {
-    if (ctx.svc.jobs == nullptr) {
-        ctx.toast("Imports are not available in this build");
-        return;
-    }
-    const std::vector<Path> files = list_splat_files(dir);
-    if (files.empty()) {
-        ctx.toast("No splat files in this folder");
-        return;
-    }
-    std::size_t queued = 0;
-    const Status status = ctx.svc.jobs->enqueue_import(
-        files, album_, &queued, vfs::is_remote(root_) ? root_ : Path(), source_key(dir));
-    if (!status.ok()) {
-        ctx.toast(status.message());
-        return;
-    }
-    ctx.toast("Queued " + std::to_string(queued) + (queued == 1 ? " import" : " imports"));
 }
 
 void PhotosScreen::poll_copy(UiContext& ctx) {
@@ -945,7 +1150,7 @@ void PhotosScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
 
     // Where the photos come from, in plain words; the capture copy state too.
     std::string where = location();
-    if (on_console()) {
+    if (on_browser()) {
         // A long breadcrumb keeps its deepest folders behind a leading "…".
         std::vector<std::string> parts = breadcrumb();
         while (parts.size() > 1 &&
@@ -973,8 +1178,13 @@ void PhotosScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
     if (!message_.empty()) {
         canvas.text(area.x + 4, area.y + 40, message_, theme.heading_size, theme.text);
         canvas.text(area.x + 4, area.y + 40 + UiCanvas::line_height(theme.heading_size),
-                    on_add_location() ? "Press Cross to add a share."
-                                      : "L1 and R1 switch to the other sources.",
+                    on_add_location()
+                        ? "Press Cross to add a share."
+                        : (pick_folder_ ? (tabs_.empty() || tabs_[static_cast<std::size_t>(tab_)].id ==
+                                                              kConsoleOutputTab
+                                               ? "Square keeps new scenes on the console."
+                                               : "Square uses this folder.")
+                                        : "L1 and R1 switch to the other sources."),
                     theme.body_size - 2, theme.dim_text);
         return;
     }
@@ -984,6 +1194,14 @@ void PhotosScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
 
 std::vector<Hint> PhotosScreen::hints() const {
     std::vector<Hint> hints;
+    if (pick_folder_) {
+        const bool console_tab =
+            tabs_.empty() || tabs_[static_cast<std::size_t>(tab_)].id == kConsoleOutputTab;
+        if (!entries_.empty()) hints.push_back(Hint{"Cross", "Open"});
+        hints.push_back(Hint{"Square", console_tab ? "Use the console" : "Use this folder"});
+        hints.push_back(Hint{"Circle", at_browse_top() ? "Back" : "Up"});
+        return hints;
+    }
     if (on_add_location()) {
         return {Hint{"Cross", "Add network location"}, Hint{"Circle", "Back"}};
     }
@@ -996,8 +1214,6 @@ std::vector<Hint> PhotosScreen::hints() const {
     }
     if (on_captures() && !entries_.empty()) {
         hints.push_back(Hint{"Square", "Copy to Inbox"});
-    } else if (on_folder && on_console()) {
-        hints.push_back(Hint{"Square", "Import splats"});
     } else if (!selection_.empty()) {
         hints.push_back(Hint{"Square", "Convert (" + std::to_string(selection_.size()) + ")"});
     }
@@ -1008,7 +1224,7 @@ std::vector<Hint> PhotosScreen::hints() const {
         hints.push_back(Hint{"L3", "Rotate left"});
         hints.push_back(Hint{"R3", "Rotate right"});
     }
-    hints.push_back(Hint{"Circle", at_console_top() ? "Back" : "Up"});
+    hints.push_back(Hint{"Circle", at_browse_top() ? "Back" : "Up"});
     return hints;
 }
 

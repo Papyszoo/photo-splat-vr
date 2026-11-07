@@ -654,7 +654,7 @@ TEST_CASE("ui_visibility options from the list pops to settings and destroys it"
     app.update(splat::UiInput{});
     app.update(press(splat::Menu));
     REQUIRE(app.nav().top_id() == splat::ScreenId::Settings);
-    for (int i = 0; i < 10; ++i) app.update(press(splat::Down));  // Quit row is last
+    for (int i = 0; i < 11; ++i) app.update(press(splat::Down));  // Quit row is last
     // From Settings, open the Visible folders row (one Up from Quit).
     app.update(press(splat::Up));
     app.update(splat::UiInput{});
@@ -669,7 +669,7 @@ TEST_CASE("ui_visibility options from the list pops to settings and destroys it"
     CHECK(app.nav().size() == 1);
     app.update(press(splat::Menu));
     REQUIRE(app.nav().top_id() == splat::ScreenId::Settings);
-    for (int i = 0; i < 9; ++i) app.update(press(splat::Down));
+    for (int i = 0; i < 10; ++i) app.update(press(splat::Down));  // 0.6.0: Output folder row
     app.update(press(splat::Select));
     REQUIRE(app.nav().top_id() == splat::ScreenId::VisibleFolders);
     const auto* reopened =

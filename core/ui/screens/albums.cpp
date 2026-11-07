@@ -15,6 +15,7 @@
 #include "gallery/visibility.h"
 #include "ui/screen_stack.h"
 #include "ui/text_fit.h"
+#include "vfs/io.h"
 
 namespace splat {
 
@@ -29,20 +30,55 @@ AlbumsScreen::AlbumsScreen() {
     // the scene count as each tile's sublabel.
 }
 
-void AlbumsScreen::on_enter(UiContext& ctx, const ScreenArgs& /*args*/) {
+void AlbumsScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
     menu_.close();
+    // The app's own library, or the network library this screen was opened for
+    // (ScreenArgs::b, from the Locations screen).
+    root_ = args.b.empty() ? ctx.svc.paths.scenes : Path(args.b);
+    // A hidden network library is a blocked screen: nothing is listed, no share
+    // is contacted, and no folder name is drawn (the same rule as the shelf).
+    const std::shared_ptr<const Visibility> visibility = current_visibility();
+    blocked_ = vfs::is_remote(root_) && visibility->enabled &&
+               !visibility->allows_location(vfs::location_id(root_));
+    if (blocked_) {
+        listing_.cancel();
+        items_.clear();
+        error_.clear();
+        empty_state_ = false;
+        build_cells();
+        return;
+    }
     request_listing(ctx);
     // A local root is already listed at this point; a location path arrives
     // through update()/tick().
     if (listing_.ready()) apply_listing(ctx);
 }
 
-void AlbumsScreen::request_listing(UiContext& ctx) {
-    const Path root = ctx.svc.paths.scenes;
+void AlbumsScreen::request_listing(UiContext& /*ctx*/) {
+    const Path root = root_;
     vfs::AsyncListing::Job job = [root] {
         auto listing = std::make_shared<Listing>();
+        const bool remote = vfs::is_remote(root);
+        std::vector<AlbumEntry> albums;
+        if (remote) {
+            // A share that is offline or has the wrong path says so; "No scenes
+            // yet" is reserved for a library that really is empty.
+            Result<std::vector<AlbumEntry>> listed = list_albums_checked(root);
+            if (!listed.ok()) {
+                return Result<vfs::AsyncListing::Snapshot>::failure(listed.message());
+            }
+            albums = std::move(listed.value());
+        } else {
+            albums = list_albums(root);
+        }
         std::size_t total = 0;
-        for (const AlbumEntry& album : list_albums(root)) {
+        for (const AlbumEntry& album : albums) {
+            // On a share the folders that hold scenes are the albums: the
+            // console cannot make an empty folder there, and a share is full of
+            // folders that are not scene libraries. "Unsorted" (the scenes
+            // directly in the library folder) stays, as on the console.
+            const bool implicit = album.dir == root || album.name == kAllScenesAlbumName;
+            if (remote && !implicit && album.scene_count == 0) continue;
             Item item;
             item.implicit = album.dir == root || album.name == kAllScenesAlbumName;
             item.album = item.implicit ? std::string() : album.name;
@@ -55,11 +91,15 @@ void AlbumsScreen::request_listing(UiContext& ctx) {
         }
         listing->empty_state = total == 0;
         listing->scenes_total = total;
-        listing->default_name = default_album_name(std::time(nullptr), root);
-        Item create;
-        create.create = true;
-        create.caption = "New folder";
-        listing->items.push_back(std::move(create));
+        if (!remote) {
+            // Folders on a share cannot be made from the console, so only the
+            // console's own library offers "New folder".
+            listing->default_name = default_album_name(std::time(nullptr), root);
+            Item create;
+            create.create = true;
+            create.caption = "New folder";
+            listing->items.push_back(std::move(create));
+        }
 
         vfs::AsyncListing::Snapshot snapshot;
         snapshot.payload = std::move(listing);
@@ -193,7 +233,7 @@ void AlbumsScreen::update(UiContext& ctx, const UiInput& input) {
         apply_listing(ctx);
         ctx.invalidate();
     }
-    if (ctx.content.empty() || listing_.busy()) return;
+    if (ctx.content.empty() || listing_.busy() || blocked_) return;
     refresh_covers(ctx);
 
     if (menu_.is_open()) {
@@ -212,6 +252,12 @@ void AlbumsScreen::update(UiContext& ctx, const UiInput& input) {
 
     if ((input.pressed & Context) != 0) {
         grid_.clear_activated();
+        // Rename and delete are folder mutations; a share answers them with the
+        // one refusal the shelf gives, so say it instead of opening a menu.
+        if (vfs::is_remote(root_)) {
+            ctx.toast(kRemoteMutationRefusal);
+            return;
+        }
         open_menu();
         return;
     }
@@ -227,10 +273,18 @@ void AlbumsScreen::update(UiContext& ctx, const UiInput& input) {
         return;
     }
     args.a = item.album;
+    // A network library keeps its root for the shelf; the console's own is the
+    // shelf's default.
+    if (vfs::is_remote(root_)) args.b = root_.string();
     ctx.nav.push(ScreenId::Scenes, args);
 }
 
 void AlbumsScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
+    if (blocked_) {
+        canvas.text(content.x + 4, content.y + 40, kNotVisibleText, ctx.theme.heading_size,
+                    ctx.theme.text);
+        return;
+    }
     if (listing_.busy()) {
         canvas.text(content.x + 4, content.y + 40, "Loading\xE2\x80\xA6", ctx.theme.heading_size,
                     ctx.theme.text);
@@ -264,12 +318,16 @@ void AlbumsScreen::draw(UiContext& ctx, UiCanvas& canvas, const Rect& content) {
 }
 
 std::vector<Hint> AlbumsScreen::hints() const {
+    if (blocked_) return {Hint{"Circle", "Back"}};
     if (menu_.is_open()) return {Hint{"Cross", "Choose"}, Hint{"Circle", "Close"}};
     const Item* item = focused_item();
     if (item != nullptr && item->create) {
         return {Hint{"Cross", "New folder"}, Hint{"Options", "Settings"}};
     }
-    if (item == nullptr || item->implicit) return {Hint{"Cross", "Open"}, Hint{"Options", "Settings"}};
+    // A share's folders cannot be changed from the console: no "More" there.
+    if (item == nullptr || item->implicit || vfs::is_remote(root_)) {
+        return {Hint{"Cross", "Open"}, Hint{"Options", "Settings"}};
+    }
     return {Hint{"Cross", "Open"}, Hint{"Triangle", "More"}, Hint{"Options", "Settings"}};
 }
 

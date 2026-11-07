@@ -8,6 +8,8 @@
 #   platform/ps5/bench/run-bench.sh --title op_audit          # title, 1200 s window
 #   platform/ps5/bench/run-bench.sh --title sharp_bench 1800
 #   platform/ps5/bench/run-bench.sh --title --dry-run op_audit
+#   platform/ps5/bench/run-bench.sh --title http              # sceHttp download speed, 240 s window
+#   platform/ps5/bench/run-bench.sh --title --env FILE http   # with HTTP_* settings (http_probe.cpp)
 #
 # Title route, in order: write the selector BENCH=<name> (plus any settings from
 # --env FILE) to <dataDir>/bench/bench.env, install the package if
@@ -41,9 +43,9 @@ usage() {
     cat <<'EOF'
 usage: run-bench.sh [--title|--payload] [--dry-run] [--env FILE] BENCH [SECONDS]
 
-  BENCH        op_audit, da2_bench or sharp_bench
+  BENCH        op_audit, da2_bench, sharp_bench or http (title route only)
   SECONDS      capture window (title default: op_audit 1200, da2_bench 300,
-               sharp_bench 900; payload default: run.sh's 12)
+               sharp_bench 900, http 240; payload default: run.sh's 12)
   --title      run as the homebrew title (the dev identity, the one app),
                selected through <dataDir>/bench/bench.env
   --payload    run the bench ELF through run.sh (the original route)
@@ -92,7 +94,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$name" in
-    op_audit|da2_bench|sharp_bench) ;;
+    op_audit|da2_bench|sharp_bench|http) ;;
     '') usage >&2; exit 2 ;;
     *) echo "run-bench: unknown bench '$name'" >&2; exit 2 ;;
 esac
@@ -104,6 +106,10 @@ fi
 
 note() { printf 'run-bench: %s\n' "$*" >&2; }
 
+if [ "$mode" = "payload" ] && [ "$name" = "http" ]; then
+    echo "run-bench: http is a title mode (sceHttp from a title is what it measures); use --title" >&2
+    exit 2
+fi
 if [ "$mode" = "payload" ] && [ -n "$env_file" ]; then
     echo "run-bench: --env is for the title route (--title); the payload route reads the console's bench.env" >&2
     exit 2
@@ -150,6 +156,7 @@ if [ -z "$seconds" ]; then
         op_audit) seconds=1200 ;;
         da2_bench) seconds=300 ;;
         sharp_bench) seconds=900 ;;
+        http) seconds=240 ;;
     esac
 fi
 

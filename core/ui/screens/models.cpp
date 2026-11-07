@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <utility>
 
+#include "ui/download_eta.h"
 #include "ui/model_service.h"
 #include "ui/screen_stack.h"
 #include "ui/text_fit.h"
@@ -36,7 +37,12 @@ std::string state_text(const ModelView& view) {
     if (view.state == "ready") return "Ready";
     if (view.state == "license_required") return "Licence needed";
     if (view.state == "accepted") return view.fraction > 0.0f ? "Paused" : "Not downloaded";
-    if (view.state == "downloading") return "Downloading " + percent_text(view.fraction);
+    if (view.state == "downloading") {
+        // The estimate comes from the bytes received so far; the percent is the
+        // whole pipeline (download, verify, convert).
+        const std::string left = eta_text(view.eta_seconds);
+        return "Downloading " + percent_text(view.fraction) + (left.empty() ? "" : ", " + left);
+    }
     if (view.state == "verifying") return "Verifying " + percent_text(view.fraction);
     if (view.state == "converting") return "Preparing " + percent_text(view.fraction);
     if (view.state == "failed") return "Failed";
@@ -101,7 +107,7 @@ void ModelsScreen::sync_rows(UiContext& ctx) {
         rows.push_back(std::move(row));
 
         key += view.id + "|" + view.state + "|" + percent_text(view.fraction) + "|" +
-               view.message + ";";
+               eta_text(view.eta_seconds) + "|" + view.message + ";";
     }
     // The last row is the default model, changed in place with Cross: the
     // remembered one, else the first ready one - exactly what the model choice

@@ -12,7 +12,8 @@
 // copy of that scene, its message tells the user where it is, and the next run
 // of the job deletes it itself ("a job whose upload fails keeps its local
 // result"). A Queued or Running job's folder stays because the runner is about
-// to use it.
+// to use it, and a Waiting job's folder is the finished scene its retry will
+// upload.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once

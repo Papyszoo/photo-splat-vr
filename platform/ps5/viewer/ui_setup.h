@@ -142,6 +142,13 @@ struct UiRuntime {
     // UI_FAKE=1 has no ModelSetup to own the settings state, so it lives here.
     // services.state points into whichever of the two is live.
     std::unique_ptr<splat::UiState> fake_ui_state;
+    // L3: the network locations the user configured (<state>/locations.json).
+    // The service owns the store, mounts on its worker at construction and is
+    // what the Locations screen edits. Null with UI_FAKE=1 or when the file
+    // could not be read (the reason is logged). Declared before `jobs`, so the
+    // conversion worker (which names a location in a Waiting row) is joined
+    // before the service goes.
+    std::unique_ptr<splat::LocationService> location_service;
     // W19: the real conversion chain (non-null with UI_FAKE off, unless the
     // queue file or the GGUF is missing); services.jobs points into it and it
     // owns the worker thread, so it must outlive the panel.
@@ -150,11 +157,6 @@ struct UiRuntime {
     // launcher pushes /app0/helper/splat-helper.elf to the payload loader;
     // services.captures points into it.
     std::unique_ptr<splat::CaptureService> captures;
-    // L3: the network locations the user configured (<state>/locations.json).
-    // The service owns the store, mounts on its worker at construction and is
-    // what the Locations screen edits. Null with UI_FAKE=1 or when the file
-    // could not be read (the reason is logged).
-    std::unique_ptr<splat::LocationService> location_service;
     std::unique_ptr<splat::UiApp> app;
     std::unique_ptr<UiHost> host;
 

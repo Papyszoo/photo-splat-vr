@@ -839,6 +839,188 @@ TEST_CASE("the first placement waits for a held pose") {
     CHECK(settled.frame().midpoint.yaw == doctest::Approx(0.0f).epsilon(1e-6));
 }
 
+// 0.6.0: "when I first launched this app the scene was 90 degrees to the right".
+// The tracker boots in a stale frame (yaw about 90.5 deg, runs/vr7/*.csv row 1),
+// a steady stale pose passes the half-second placement gate, and the tracker
+// latches to the real frame 1.3-2 s later with a 94-97 deg jump in one sample.
+// This is that session end to end on the code the console runs: the placement
+// gate, the cached pose, the re-anchor watch, the same placement call the
+// Cross/Options holds use, and the window latched in front of the camera.
+TEST_CASE("a tracker re-anchor after the placement puts the scene and the window in front again") {
+    constexpr double kPi = 3.14159265358979323846;
+    struct Case {
+        double stale_deg;   // heading the stale frame reports for the user
+        double real_deg;    // the same physical heading once the tracker latched
+    };
+    // 90.5 -> 0 is the logged one; the others are the same swing from every
+    // starting heading, including the wrap past 180 and the opposite sign.
+    const Case cases[] = {{90.5, 0.0}, {0.0, -94.0}, {180.0, 85.0}, {-90.0, 0.0}, {10.0, 107.0}};
+    for (const Case& c : cases) {
+        CAPTURE(c.stale_deg);
+        const double stale = c.stale_deg * kPi / 180.0;
+        const double real = c.real_deg * kPi / 180.0;
+        const float eye_x = 0.12f;
+        const float eye_y = 1.38f;
+        auto stale_pose = [&](int frame) {
+            // A head holding still on a stale frame: sub-millimetre, sub-degree noise.
+            return make_head_pose(eye_x + 0.0002f * std::sin(0.7f * static_cast<float>(frame)),
+                                  eye_y, -0.05f, stale + 0.002 * std::sin(0.5 * frame), 0.01);
+        };
+        auto real_pose = [&](int frame) {
+            return make_head_pose(eye_x + 0.0302f, eye_y + 0.04f, -0.08f,
+                                  real + 0.002 * std::sin(0.5 * frame), 0.01);
+        };
+
+        // The first placement: worn, tracked, held for kPlaceStableSeconds.
+        splat::PlacementWait wait;
+        splat::HmdView view;
+        view.set_comfort_radius(2.0f);
+        double t = 100.0;
+        int frame = 0;
+        bool placed = false;
+        for (; frame < 120 && !placed; ++frame, t += 1.0 / 60.0) {
+            const splat::HeadPoses poses = head_with_eyes(stale_pose(frame), 0.064f);
+            placed = wait.update(true, true, poses.head, t).place;
+            if (placed) {
+                REQUIRE(view.update(poses));
+                view.recentre_here();
+                view.reset_scene_adjust();
+            }
+        }
+        REQUIRE(placed);
+        CHECK(view.frame().midpoint.yaw == doctest::Approx(0.0f).epsilon(1e-5));
+
+        // The window that was open at boot, latched in the stale frame.
+        splat::PanelAnchor window;
+        {
+            const splat::CameraPose camera = view.frame().midpoint;
+            window.latch(camera.position, camera.yaw, camera.pitch);
+        }
+
+        // Two quiet seconds of the stale frame, then the latch: one sample.
+        splat::ReanchorWatch watch;
+        int fired = 0;
+        for (int i = 0; i < 120; ++i, ++frame, t += 1.0 / 60.0) {
+            const splat::HeadPoses poses = head_with_eyes(stale_pose(frame), 0.064f);
+            fired += watch.update(true, poses.head, t) ? 1 : 0;
+            view.update(poses);
+        }
+        CHECK(fired == 0);
+        const splat::HeadPoses latched = head_with_eyes(real_pose(frame), 0.064f);
+        t += 1.0 / 60.0;
+        const bool reanchored = watch.update(true, latched.head, t);
+        view.update(latched);
+
+        // The bug as the user saw it: the photo is far off to the side, and so is
+        // the window that was open in the old frame.
+        const double off_deg = std::abs(view.frame().midpoint.yaw) * 180.0 / kPi;
+        MESSAGE("without the watch the photo is " << off_deg << " deg off");
+        CHECK(off_deg > 60.0);
+        {
+            const splat::CameraPose camera = view.frame().midpoint;
+            float forward[3] = {std::sin(camera.yaw) * std::cos(camera.pitch),
+                                std::sin(camera.pitch),
+                                std::cos(camera.yaw) * std::cos(camera.pitch)};
+            const splat::OverlayQuad& quad = window.quad();
+            float to_window[3] = {quad.center[0] - camera.position[0],
+                                  quad.center[1] - camera.position[1],
+                                  quad.center[2] - camera.position[2]};
+            const float length = std::sqrt(to_window[0] * to_window[0] + to_window[1] * to_window[1] +
+                                           to_window[2] * to_window[2]);
+            const float cosine = (forward[0] * to_window[0] + forward[1] * to_window[1] +
+                                  forward[2] * to_window[2]) /
+                                 length;
+            CHECK(cosine < 0.5f);   // more than 60 deg away from where the user looks
+        }
+
+        // The watch fires on exactly that sample; the host then runs the
+        // placement call (place_scene_at_head) and re-latches the window.
+        REQUIRE(reanchored);
+        view.recentre_here();
+        view.reset_scene_adjust();
+        const splat::CameraPose camera = view.frame().midpoint;
+        CHECK(camera.yaw == doctest::Approx(0.0f).epsilon(1e-5));
+        CHECK(camera.pitch == doctest::Approx(0.0f).epsilon(1e-5));
+        CHECK(camera.position[0] == doctest::Approx(0.0f).epsilon(1e-5));
+        window.recenter(camera.position, camera.yaw, camera.pitch);
+        const splat::OverlayQuad& quad = window.quad();
+        CHECK(quad.center[0] == doctest::Approx(0.0f).epsilon(1e-5));
+        CHECK(quad.center[1] == doctest::Approx(0.0f).epsilon(1e-5));
+        CHECK(quad.center[2] == doctest::Approx(splat::kPanelDistanceMetres).epsilon(1e-5));
+
+        // It fired once: the frames after the latch are quiet again.
+        for (int i = 0; i < 60; ++i, ++frame, t += 1.0 / 60.0) {
+            const splat::HeadPoses poses = head_with_eyes(real_pose(frame), 0.064f);
+            CHECK_FALSE(watch.update(true, poses.head, t));
+        }
+    }
+}
+
+// The watch must not take a head for the tracker: the fastest real turn in the
+// vr8 log is 7.5 deg in a sample (444 deg/s), and it must not fire across a gap
+// the tracker was blind for or across a long frame.
+TEST_CASE("the re-anchor watch ignores head turns, stalls, gaps and steps") {
+    const double dt = 1.0 / 60.0;
+    auto at = [](double yaw_deg, float x = 0.0f) {
+        return make_head_pose(x, 1.6f, 0.0f, yaw_deg * 3.14159265358979323846 / 180.0, 0.0);
+    };
+
+    // The thresholds are the documented ones.
+    CHECK(splat::kReanchorMinDegrees == doctest::Approx(25.0f));
+    CHECK(splat::kReanchorMinDegreesPerSecond == doctest::Approx(1200.0f));
+
+    // A sweeping turn at 7.5 deg per 16.7 ms sample, 60 samples: 450 deg.
+    {
+        splat::ReanchorWatch watch;
+        double t = 0.0;
+        for (int i = 0; i < 60; ++i, t += dt) {
+            CHECK_FALSE(watch.update(true, at(7.5 * i), t));
+        }
+    }
+    // The logged jumps, one 16.7 ms sample: 94 and 97 deg, and the small
+    // pre-latch ones (13-15 deg) stay under the limit on purpose.
+    for (const double degrees : {94.0, 97.4, -94.0, 26.0}) {
+        splat::ReanchorWatch watch;
+        CHECK_FALSE(watch.update(true, at(0.0), 0.0));
+        CHECK(watch.update(true, at(degrees), dt));
+    }
+    for (const double degrees : {15.4, 13.3, 24.0}) {
+        splat::ReanchorWatch watch;
+        CHECK_FALSE(watch.update(true, at(0.0), 0.0));
+        CHECK_FALSE(watch.update(true, at(degrees), dt));
+    }
+    // The same 94 deg over a 150 ms stall (a scene load) is a turn, not a
+    // re-anchor: 627 deg/s is under the rate limit.
+    {
+        splat::ReanchorWatch watch;
+        CHECK_FALSE(watch.update(true, at(0.0), 0.0));
+        CHECK_FALSE(watch.update(true, at(94.0), 0.15));
+    }
+    // A lost pose clears the previous sample: a different pose when it comes
+    // back is not a jump, and the next jump is measured from the new sample.
+    {
+        splat::ReanchorWatch watch;
+        CHECK_FALSE(watch.update(true, at(0.0), 0.0));
+        CHECK_FALSE(watch.update(false, at(0.0), dt));
+        CHECK_FALSE(watch.update(true, at(120.0), 2 * dt));
+        CHECK(watch.update(true, at(-10.0), 3 * dt));
+    }
+    // A position-only step (the 330 mm sample in the vr8 log) and a zero
+    // quaternion are not re-anchors; time that does not advance is not either.
+    {
+        splat::ReanchorWatch watch;
+        CHECK_FALSE(watch.update(true, at(0.0, 0.0f), 0.0));
+        CHECK_FALSE(watch.update(true, at(0.0, 0.33f), dt));
+        splat::TrackedPose garbage = at(0.0);
+        for (float& component : garbage.quaternion) component = 0.0f;
+        CHECK_FALSE(watch.update(true, garbage, 2 * dt));
+        CHECK_FALSE(watch.update(true, at(90.0), 2 * dt));   // same timestamp
+    }
+    // The angle helper both rules share: 90 deg about the vertical is 90 deg.
+    CHECK(splat::pose_angle_degrees(at(0.0), at(90.0)) == doctest::Approx(90.0).epsilon(1e-4));
+    CHECK(splat::pose_angle_degrees(at(170.0), at(-170.0)) == doctest::Approx(20.0).epsilon(1e-3));
+}
+
 // A scene switch must not move the user: the new scene's capture camera goes to
 // the same world anchor with the same scale and offset (2026-10-26 feedback:
 // "in VR we should be free to explore a scene, not have it adjust to our

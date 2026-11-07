@@ -13,6 +13,7 @@
 
 #ifdef SPLAT_MODEL_NET_TESTS
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 
 #include "model/checkpoint.h"
 #include "model/model_manager.h"
+#include "model/segmented_download.h"
 #include "platform/desktop/curl_http_fetcher.h"
 #include "test_util.h"
 
@@ -177,6 +179,59 @@ TEST_CASE("model manager: the desktop curl fetcher restarts when Range is ignore
     const splat::Status status = fetcher.download(request);
     REQUIRE_MESSAGE(status.ok(), status.message());
     CHECK(read_file(destination) == payload);  // truncated, not doubled
+}
+
+TEST_CASE("model manager: the desktop curl fetcher writes one segment in place") {
+    const std::string payload = make_payload(4096);
+    RangeServer server(payload, true);
+    splat::CurlHttpFetcher fetcher;
+    splat_test::TempDir temp("curl-segment");
+    const splat::Path destination = temp.path() / "file.bin.part";
+    write_file(destination, std::string(4096, 'X'));  // the other segments' bytes stay as they are
+
+    splat::FetchRequest request;
+    request.url = server.url();
+    request.destination = destination;
+    request.offset = 1000;
+    request.end = 2500;
+    std::atomic<uint64_t> written{0};
+    request.written = &written;
+
+    const splat::Status status = fetcher.download(request);
+    REQUIRE_MESSAGE(status.ok(), status.message());
+    CHECK(written.load() == 1500);
+    const std::string expected = std::string(1000, 'X') + payload.substr(1000, 1500) + std::string(1596, 'X');
+    CHECK(read_file(destination) == expected);  // not truncated, not appended
+
+    // A server that ignores the range must not be allowed to restart the file.
+    RangeServer ignoring(payload, false);
+    request.url = ignoring.url();
+    written.store(0);
+    const splat::Status ignored = fetcher.download(request);
+    CHECK_FALSE(ignored.ok());
+    CHECK(read_file(destination) == expected);
+}
+
+TEST_CASE("model manager: four curl segments assemble the exact bytes") {
+    const std::string payload = make_payload(300000);
+    RangeServer server(payload, true);
+    splat::CurlHttpFetcher fetcher;
+    splat_test::TempDir temp("curl-segments");
+
+    splat::SegmentedDownload job;
+    job.fetcher = &fetcher;
+    job.url = server.url();
+    job.part = temp.path() / "downloads" / "file.bin.part";
+    job.total = payload.size();
+    job.segments = splat::plan_segments(0, job.total, 4);
+    splat::Progress progress;
+    job.progress = &progress;
+
+    const splat::Status status = splat::download_segmented(job);
+    REQUIRE_MESSAGE(status.ok(), status.message());
+    CHECK(read_file(job.part) == payload);
+    CHECK_FALSE(std::filesystem::exists(splat::segments_path(job.part)));
+    CHECK(progress.fraction() == doctest::Approx(1.0f));
 }
 
 TEST_CASE("model manager: the desktop curl fetcher bounds a text GET") {

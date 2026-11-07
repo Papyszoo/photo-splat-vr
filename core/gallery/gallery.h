@@ -71,6 +71,13 @@ std::vector<AlbumEntry> list_albums_all(const Path& root);
 // thumbnail (core/gallery/visibility.h).
 std::vector<AlbumEntry> list_albums(const Path& root);
 
+// list_albums(), but a root the file system refuses to read (an offline or wrong
+// network share, a path that is not a folder) is an error naming it instead of
+// an empty list. The Albums screen uses this for a network library, so the user
+// reads the share's failure rather than "No scenes yet"; local callers keep
+// list_albums().
+Result<std::vector<AlbumEntry>> list_albums_checked(const Path& root);
+
 // Scenes of one album, sorted by folder name. `album` is the album folder name
 // under `root`; "" is the loose-scene album, and kAllScenesAlbumName resolves
 // to the root as well (unless a hand-made folder of that name exists). A

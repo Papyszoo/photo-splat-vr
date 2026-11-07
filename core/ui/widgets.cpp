@@ -324,14 +324,24 @@ ConversionStatus conversion_status(const IJobService* jobs) {
         if (job.kind == "rotate") continue;
         if (job.state == "running") status.fraction = job.fraction;
         if (job.state == "queued") ++status.queued;
-        if (job.state == "running" || job.state == "queued") ++status.active;
+        if (job.state == "waiting") ++status.waiting;
+        if (job.state == "running" || job.state == "queued" || job.state == "waiting") {
+            ++status.active;
+        }
     }
     return status;
 }
 
 std::string conversion_label(const ConversionStatus& status) {
-    if (status.queued <= 0) return "Converting";
-    return "Converting \xC2\xB7 " + std::to_string(status.queued) + " queued";
+    // Nothing converting or queued, only scenes waiting for their share.
+    if (status.waiting > 0 && status.active <= status.waiting) {
+        return status.waiting == 1 ? std::string("Waiting")
+                                   : "Waiting \xC2\xB7 " + std::to_string(status.waiting);
+    }
+    std::string label = "Converting";
+    if (status.queued > 0) label += " \xC2\xB7 " + std::to_string(status.queued) + " queued";
+    if (status.waiting > 0) label += " \xC2\xB7 " + std::to_string(status.waiting) + " waiting";
+    return label;
 }
 
 namespace {

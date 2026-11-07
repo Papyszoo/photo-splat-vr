@@ -93,6 +93,14 @@ public:
     // init().
     std::vector<splat::OverlayQuad> quads() const { return quads_; }
 
+    // The same canvas and backdrop textures drawn flat and fixed on the TV
+    // (0.6.0, "one menu, two views"): the quads for
+    // SplatRenderer::set_tv_overlay_quads, filling the 1920x1080 TV image with the
+    // TV camera of render/tv_view.h. They do not depend on the head or on the
+    // mode, only on whether the panel is visible: empty when hidden or before
+    // init(). The VR window (quads()) and this are one menu, two views.
+    std::vector<splat::OverlayQuad> tv_quads() const;
+
     const std::string& last_error() const { return last_error_; }
     // Number of canvas texture uploads since init(); a test or a log line can
     // show that an idle panel really costs none.

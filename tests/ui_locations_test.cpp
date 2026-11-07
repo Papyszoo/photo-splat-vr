@@ -85,7 +85,8 @@ struct Fixture {
             screen = created.get();
             return std::unique_ptr<splat::Screen>(std::move(created));
         });
-        registry.add(splat::ScreenId::Scenes, [this] {
+        // A share opens as the albums home of its library (ScreenId::Albums).
+        registry.add(splat::ScreenId::Albums, [this] {
             auto screen = std::make_unique<CapturingScreen>();
             scenes = screen.get();
             return screen;

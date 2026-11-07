@@ -267,7 +267,8 @@ void log_changes(const std::shared_ptr<JobLog>& state) {
 }  // namespace
 
 std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& scenes_dir,
-                                          const Path& legacy_models_dir, ModelSetup& models) {
+                                          const Path& legacy_models_dir, ModelSetup& models,
+                                          const splat::ILocationService* locations) {
     std::error_code error;
     std::filesystem::create_directories(state_dir, error);
     const Path queue_file = state_dir / "jobs.json";
@@ -340,6 +341,15 @@ std::unique_ptr<JobSetup> build_job_setup(const Path& state_dir, const Path& sce
     // staging folder is under the title's own data directory, so a failed
     // upload leaves a copy the operator can inspect (the message names it).
     config.staging_root = splat::Path(data_path("tmp"));
+    // "Waiting for <name>": the row names the location the way Settings does.
+    if (locations != nullptr) {
+        config.location_name = [locations](const std::string& id) {
+            for (const splat::LocationView& view : locations->list()) {
+                if (view.id == id) return view.name.empty() ? view.id : view.name;
+            }
+            return std::string();  // not configured: the runner treats it as removed
+        };
+    }
     // Folders a finished or cancelled job left behind (an interrupted delete)
     // and folders that name no job at all go now; a failed job's copy stays
     // because it is the scene's only copy (core/jobs/staging.h).

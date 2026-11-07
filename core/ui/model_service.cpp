@@ -3,6 +3,7 @@
 #include "ui/model_service.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -129,8 +130,15 @@ ModelService::ModelService(ModelManager& manager, UiState& ui_state, ModelServic
       ui_state_(ui_state),
       state_dir_(options.state_dir.empty() ? manager.state_dir() : options.state_dir),
       legacy_models_dir_(std::move(options.legacy_models_dir)),
-      free_bytes_(std::move(options.free_bytes)) {
+      free_bytes_(std::move(options.free_bytes)),
+      clock_(std::move(options.clock)) {
     if (!free_bytes_) free_bytes_ = default_free_bytes;
+    if (!clock_) {
+        clock_ = [] {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        };
+    }
 }
 
 ModelService::~ModelService() {
@@ -217,6 +225,9 @@ void ModelService::overlay_download_locked(std::vector<ModelView>& views) const 
             view.state = "converting";  // the manager reports 0.70 "verifying" first
         } else {
             view.state = "downloading";
+            // Verify and convert keep their stage text: only the transfer has bytes.
+            view.eta_seconds = download_rate_.seconds_left(
+                download_total_ > download_bytes_ ? download_total_ - download_bytes_ : 0);
         }
     }
 }
@@ -285,6 +296,10 @@ Status ModelService::start_download(const std::string& id) {
         download_backend_ = id;
         download_fraction_ = 0.0f;
         download_stage_ = "starting";
+        download_bytes_ = 0;
+        const ModelBackendSpec* spec = manager_.backend(id);
+        download_total_ = spec != nullptr ? spec->source_bytes : 0;
+        download_rate_.reset();
         download_running_ = true;
         cache_valid_ = false;
     }
@@ -293,6 +308,14 @@ Status ModelService::start_download(const std::string& id) {
             std::lock_guard<std::mutex> lock(mutex_);
             download_fraction_ = std::max(download_fraction_, fraction);
             if (!stage.empty()) download_stage_ = stage;
+            if (stage == "downloading" && download_total_ > 0) {
+                // The bar is the whole pipeline (download 0.05 .. 0.70); the time
+                // estimate wants the transfer's bytes.
+                const double part = (fraction - kFetchDownloadStart) / kFetchDownloadSpan;
+                download_bytes_ = static_cast<uint64_t>(
+                    std::clamp(part, 0.0, 1.0) * static_cast<double>(download_total_));
+                download_rate_.add(clock_(), download_bytes_);
+            }
         });
         const Status status = manager_.fetch(id, progress, [this] {
             return cancel_requested_.load(std::memory_order_relaxed);
@@ -388,6 +411,7 @@ Status ModelService::remove(const std::string& id) {
     std::vector<Path> files;
     files.push_back(manager_.downloads_dir() / spec->source_filename);
     files.push_back(manager_.downloads_dir() / (spec->source_filename + ".part"));
+    files.push_back(segments_path(files.back()));
     files.push_back(manager_.gguf_path(id));
     files.push_back(manager_.state_dir() / "models" / (id + ".json"));
     if (!legacy_models_dir_.empty()) files.push_back(legacy_models_dir_ / (id + ".gguf"));

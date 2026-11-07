@@ -15,7 +15,7 @@ bool job_may_need(const std::vector<Job>& jobs, const std::string& name) {
     for (const Job& job : jobs) {
         if (job.id != name) continue;
         return job.state == JobState::Failed || job.state == JobState::Queued ||
-               job.state == JobState::Running;
+               job.state == JobState::Running || job.state == JobState::Waiting;
     }
     return false;  // no job owns this folder
 }

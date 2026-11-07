@@ -142,7 +142,7 @@ void FakeJobService::start_next() {    if (busy()) return;
 Status FakeJobService::cancel(const std::string& id) {
     for (JobView& job : jobs_) {
         if (job.id != id) continue;
-        if (job.state != "queued" && job.state != "running") {
+        if (job.state != "queued" && job.state != "running" && job.state != "waiting") {
             return Status::error("job " + id + " is " + job.state);
         }
         const bool was_running = job.state == "running";
@@ -291,6 +291,7 @@ void FakeModelService::tick(double dt) {
             model.message.clear();
         } else {
             model.message = "downloading";
+            model.eta_seconds = (1.0 - model.fraction) * kDownloadSeconds;
         }
     }
 }

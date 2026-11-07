@@ -216,6 +216,16 @@ std::vector<AlbumEntry> list_albums(const Path& root) {
     return visible;
 }
 
+Result<std::vector<AlbumEntry>> list_albums_checked(const Path& root) {
+    vfs::FileStat status;
+    const Status looked = vfs::stat(root, &status);
+    if (!looked.ok()) return Result<std::vector<AlbumEntry>>::failure(looked.message());
+    if (!status.directory) {
+        return Result<std::vector<AlbumEntry>>::failure("not a folder: " + root.string());
+    }
+    return Result<std::vector<AlbumEntry>>::success(list_albums(root));
+}
+
 std::vector<SceneEntry> list_scenes(const Path& root, const std::string& album) {
     const Path directory = album_dir(root, album);
     std::vector<vfs::DirEntry> entries;

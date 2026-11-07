@@ -913,9 +913,9 @@ seed_nfs_export() {
     return 0
 }
 
-# A2 extra: one .splat file in the location's folder, newest mtime first in the
-# Photos tab (list_photos sorts by mtime), named after the fixture so the job
-# line is recognisable.
+# A2 extra: one .splat file in the location's folder (the picker lists a folder
+# by name, splat files last), named after the fixture so the job line is
+# recognisable.
 seed_share_splat() {
     local source="$library/console/splats/tiny.splat"
     [ -f "$source" ] || { note "no $source to import from the share"; return 1; }

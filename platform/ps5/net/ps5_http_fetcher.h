@@ -6,7 +6,10 @@
 // downloads with on this hardware. The behaviour matches the desktop fetcher:
 // HEAD follows redirects, a download asks for `Range: bytes=<offset>-` and
 // appends, and a server that ignores the range (200 instead of 206) restarts
-// the file from zero.
+// the file from zero. A request with FetchRequest::end set is one segment of the
+// parallel model download (core/model/segmented_download.h): a bounded range
+// written in place, several at once from different threads. Only the request
+// setup (create, send, status and headers) is serialised, never a body read.
 //
 // Compiled only for the title (PS5_TITLE): the bench title links it for
 // BENCH=http, and the console test measures whether a title may call sceHttp
@@ -15,6 +18,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -52,9 +56,10 @@ public:
 private:
     Status download_impl(const std::string& url, const Path& destination, uint64_t offset,
                          uint64_t max_bytes, uint64_t total_bytes, Progress* progress,
-                         const std::function<bool()>& cancelled);
+                         const std::function<bool()>& cancelled, bool in_place,
+                         std::atomic<uint64_t>* written_out);
 
-    long last_status_ = 0;
+    std::atomic<long> last_status_{0};
 };
 
 }  // namespace splat

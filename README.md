@@ -10,39 +10,58 @@ The SHARP backend is an independent reimplementation of the
 written from the paper and the reference code's observable behaviour. No Apple
 code and no model weights are part of this repository.
 
-v0.5 adds the library features on top of that core: photos in the common
-camera and web formats, splat import, rotate left or right on any photo or
-scene entry, and network libraries over SMB and NFS. v0.1 does what the project
-set out to do: photos are converted on the console and the resulting scenes
-display in VR and on the TV. DA2-Small ships as an alternative, with approximate
-scene size.
+v0.6 builds on the library features of v0.5 (photos in the common camera and
+web formats, splat import, rotate left or right on any photo or scene entry, and
+network libraries over SMB and NFS): the photo picker browses folders on every
+source, scenes can be saved straight to a network folder, the TV shows its own
+picture and menu, and the SHARP model downloads about three times faster.
+v0.1 does what the project set out to do: photos are converted on the console
+and the resulting scenes display in VR and on the TV. DA2-Small ships as an
+alternative, with approximate scene size.
 
 - Repository: <https://github.com/Papyszoo/photo-splat-vr>
 - Specification: [`docs/spec.md`](docs/spec.md)
 - Decisions: [`docs/PLAN.md`](docs/PLAN.md)
 - Known issues: [`docs/BACKLOG.md`](docs/BACKLOG.md)
 
-## What is new in 0.5
+## What is new in 0.6
 
-- **More photo formats.** WebP, TIFF, HEIC/HEIF, AVIF, BMP, GIF (first frame),
-  TGA and camera RAW (DNG, CR2, CR3, NEF, ARW, RAF, ORF, RW2, PEF, SRW) convert
-  like JPEG and PNG. EXIF orientation is applied to the pixels, the thumbnail
-  and the intrinsics, so a sideways phone photo becomes an upright scene.
-- **Rotate a file entry.** Focus a photo or a scene and press **L3** (left) or
-  **R3** (right) to turn it 90 degrees. The rotated version overrides the
-  previous one: a JPEG or baseline TIFF has its Orientation tag rewritten, a
-  scene has its own files rewritten, and a format the app cannot write keeps its
-  source and stores the turn for the conversion. The viewer has no rotation to
-  change or save.
-- **Import splats.** `.ply`, `.splat`, `.spz` and SuperSplat `.compressed.ply`
-  files become normal scenes without a photo or a model. A file above the
-  renderer's budget is thinned to 2,000,000 splats with a notice, never refused.
-- **Network libraries.** An SMB2/SMB3 share or an NFSv3/NFSv4 export can hold
-  photos, scenes, or both. A conversion saved to a share is built locally,
-  uploaded, and the local copy is deleted; a failed upload keeps it and names it.
-- **Visible folders.** One passcode hides the scene folders (albums and network
-  scene libraries) a visitor may not see; the photo picker stays open.
-- **Thumbnail size.** One Settings slider sizes every thumbnail grid.
+- **Folders in the photo picker.** Every source (Console, Inbox, USB, network
+  locations) is a folder browser like Finder or Windows Explorer: folders first,
+  then the photos and splat files of the folder you are in. **Cross** opens a
+  folder, **Circle** goes up. **Square** on a folder no longer imports every
+  splat file below it: you pick the files yourself, and **Cross** on a splat
+  file imports it, from any source.
+- **Output folder.** `Settings > Output folder` chooses where new scenes are
+  saved: the console (default) or a folder on a network location, picked by
+  browsing that location's folders (**Square** = "Use this folder"). Scenes go
+  to `<output folder>/<album>/<scene>`, so albums look the same as on the
+  console. Existing scenes stay where they are.
+- **Albums on network scene libraries.** A network scene library lists the
+  folders that hold scenes as albums, and the scenes directly in the folder as
+  Unsorted. An offline share shows its own error.
+- **Offline share, no lost scene.** A scene whose network folder does not
+  answer shows "Waiting for <location>", stays on the console, tries again by
+  itself and is saved when the share is back. **Square** on the row cancels it.
+  A scene is saved under a hidden temporary name and only gets its real name once
+  it is whole, so a share that drops never leaves a half-saved scene.
+- **Faster model download.** The SHARP checkpoint (2.8 GB) downloads over four
+  connections at once, about 3 times faster on the console, and the Models row
+  shows "about N min left". A paused or interrupted download continues where it
+  stopped, and the checkpoint is still verified after it arrives.
+- **The TV has its own picture.** In VR the TV shows the scene without the VR
+  window or HUD and, while the menu is open, the same menu flat on the whole
+  screen. Anyone holding a controller can drive it, and it works before the
+  headset is on. If the console refuses the TV output, the TV mirrors the
+  headset's view as before.
+- **Scene and menu start in front of you.** The headset's tracker starts about
+  90 degrees off and corrects itself a few seconds later; the app now notices
+  and puts the scene and the open menu in front of where you face.
+- **Hold Options to recentre.** Hold **Options** for 1 second to recentre the
+  scene and the open menu, like the PSVR2 standard. A tap on **Options** still
+  opens and closes the menu, now when you let go.
+- **Steadier menu window.** Moving or turning your head no longer skews the
+  contents of the VR menu window.
 
 ## Formats
 
@@ -77,7 +96,10 @@ both. Scenes on a share open where they lie, without a copy on the console.
   installed at once and each keeps its own data folder (see
   `platform/ps5/title/README.md`).
 - PS VR2 for VR viewing. A DualSense or the two PS VR2 Sense controllers for
-  input. TV mode works without the headset.
+  input. TV mode works without the headset. In VR the TV shows the scene (without
+  the VR window or HUD) and, while the menu is open, the same menu flat on the
+  screen; whoever holds a controller can drive it, and it works before the
+  headset is on.
 - Network access on the console for the model download, and FTP access to the
   console for copying the package and your photos.
 - About 4 GB free under `/data` for the SHARP checkpoint and its converted form;
@@ -135,6 +157,12 @@ Open **Settings → Models**. Nothing is installed on a fresh console.
 - **DA2-Small** is the fast model, with approximate scene size. It is
   Apache-2.0 and needs no acceptance; its checkpoint is about 100 MB.
 
+How long it takes: the SHARP download is about 2.8 GB, a few minutes on a
+wired connection (the console fetches it over four connections at once), plus
+about 4 minutes of preparing it afterwards. The row shows "about N min left"
+while the download runs; verifying and preparing show their stage and percent
+only.
+
 A download or conversion can be paused and resumed. **Delete** removes the
 downloaded files but keeps the licence acceptance. The **Default model** row
 picks the model offered first when you convert; SHARP is used when it is ready.
@@ -176,8 +204,9 @@ R1, Options, Cross/Circle, R3.
 
 | Action | DualSense | Sense controllers |
 | --- | --- | --- |
-| Menu / back to scene | **Options** | right: **Options** |
-| Recentre (hold 1 s) | **Cross** | right: **Cross** |
+| Menu / back to scene (tap, on release) | **Options** | right: **Options** |
+| Recentre the scene and the open menu window (hold 1 s) | **Options** | right: **Options** |
+| Recentre (hold 1 s; the window while the menu is open) | **Cross** | right: **Cross** |
 | Previous / next scene | **L1** / **R1** | left **L1** tap / right **R1** tap (a hold grabs) |
 | Walk (forward/back, strafe) | **left stick** | left controller's **stick** |
 | Rise/sink, turn right/left | **right stick** | right controller's **stick** |

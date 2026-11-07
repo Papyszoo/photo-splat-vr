@@ -644,6 +644,49 @@ TEST_CASE("ui_widgets conversion chip shows only while converting") {
     CHECK(width > 100);
 }
 
+TEST_CASE("ui_widgets conversion chip counts a scene waiting for its network folder") {
+    const splat::UiTheme theme = splat::default_theme();
+    splat::FakeJobService jobs;
+    splat::JobView waiting;
+    waiting.name = "one.jpg";
+    waiting.kind = "convert";
+    waiting.state = "waiting";
+    waiting.message = "Waiting for NAS";
+    jobs.inject_job(waiting);
+
+    // A waiting job alone is an unfinished job: the chip stays up and says so.
+    splat::ConversionStatus status = splat::conversion_status(&jobs);
+    CHECK(status.active == 1);
+    CHECK(status.waiting == 1);
+    CHECK(status.queued == 0);
+    CHECK(splat::conversion_label(status) == "Waiting");
+    CHECK(splat::conversion_chip_width(status, theme) > 100);
+
+    waiting.name = "two.jpg";
+    jobs.inject_job(waiting);
+    status = splat::conversion_status(&jobs);
+    CHECK(status.active == 2);
+    CHECK(splat::conversion_label(status) == "Waiting \xC2\xB7 2");
+
+    // Next to a conversion in progress it is counted beside the queued ones.
+    REQUIRE(jobs.enqueue({splat::Path("a.jpg"), splat::Path("b.jpg")}, "sharp", "").ok());
+    jobs.tick(1.0);
+    status = splat::conversion_status(&jobs);
+    CHECK(status.active == 4);
+    CHECK(status.queued == 1);
+    CHECK(status.waiting == 2);
+    CHECK(splat::conversion_label(status) ==
+          "Converting \xC2\xB7 1 queued \xC2\xB7 2 waiting");
+
+    // Cancelling the waiting jobs takes them out of the count again.
+    for (const splat::JobView& view : jobs.snapshot()) {
+        if (view.state == "waiting") REQUIRE(jobs.cancel(view.id).ok());
+    }
+    status = splat::conversion_status(&jobs);
+    CHECK(status.waiting == 0);
+    CHECK(status.active == 2);
+}
+
 TEST_CASE("ui_widgets confirm card starts on Cancel") {
     const splat::UiTheme theme = splat::default_theme();
     const splat::Rect content{64, 112, 1152, 532};

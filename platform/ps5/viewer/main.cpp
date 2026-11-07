@@ -940,6 +940,10 @@ int main(int, char**) {
     if (parse_float(env_value(env_text, "SWAY_PERIOD"), real)) options.sway_period = real;
     if (parse_u32(env_value(env_text, "PRELOAD"), number)) options.preload = number != 0;
     if (parse_u32(env_value(env_text, "MIRROR"), number)) options.mirror = number != 0;
+    // 0.6.0: the title's own TV output in VR (tv_output.h), on unless TV_OUTPUT=0.
+    // A local, not viewer::Options: only the VR path reads it.
+    bool tv_output = true;
+    if (parse_u32(env_value(env_text, "TV_OUTPUT"), number)) tv_output = number != 0;
     if (parse_u32(env_value(env_text, "UI"), number)) {
         options.ui = number != 0;
         options.ui_given = true;
@@ -973,11 +977,11 @@ int main(int, char**) {
     }
     if (options.mode == "vr") {
         line("viewer: config %s: mode=vr scene=%s seconds=%d comfort_radius=%.3f m world_scale=%.2f "
-             "preload=%d mirror=%d",
+             "preload=%d mirror=%d tv_output=%d",
              options.env_ok ? kEnvPath.c_str() : "(defaults)",
              options.scene.empty() ? "(first)" : options.scene.c_str(), options.seconds,
              options.comfort_radius, options.world_scale, options.preload ? 1 : 0,
-             options.mirror ? 1 : 0);
+             options.mirror ? 1 : 0, tv_output ? 1 : 0);
     } else {
         line("viewer: config %s: mode=tv scene=%s seconds=%d out=%ux%u flip_rate=%d "
              "comfort_radius=%.3f m sway_period=%.1f s",
@@ -1043,6 +1047,7 @@ int main(int, char**) {
         vr.world_scale = options.world_scale;
         vr.preload = options.preload;
         vr.mirror = options.mirror;
+        vr.tv_output = tv_output;
         // SECONDS is the session's only cap: 0 (the default, and an explicit
         // SECONDS=0) means no auto-exit at all; the panel's Quit and the quit
         // file still end the session. A dev run caps itself with SECONDS=1800.

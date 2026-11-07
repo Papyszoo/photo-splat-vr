@@ -36,6 +36,7 @@
 #include "jobs/job_queue.h"
 #include "jobs/job_runner.h"
 #include "ui/job_service.h"
+#include "ui/services.h"
 
 namespace viewer {
 
@@ -76,9 +77,15 @@ struct JobSetup {
 // file still gets the queue: its job fails on start with the paths that were
 // looked in (each job resolves its own backend's file), instead of hiding the
 // whole queue screen.
+//
+// `locations`, when given, names a network location in a Waiting row ("Waiting
+// for NAS"): a scene whose network folder did not answer when it was ready waits
+// in the queue and is uploaded when the share is back (core/jobs/job_runner.h).
+// It must outlive the setup.
 std::unique_ptr<JobSetup> build_job_setup(const splat::Path& state_dir,
                                           const splat::Path& scenes_dir,
                                           const splat::Path& legacy_models_dir,
-                                          ModelSetup& models);
+                                          ModelSetup& models,
+                                          const splat::ILocationService* locations = nullptr);
 
 }  // namespace viewer

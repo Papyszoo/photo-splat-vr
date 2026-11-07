@@ -59,6 +59,8 @@ TEST_CASE("ui_settings lists the rows in order") {
     CHECK(rows[splat::SettingsScreen::SystemHeader].header);
     CHECK(rows[splat::SettingsScreen::Models].label == "Models");
     CHECK(rows[splat::SettingsScreen::Conversions].label == "Conversions");
+    CHECK(rows[splat::SettingsScreen::OutputFolder].label == "Output folder");
+    CHECK(rows[splat::SettingsScreen::OutputFolder].right == "Console");
     CHECK(rows[splat::SettingsScreen::Locations].label == "Network locations");
     // Stage H: one row between Locations and Quit, "Off" without a passcode.
     CHECK(splat::SettingsScreen::VisibleFolders == splat::SettingsScreen::Quit - 1);
@@ -138,8 +140,12 @@ TEST_CASE("ui_settings rows open their screens and quit") {
     CHECK(fixture.stack.top_id() == splat::ScreenId::Queue);
     fixture.stack.pop();
 
-    // Network locations (L3) sits between Conversions and Visible folders;
-    // Quit is the row after that (stage H).
+    // Output folder (0.6.0) follows Conversions: where the new scenes go. Its
+    // own test below opens the chooser.
+    fixture.settings.update(fixture.context, press(splat::Down));
+    CHECK(fixture.settings.list().focus() == splat::SettingsScreen::OutputFolder);
+    // Network locations (L3) sits between it and Visible folders; Quit is the row
+    // after that (stage H).
     fixture.settings.update(fixture.context, press(splat::Down));
     CHECK(fixture.settings.list().focus() == splat::SettingsScreen::Locations);
     fixture.settings.update(fixture.context, press(splat::Down));

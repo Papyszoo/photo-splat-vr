@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace splat {
@@ -159,11 +160,7 @@ void hmd_scene_position(const float tracker_position[3], float out[3]) {
     out[2] = -tracker_position[2];
 }
 
-bool pose_jumped(const TrackedPose& a, const TrackedPose& b) {
-    const float dx = b.position[0] - a.position[0];
-    const float dy = b.position[1] - a.position[1];
-    const float dz = b.position[2] - a.position[2];
-    if (std::sqrt(dx * dx + dy * dy + dz * dz) > kPlaceJumpMetres) return true;
+double pose_angle_degrees(const TrackedPose& a, const TrackedPose& b) {
     double dot = 0.0;
     double norm_a = 0.0;
     double norm_b = 0.0;
@@ -173,11 +170,38 @@ bool pose_jumped(const TrackedPose& a, const TrackedPose& b) {
         norm_b += static_cast<double>(b.quaternion[i]) * static_cast<double>(b.quaternion[i]);
     }
     const double scale = std::sqrt(norm_a * norm_b);
-    if (!(scale > 0.0)) return true;   // a zero quaternion is not a pose
+    if (!(scale > 0.0)) return std::numeric_limits<double>::infinity();   // not a pose
     dot = std::min(1.0, std::max(-1.0, dot / scale));
     // The angle between two orientations: 2 acos|dot|, in degrees.
-    const double degrees = 2.0 * std::acos(std::fabs(dot)) * 180.0 / 3.14159265358979323846;
-    return degrees > static_cast<double>(kPlaceJumpDegrees);
+    return 2.0 * std::acos(std::fabs(dot)) * 180.0 / 3.14159265358979323846;
+}
+
+bool pose_jumped(const TrackedPose& a, const TrackedPose& b) {
+    const float dx = b.position[0] - a.position[0];
+    const float dy = b.position[1] - a.position[1];
+    const float dz = b.position[2] - a.position[2];
+    if (std::sqrt(dx * dx + dy * dy + dz * dz) > kPlaceJumpMetres) return true;
+    return pose_angle_degrees(a, b) > static_cast<double>(kPlaceJumpDegrees);
+}
+
+bool ReanchorWatch::update(bool tracked, const TrackedPose& pose, double now_seconds) {
+    if (!tracked) {
+        have_ = false;
+        return false;
+    }
+    bool reanchored = false;
+    if (have_) {
+        const double seconds = now_seconds - previous_seconds_;
+        const double degrees = pose_angle_degrees(previous_, pose);
+        // A zero quaternion is garbage, not a new frame (infinite angle).
+        reanchored = seconds > 0.0 && std::isfinite(degrees) &&
+                     degrees >= static_cast<double>(kReanchorMinDegrees) &&
+                     degrees / seconds >= static_cast<double>(kReanchorMinDegreesPerSecond);
+    }
+    have_ = true;
+    previous_ = pose;
+    previous_seconds_ = now_seconds;
+    return reanchored;
 }
 
 PlacementWait::Step PlacementWait::update(bool worn, bool tracked, const TrackedPose& pose,

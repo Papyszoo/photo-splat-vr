@@ -399,3 +399,89 @@ TEST_CASE("jobs: a scene turn is its own queued job kind and survives a restart"
     JobQueue same = reloaded.value();
     CHECK_FALSE(same.enqueue_rotate(folder, 1).ok());
 }
+
+TEST_CASE("jobs: a waiting job keeps its row across a restart and is not re-queued") {
+    splat_test::TempDir dir("jobs-waiting-queue");
+    JobQueue queue = JobQueue::open(queue_file(dir)).value();
+    const auto id = queue.enqueue(dir.path() / "photo.jpg", "sharp", "", 0, splat::Path("smb0:/scenes"));
+    REQUIRE_MESSAGE(id.ok(), id.message());
+
+    // Only a running job can start waiting; a queued one has nothing to upload.
+    CHECK_FALSE(queue.mark_waiting(id.value(), "Waiting for NAS", 4.5).ok());
+    REQUIRE(queue.take_next().value().has_value());
+    REQUIRE(queue.mark_waiting(id.value(), "Waiting for NAS", 4.5).ok());
+    CHECK(queue.find(id.value())->state == JobState::Waiting);
+    // take_next never hands a waiting job out: the runner retries it by id.
+    CHECK_FALSE(queue.take_next().value().has_value());
+
+    const auto reloaded = JobQueue::open(queue_file(dir));
+    REQUIRE_MESSAGE(reloaded.ok(), reloaded.message());
+    const splat::Job* job = reloaded.value().find(id.value());
+    REQUIRE(job != nullptr);
+    CHECK(job->state == JobState::Waiting);
+    CHECK(job->message == "Waiting for NAS");
+    CHECK(job->seconds_taken == doctest::Approx(4.5));
+    CHECK(job->output_root == splat::Path("smb0:/scenes"));
+
+    // The upload that finally works completes the row without a Running step; a
+    // refused one fails it. Either way a crash mid-attempt only leaves it waiting.
+    JobQueue done = reloaded.value();
+    REQUIRE(done.mark_done(id.value(), splat::Path("smb0:/scenes/photo"), 4.5).ok());
+    CHECK(done.find(id.value())->state == JobState::Done);
+    CHECK(done.find(id.value())->scene_folder == splat::Path("smb0:/scenes/photo"));
+    CHECK(done.find(id.value())->message.empty());
+    JobQueue failed = reloaded.value();
+    REQUIRE(failed.mark_failed(id.value(), "upload failed: refused").ok());
+    CHECK(failed.find(id.value())->state == JobState::Failed);
+    // A queued job still cannot jump to Done.
+    JobQueue fresh = reloaded.value();
+    const auto second = fresh.enqueue(dir.path() / "second.jpg", "sharp");
+    REQUIRE_MESSAGE(second.ok(), second.message());
+    CHECK_FALSE(fresh.mark_done(second.value(), splat::Path("x"), 1.0).ok());
+
+    // Cancelling a waiting job is allowed.
+    JobQueue cancelled = reloaded.value();
+    REQUIRE(cancelled.cancel(id.value()).ok());
+    CHECK(cancelled.find(id.value())->state == JobState::Cancelled);
+    // A waiting job still blocks a second copy of its photo.
+    JobQueue duplicate = reloaded.value();
+    CHECK_FALSE(duplicate.enqueue(dir.path() / "photo.jpg", "sharp").ok());
+}
+
+TEST_CASE("jobs: a waiting row with no network folder is refused on load") {
+    splat_test::TempDir dir("jobs-waiting-bad");
+    const splat::Path file = queue_file(dir);
+    const auto write_row = [&](const std::string& extra) {
+        write_text(file,
+                   "{\"version\":1,\"next_sequence\":2,\"jobs\":[{\"id\":\"job-000001\","
+                   "\"photo\":\"/data/a.jpg\",\"kind\":\"convert\",\"backend\":\"sharp\","
+                   "\"state\":\"waiting\",\"message\":\"Waiting for NAS\",\"sequence\":1" +
+                       extra + "}]}");
+    };
+
+    // A waiting job has a network destination; without one, or with a local
+    // folder, its retry would have nowhere to upload to.
+    write_row("");
+    const auto none = JobQueue::open(file);
+    CHECK_FALSE(none.ok());
+    CHECK(none.message().find("job-000001") != std::string::npos);
+    write_row(",\"output_root\":\"/data/scenes\"");
+    CHECK_FALSE(JobQueue::open(file).ok());
+    // A scene turn never waits.
+    write_text(file,
+               "{\"version\":1,\"next_sequence\":2,\"jobs\":[{\"id\":\"job-000001\","
+               "\"photo\":\"/data/scenes/a\",\"kind\":\"rotate\",\"rotate\":1,"
+               "\"state\":\"waiting\",\"output_root\":\"smb0:/scenes\",\"sequence\":1}]}");
+    CHECK_FALSE(JobQueue::open(file).ok());
+    // With a location destination the same row loads, and the boot path starts
+    // from an empty queue (keeping the file) when it does not.
+    write_row(",\"output_root\":\"smb0:/scenes\"");
+    const auto good = JobQueue::open(file);
+    REQUIRE_MESSAGE(good.ok(), good.message());
+    CHECK(good.value().jobs().front().state == JobState::Waiting);
+    write_row(",\"output_root\":\"/data/scenes\"");
+    std::string notice;
+    const JobQueue boot = JobQueue::open_or_empty(file, &notice);
+    CHECK(boot.jobs().empty());
+    CHECK_FALSE(notice.empty());
+}

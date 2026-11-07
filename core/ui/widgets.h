@@ -209,12 +209,16 @@ void draw_row_progress(UiCanvas& canvas, const Rect& plate, std::string_view rig
 // The one conversion status, in the top bar and in Settings: a chip with a
 // ring for the running photo's progress, "Converting" and how many photos are
 // still to go. Right-aligned at `right`, centred on `cy`; returns its width.
+// A finished scene waiting for its network folder (state "waiting") is an
+// unfinished job like the others: it keeps the chip up.
 struct ConversionStatus {
-    int active = 0;          // queued + running jobs
-    int queued = 0;          // waiting behind the running one
+    int active = 0;          // queued + running + waiting jobs
+    int queued = 0;          // queued behind the running one
+    int waiting = 0;         // done converting, waiting for the network folder
     float fraction = 0.0f;   // the running job's progress
 };
-// "Converting", or "Converting · 2 queued": the chip's words.
+// "Converting", "Converting · 2 queued", "Converting · 1 waiting" or, with
+// nothing but waiting jobs, "Waiting" / "Waiting · 2": the chip's words.
 std::string conversion_label(const ConversionStatus& status);
 ConversionStatus conversion_status(const IJobService* jobs);
 int draw_conversion_chip(UiCanvas& canvas, int right, int cy, const ConversionStatus& status,

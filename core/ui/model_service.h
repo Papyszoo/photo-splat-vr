@@ -25,6 +25,7 @@
 
 #include "common/path.h"
 #include "model/model_manager.h"
+#include "ui/download_eta.h"
 #include "ui/services.h"
 #include "ui/ui_state.h"
 
@@ -68,6 +69,9 @@ struct ModelServiceOptions {
     // Free bytes at state_dir. Injectable for tests; the default asks the
     // filesystem and never refuses when it cannot answer.
     std::function<uint64_t(const Path&)> free_bytes;
+    // Seconds on a monotonic clock, for the download's time estimate. Injectable
+    // for tests; the default is std::chrono::steady_clock.
+    std::function<double()> clock;
 };
 
 class ModelService : public IModelService {
@@ -115,6 +119,7 @@ private:
     Path state_dir_;
     Path legacy_models_dir_;
     std::function<uint64_t(const Path&)> free_bytes_;
+    std::function<double()> clock_;
 
     mutable std::mutex mutex_;
     mutable std::vector<ModelView> cache_;
@@ -127,6 +132,9 @@ private:
     std::string download_backend_;
     float download_fraction_ = 0.0f;
     std::string download_stage_;
+    uint64_t download_bytes_ = 0;  // received so far, from the byte stage of the progress
+    uint64_t download_total_ = 0;
+    DownloadRate download_rate_;
     std::thread worker_;
 };
 

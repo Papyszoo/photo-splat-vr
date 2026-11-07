@@ -26,17 +26,31 @@ void main() {
     v_uv = in_uv;
     v_tint = in_tint;
 
-    // Behind the eye: push it outside the clip volume so it is discarded
-    // without making the whole triangle degenerate.
-    if (p.z <= 1.0e-4) {
-        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-        return;
-    }
     // The eye is shifted along camera +x, as in splat.vert; the overlay is a
     // world-space object, so this is the same parallax the splats get.
     const vec3 eye_p = vec3(p.x - camera.eye.x, p.y, p.z);
-    const vec2 pixels = camera.intrinsics.xy * eye_p.xy / eye_p.z + camera.intrinsics.zw +
-                        vec2(camera.eye.y, 0.0);
-    const vec2 ndc = pixels * (2.0 / camera.screen.xy) - 1.0;
-    gl_Position = vec4(ndc, 0.5, 1.0);
+
+    // The pinhole projection written in homogeneous clip coordinates, w = the
+    // view depth. pixels = fx * x / z + cx' (cx' = cx + the eye's shift) and
+    // ndc = pixels * 2 / width - 1 are both divisions by z, so the clip
+    // position is the affine map below and the GPU's own divide by w gives
+    // exactly that pixel.
+    //
+    // w must be the depth, not 1: the rasteriser interpolates v_uv with the
+    // perspective-correct barycentrics 1/w gives it. With w = 1 the texture
+    // coordinates are interpolated linearly in screen space across the quad's
+    // two triangles, which is exact only for a quad facing the eye; a window
+    // that is world-fixed and seen at an angle (the head turned or moved away
+    // from where it opened) then shows its content skewed along the diagonal
+    // while its four corners are still right.
+    //
+    // A corner behind the eye needs no special case: the clip volume's
+    // 0 <= z <= w (z = depth - near, so w - z = near > 0) drops the part of the
+    // triangle nearer than `near` and keeps the rest, which a vertex pushed to
+    // a fixed point outside the volume would have mangled.
+    const float near_plane = 0.01;
+    const vec2 cxy = camera.intrinsics.zw + vec2(camera.eye.y, 0.0);
+    gl_Position = vec4(
+        (2.0 / camera.screen.xy) * (camera.intrinsics.xy * eye_p.xy + cxy * eye_p.z) - eye_p.z,
+        eye_p.z - near_plane, eye_p.z);
 }

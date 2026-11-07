@@ -203,7 +203,9 @@ ModelManager::ModelManager(ModelManagerOptions options)
     : state_dir_(std::move(options.state_dir)),
       fetcher_(options.fetcher),
       specs_(options.specs),
-      converter_(std::move(options.converter)) {
+      converter_(std::move(options.converter)),
+      segment_min_bytes_(options.segment_min_bytes),
+      segment_count_(options.segment_count) {
     if (specs_.empty()) {
         specs_.push_back(sharp_model_spec());
         specs_.push_back(da2_model_spec());
@@ -317,7 +319,7 @@ Result<ModelRecord> ModelManager::load_record(const ModelBackendSpec& spec) {
     // resumed from the .part; verifying/converting is restarted from the source.
     if (record.state == ModelState::Downloading) {
         const Path part = (downloads_dir() / spec.source_filename).string() + part_suffix();
-        record.downloaded_bytes = size_or_zero(part);
+        record.downloaded_bytes = part_bytes(part, spec.source_bytes);
         record.state = ModelState::Accepted;
         record.message = record.downloaded_bytes > 0 ? "download paused" : "";
     } else if (record.state == ModelState::Verifying || record.state == ModelState::Converting) {
@@ -668,9 +670,19 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
     }
 
     const Path part = source.string() + part_suffix();
-    uint64_t offset = size_or_zero(part);
+    // A parallel download leaves <part>.segments beside the .part, and the .part
+    // is then sparse: its size says nothing about what is in it. A plain
+    // sequential download is just the .part, whose size is its resume offset.
+    std::vector<DownloadSegment> segments;
+    SegmentsState layout = read_segments(part, spec->source_bytes, &segments);
+    if (layout == SegmentsState::invalid) {
+        remove_part_files(part);  // nothing in it can be trusted: start this download clean
+        layout = SegmentsState::none;
+    }
+    uint64_t offset = layout == SegmentsState::valid ? segments_done(segments) : size_or_zero(part);
     if (offset > spec->source_bytes) {
-        remove_if_present(part);  // a corrupt leftover would make the resume invalid
+        remove_part_files(part);  // a corrupt leftover would make the resume invalid
+        layout = SegmentsState::none;
         offset = 0;
     }
 
@@ -693,27 +705,54 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
                                     std::to_string(spec->source_bytes) + " bytes");
         }
 
+        // Parallel segments need byte ranges. A server that stopped offering
+        // them cannot continue a segmented .part: it starts again as one GET.
+        const bool ranges = head.value().range_supported;
+        if (layout == SegmentsState::valid && !ranges) {
+            remove_part_files(part);
+            layout = SegmentsState::none;
+            offset = 0;
+        }
+        const bool parallel =
+            ranges && (layout == SegmentsState::valid ||
+                       spec->source_bytes - offset >= segment_min_bytes_);
+
         record.state = ModelState::Downloading;
         record.downloaded_bytes = offset;
         record.updated_at = current_timestamp_utc();
         saved = save_record(record);
         if (!saved.ok()) return saved;
-        progress.report(0.05f, offset > 0 ? "resuming the download" : "downloading");
+        progress.report(kFetchDownloadStart, offset > 0 ? "resuming the download" : "downloading");
 
         Progress download_progress([&progress](float fraction, const std::string& stage) {
-            progress.report(0.05f + 0.65f * fraction, stage);
+            progress.report(kFetchDownloadStart + kFetchDownloadSpan * fraction, stage);
         });
-        FetchRequest request;
-        request.url = spec->source_url;
-        request.destination = part;
-        request.offset = offset;
-        request.total_bytes = spec->source_bytes;
-        request.progress = &download_progress;
-        request.cancelled = cancelled;
 
-        const Status downloaded = fetcher_->download(request);
+        Status downloaded = Status::success();
+        if (parallel) {
+            SegmentedDownload job;
+            job.fetcher = fetcher_;
+            job.url = spec->source_url;
+            job.part = part;
+            job.total = spec->source_bytes;
+            job.segments = layout == SegmentsState::valid
+                               ? std::move(segments)
+                               : plan_segments(offset, spec->source_bytes, segment_count_);
+            job.progress = &download_progress;
+            job.cancelled = cancelled;
+            downloaded = download_segmented(job);
+        } else {
+            FetchRequest request;
+            request.url = spec->source_url;
+            request.destination = part;
+            request.offset = offset;
+            request.total_bytes = spec->source_bytes;
+            request.progress = &download_progress;
+            request.cancelled = cancelled;
+            downloaded = fetcher_->download(request);
+        }
         if (!downloaded.ok()) {
-            record.downloaded_bytes = size_or_zero(part);
+            record.downloaded_bytes = part_bytes(part, spec->source_bytes);
             return fail(record, "download failed: " + downloaded.message());  // kept for resume
         }
     }
@@ -728,18 +767,18 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
 
     const uint64_t downloaded_bytes = size_or_zero(part);
     if (downloaded_bytes != spec->source_bytes) {
-        remove_if_present(part);
+        remove_part_files(part);
         return fail(record, "downloaded " + std::to_string(downloaded_bytes) + " bytes, expected " +
                                 std::to_string(spec->source_bytes) +
                                 "; the partial file was removed");
     }
     const Result<std::string> digest = sha256_file(part);
     if (!digest.ok()) {
-        remove_if_present(part);
+        remove_part_files(part);
         return fail(record, digest.message());
     }
     if (digest.value() != spec->source_sha256) {
-        remove_if_present(part);
+        remove_part_files(part);
         return fail(record, "SHA-256 mismatch: downloaded " + digest.value() + ", expected the pinned " +
                                 spec->source_sha256 + "; the partial file was removed");
     }
@@ -749,6 +788,7 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
     if (error) {
         return fail(record, "cannot move the verified download into place: " + error.message());
     }
+    remove_if_present(segments_path(part));  // a crash after the last byte can leave it behind
     return convert_and_store(*spec, source, record, progress);
 }
 

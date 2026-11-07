@@ -189,11 +189,41 @@ public:
         for (auto it = files.begin(); it != files.end();) {
             it = under(relative, it->first) ? files.erase(it) : std::next(it);
         }
+        for (auto it = directories.begin(); it != directories.end();) {
+            it = (*it == relative || under(relative, *it)) ? directories.erase(it)
+                                                           : std::next(it);
+        }
         return splat::Status::success();
     }
+    // A file, or a folder with everything below it (a scene is uploaded into a
+    // hidden temporary folder and renamed to its name).
     splat::Status rename(const std::string& from, const std::string& to) override {
         ++writes;
         if (!writable_) return splat::Status::error("the share " + id_ + " is read-only");
+        if (directories.count(from) != 0) {
+            std::map<std::string, std::vector<uint8_t>> moved;
+            for (auto it = files.begin(); it != files.end();) {
+                if (under(from, it->first)) {
+                    moved[to + it->first.substr(from.size())] = std::move(it->second);
+                    it = files.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            std::set<std::string> moved_directories;
+            for (auto it = directories.begin(); it != directories.end();) {
+                if (*it == from || under(from, *it)) {
+                    moved_directories.insert(to + it->substr(from.size()));
+                    it = directories.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto& file : moved) files[file.first] = std::move(file.second);
+            directories.insert(moved_directories.begin(), moved_directories.end());
+            add_parents(to);
+            return splat::Status::success();
+        }
         const auto found = files.find(from);
         if (found == files.end()) return splat::Status::error("no such file: " + from);
         files[to] = std::move(found->second);

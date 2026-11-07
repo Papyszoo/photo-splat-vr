@@ -10,6 +10,14 @@
 // "rename-album" / "delete-album"). Options (handled by UiApp) leads to
 // Settings.
 //
+// The same screen is a network library's home (ScreenArgs::b = the library's
+// location path, pushed by the Locations screen): the subfolders that hold scenes
+// are its albums, "Unsorted" holds the scenes directly in the library folder, and
+// Cross and Circle work as on the console. A share cannot be rearranged from the
+// console, so there is no "New folder" tile and no folder menu (Triangle says
+// why); an unreadable share shows its own error; a library the passcode hides is
+// blocked.
+//
 // A cover is the folder's first scene thumbnail; a missing one (every console
 // scene today) becomes a labelled placeholder tile, never an error.
 //
@@ -20,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "common/path.h"
 #include "ui/screen.h"
 #include "ui/thumb_cache.h"
 #include "ui/widgets.h"
@@ -49,6 +58,12 @@ public:
 
     // The empty state: no scene anywhere under the root yet.
     bool empty_state() const { return empty_state_; }
+    // The library root the albums come from (a location path for a share).
+    const Path& root() const { return root_; }
+    // True when the passcode hides this network library: nothing is listed.
+    bool blocked() const { return blocked_; }
+    // The listing's failure line, empty on a good listing.
+    const std::string& error() const { return error_; }
     static constexpr const char* kEmptyText = "No scenes yet";
     static constexpr const char* kEmptyHint =
         "Open a folder and choose + to turn photos into scenes.";
@@ -83,6 +98,10 @@ private:
     const Item* focused_item() const;
     void run(UiContext& ctx, Action action);
 
+    // The library the albums are listed from: the app's scene folder, or the
+    // location path this screen was opened with.
+    Path root_;
+    bool blocked_ = false;
     GridView grid_;
     PopupMenu menu_;
     std::vector<Action> menu_actions_;

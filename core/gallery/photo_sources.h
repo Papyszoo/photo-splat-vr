@@ -28,34 +28,9 @@ struct PhotoSource {
     bool removable = false;
 };
 
-struct PhotoEntry {
-    Path path;
-    std::string name;   // file name without the directories
-    uint64_t size = 0;  // bytes; 0 when it cannot be stat'ed
-    int64_t mtime = 0;  // Unix seconds; 0 when it cannot be stat'ed
-    // A splat file listed because the caller asked for them: it is imported,
-    // not converted (L2/L3).
-    bool splat = false;
-};
-
 // The inbox first, always, even when it does not exist yet; then one source per
 // usbN directory under roots.mnt that opens for listing, ascending by N.
 std::vector<PhotoSource> discover_sources(const SourceRoots& roots);
-
-// Files under source.dir that is_photo_file() accepts (core/image/format.h),
-// at most three directory levels below the source, newest mtime first and at
-// most 500 entries. Unreadable directories are skipped silently; a missing
-// source directory yields an empty list. `include_splats` also lists the
-// splat files is_splat_file() accepts, flagged PhotoEntry::splat; the default
-// keeps the photo-only listing every existing caller expects.
-std::vector<PhotoEntry> list_photos(const PhotoSource& source, bool include_splats = false);
-
-// The same list, but a source that cannot be read is an error naming it -
-// what a photos screen needs for an offline share, where an empty list would
-// say "No photos" and hide the failure. A local missing source is still an
-// ordinary empty list for list_photos(), which keeps every old caller.
-Result<std::vector<PhotoEntry>> list_photos_checked(const PhotoSource& source,
-                                                    bool include_splats = false);
 
 // Where the console folder browser starts (photos copied over FTP can be
 // anywhere the title can read): roots.data when it is a listable directory,
@@ -76,15 +51,18 @@ struct FolderEntry {
     uint32_t source_count = 0;
 };
 
-// One level of `dir`: its sub-folders (names starting with '.' skipped), then
-// its photo files (is_photo_file), then its splat files (is_splat_file), each
-// group sorted by name ignoring case, at most 500 entries in all. A missing or
-// unreadable folder yields an empty list.
+// The one listing behind every tab of the photo picker (Inbox, Console, USB
+// and the network locations). One level of `dir`: its sub-folders (names
+// starting with '.' skipped), then its photo files (is_photo_file), then its
+// splat files (is_splat_file), each group sorted by name ignoring case, at most
+// 500 entries in all. A missing or unreadable folder yields an empty list.
 std::vector<FolderEntry> list_folder(const Path& dir);
 
-// Every splat file at most `max_depth` levels below `dir`, name order, at most
-// `max_files`. The picker's Square on a folder row imports exactly this list.
-std::vector<Path> list_splat_files(const Path& dir, int max_depth = 3,
-                                   std::size_t max_files = 50);
+// The same one level, but a folder that cannot be read is an error carrying the
+// file system's own message (a network share that is offline, a wrong path),
+// where list_folder() answers an empty list. Local and network paths take this
+// one route: a network location is browsed folder by folder, one listing per
+// visit, never walked.
+Result<std::vector<FolderEntry>> list_folder_checked(const Path& dir);
 
 }  // namespace splat

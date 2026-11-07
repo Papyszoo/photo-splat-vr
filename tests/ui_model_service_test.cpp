@@ -30,6 +30,7 @@
 #include "model/model_manager.h"
 #include "model/sha256.h"
 #include "test_util.h"
+#include "ui/download_eta.h"
 #include "ui/model_service.h"
 #include "ui/ui_state.h"
 
@@ -386,6 +387,35 @@ TEST_CASE("ui_model_service publishes download progress from the worker") {
     CHECK_FALSE(service.downloading());
 }
 
+TEST_CASE("ui_model_service shows the time left from the byte rate while downloading") {
+    Fixture fixture;
+    // A synthetic clock: every progress report is one minute after the last, so
+    // the 4096-byte payload arrives at 256 bytes per minute.
+    double now = 0.0;
+    fixture.options.clock = [&now] { return now += 60.0; };
+    ModelService service(fixture.manager, fixture.state, fixture.options);
+    fixture.fetcher.block_after.store(fixture.payload.size() / 2);
+
+    REQUIRE_MESSAGE(service.download("da2").ok(), "start");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+
+    const std::vector<splat::ModelView> views = service.list();
+    const splat::ModelView* downloading = find_view(views, "da2");
+    REQUIRE(downloading != nullptr);
+    CHECK(downloading->state == "downloading");
+    // Half of the bytes are in and the other half takes as long again: 8 minutes.
+    CHECK(downloading->eta_seconds == doctest::Approx(480.0).epsilon(0.05));
+    CHECK(splat::eta_text(downloading->eta_seconds) == "about 8 min left");
+
+    fixture.fetcher.release.store(true);
+    service.wait_for_idle();
+    const std::vector<splat::ModelView> after = service.list();
+    const splat::ModelView* ready = find_view(after, "da2");
+    REQUIRE(ready != nullptr);
+    CHECK(ready->state == "ready");
+    CHECK(ready->eta_seconds < 0.0);  // no estimate outside a download
+}
+
 TEST_CASE("ui_model_service cancel stops the fetcher and keeps the .part") {
     Fixture fixture;
     ModelService service(fixture.manager, fixture.state, fixture.options);
@@ -652,13 +682,15 @@ TEST_CASE("ui_model_service delete keeps the licence acceptance and clears the f
     REQUIRE_MESSAGE(service.select("sharp").ok(), "select");
     REQUIRE(std::filesystem::exists(fixture.temp.path() / "models" / "sharp.gguf"));
 
-    // A paused part left around is removed too.
+    // A paused part left around is removed too, with its segments file.
     write_file(fixture.temp.path() / "downloads" / "model.bin.part", "stale");
+    write_file(fixture.temp.path() / "downloads" / "model.bin.part.segments", "{}");
 
     REQUIRE_MESSAGE(service.remove("sharp").ok(), "remove");
     CHECK_FALSE(std::filesystem::exists(fixture.temp.path() / "models" / "sharp.gguf"));
     CHECK_FALSE(std::filesystem::exists(fixture.temp.path() / "downloads" / "model.bin"));
     CHECK_FALSE(std::filesystem::exists(fixture.temp.path() / "downloads" / "model.bin.part"));
+    CHECK_FALSE(std::filesystem::exists(fixture.temp.path() / "downloads" / "model.bin.part.segments"));
     CHECK_FALSE(std::filesystem::exists(fixture.temp.path() / "models" / "sharp.json"));
     CHECK(fixture.manager.license_accepted("sharp"));  // the acceptance survives
     CHECK(service.selected().empty());

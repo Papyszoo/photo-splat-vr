@@ -77,7 +77,16 @@ public:
     // (including the cache writeback). Returns false only when VideoOut
     // refused the flip; a flip that merely had to be shown unpaced still
     // returns true and says so in `error`.
-    bool present(const void* pixels, double* tile_ms, std::string& error);
+    //
+    // `rgba_source`: the pixels are R, G, B, A in memory (the VR renderer's
+    // R8G8B8A8 target, which the TV picture is read back from) and the tile
+    // write swaps red and blue on the way; false is VideoOut's own B, G, R, A.
+    bool present(const void* pixels, double* tile_ms, std::string& error,
+                 bool rgba_source = false);
+    // Presents whose earlier flip was not seen shown within pace_timeout_ms.
+    // The system not scanning the port out at all (the TV still on the console
+    // UI) shows up here as a count that climbs with every present.
+    uint64_t unconfirmed_flips() const { return unconfirmed_; }
 
     // Blank, unregister, close, unmap, release -- each step bounded. A step
     // that will not finish leaves its memory alone (VideoOut may still scan
@@ -102,6 +111,7 @@ private:
     uint64_t flips_ = 0;
     uint64_t buffer_serial_[8] = {};
     bool unpaced_reported_ = false;
+    uint64_t unconfirmed_ = 0;
 };
 
 }  // namespace ps5

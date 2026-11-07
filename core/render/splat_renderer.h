@@ -82,6 +82,7 @@ struct PassTimings {
     double project_ms = 0.0;  // cull + project + indirect command
     double sort_ms = 0.0;     // radix sort
     double draw_ms = 0.0;     // both eyes
+    double tv_ms = 0.0;       // the TV copy, its quads and the readback (0 on a frame without one)
 };
 
 // Destination for a frame. The caller owns the image and view. With readback
@@ -171,6 +172,29 @@ public:
     void clear_overlay_quads();
     bool has_overlay_quads() const;
 
+    // ---- TV picture (0.6.0, render/tv_view.h) ---------------------------
+    // The TV gets its own image of a VR session: the left eye's centre 16:9
+    // crop taken between the comfort pass and the overlay pass, so it holds the
+    // scene and nothing the eyes' overlay list draws (the VR window, the label,
+    // the HUD), and then the TV quad list drawn onto it with the TV camera
+    // (set_tv_overlay_quads: the same menu canvas, flat). It lands in a
+    // host-visible slot buffer for the title's VideoOut worker.
+    //
+    // enable_tv_capture() makes the two 1920x1080 images (the target format and
+    // its blend-space counterpart) and `slots` host buffers once. A frame asks
+    // for a slot with request_tv_frame(slot) right before render(); -1 or no
+    // call means no TV work at all that frame (render() consumes the request, so
+    // a failed frame cannot leave a stale one). The slot's bytes are valid when
+    // render() returns (it waits for its fence), in the target's channel order
+    // (R, G, B, A for the VR path's R8G8B8A8), top row first.
+    Status enable_tv_capture(uint32_t width, uint32_t height, int slots);
+    bool tv_capture_enabled() const { return tv_width_ != 0; }
+    uint32_t tv_width() const { return tv_width_; }
+    uint32_t tv_height() const { return tv_height_; }
+    void request_tv_frame(int slot) { tv_request_slot_ = slot; }
+    const uint8_t* tv_frame_pixels(int slot) const;
+    Status set_tv_overlay_quads(std::vector<OverlayQuad> quads);
+
     // RGB8 top-down image of the last readback frame.
     Result<Image> read_image() const;
 
@@ -214,6 +238,10 @@ private:
     SplatRenderer() = default;
     void destroy();
     Status ensure_overlay();
+    // The TV copy of this frame, recorded between the comfort and overlay passes.
+    void record_tv_frame(VkCommandBuffer command_buffer, const RenderTarget& target,
+                         bool blend_alt, bool srgb_target, const CameraIntrinsics& intrinsics,
+                         int slot);
 
     Status upload_scene_attributes(const SplatScene& scene, VulkanBuffer attributes[5]);
     void destroy_attributes(VulkanBuffer attributes[5]);
@@ -243,6 +271,13 @@ private:
     VulkanBuffer draw_;
     VulkanBuffer camera_;
     VulkanBuffer readback_;
+    // The TV picture: [0] in options_.target_format, [1] in alt_format_ (the
+    // frame's blend space picks one), and the host slots they are read into.
+    uint32_t tv_width_ = 0;
+    uint32_t tv_height_ = 0;
+    VulkanImage tv_images_[2];
+    std::vector<VulkanBuffer> tv_slots_;
+    int tv_request_slot_ = -1;
     // D32 depth attachment, written by the splat pass and sampled by the
     // comfort pass to locate the nearest splat at each pixel.
     VulkanImage depth_image_;

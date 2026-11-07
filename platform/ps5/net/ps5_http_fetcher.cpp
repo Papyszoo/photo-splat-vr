@@ -10,12 +10,15 @@
 #include "platform/ps5/net/ps5_http_fetcher.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/types.h>
+
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -38,7 +41,12 @@ using ps5::ResponseHeaders;
 constexpr int kMethodGet = 0;
 constexpr int kMethodHead = 2;
 
-constexpr size_t kChunkBytes = 64 * 1024;
+// Probe variant C (runs/v0.2-library/REPORT-060-probe.md): 256 KiB reads, the
+// larger pools below and a receive block, four connections together 10.8 MB/s.
+constexpr size_t kChunkBytes = 256 * 1024;
+// Receive block sizes tried for the template, largest first, until sceHttp
+// accepts one (the probe's 262144 was accepted on the console).
+constexpr unsigned int kRecvBlockLadder[] = {262144u, 65536u, 16384u};
 // 15 s to connect, 30 s per receive, as the brief asks; resolve and send get
 // the same bounds so no stage can wait forever.
 constexpr unsigned int kConnectTimeoutUs = 15u * 1000u * 1000u;
@@ -59,6 +67,7 @@ struct NetContext {
     int ssl_ctx = -1;
     int http_ctx = -1;
     int tmpl = -1;
+    unsigned int recv_block = 0;  // accepted receive block size, 0 = sceHttp's default
     std::string error;
 };
 
@@ -77,17 +86,18 @@ NetContext make_context() {
         context.error = "sceNetInit failed; the console network stack is unavailable";
         return context;
     }
-    context.net_pool = sceNetPoolCreate("splat_http", 512 * 1024, 0);
+    // Sized for four connections at once (the parallel model download).
+    context.net_pool = sceNetPoolCreate("splat_http", 2 * 1024 * 1024, 0);
     if (context.net_pool < 0) {
         context.error = "sceNetPoolCreate failed (" + hex_code(context.net_pool) + ")";
         return context;
     }
-    context.ssl_ctx = sceSslInit(384 * 1024);
+    context.ssl_ctx = sceSslInit(1024 * 1024);
     if (context.ssl_ctx < 0) {
         context.error = "sceSslInit failed (" + hex_code(context.ssl_ctx) + ")";
         return context;
     }
-    context.http_ctx = sceHttpInit(context.net_pool, context.ssl_ctx, 256 * 1024);
+    context.http_ctx = sceHttpInit(context.net_pool, context.ssl_ctx, 2 * 1024 * 1024);
     if (context.http_ctx < 0) {
         context.error = "sceHttpInit failed (" + hex_code(context.http_ctx) + ")";
         return context;
@@ -108,6 +118,12 @@ NetContext make_context() {
         return context;
     }
     set_timeouts(context.tmpl);
+    for (const unsigned int block : kRecvBlockLadder) {
+        if (sceHttpSetRecvBlockSize(context.tmpl, block) == 0) {
+            context.recv_block = block;
+            break;
+        }
+    }
     return context;
 }
 
@@ -118,9 +134,16 @@ NetContext& shared_context() {
     return context;
 }
 
-std::mutex& transfer_mutex() {
+std::mutex& setup_mutex() {
     // sceHttp's template/connection state is not documented as reentrant, so
-    // one transfer runs at a time per process, as ProsperoMgr serialises them.
+    // creating and sending a request (through reading its status and headers) is
+    // one step at a time per process, as ProsperoMgr serialises them. Reading a
+    // body is not under this lock: the parallel model download reads four bodies
+    // at once, and a licence or HEAD request must not wait for a download.
+    // Four bodies read at once is console-proven by the probe
+    // (platform/ps5/bench/http_probe.cpp, variant C: setup one at a time, then
+    // all four read together); a body read that overlaps another request's setup
+    // or teardown is not, and needs the first real download on the console.
     static std::mutex mutex;
     return mutex;
 }
@@ -164,6 +187,7 @@ SendOutcome open_and_send(NetContext& context, Request& request, const std::stri
         }
         request.connection = connection;
         set_timeouts(request.connection);
+        if (context.recv_block != 0) sceHttpSetRecvBlockSize(request.connection, context.recv_block);
 
         const int created = sceHttpCreateRequestWithURL(request.connection, method, url.c_str(), 0);
         if (created < 0) {
@@ -172,6 +196,7 @@ SendOutcome open_and_send(NetContext& context, Request& request, const std::stri
         }
         request.request = created;
         set_timeouts(request.request);
+        if (context.recv_block != 0) sceHttpSetRecvBlockSize(request.request, context.recv_block);
 
         if (range != nullptr) {
             const int header = sceHttpAddRequestHeader(request.request, "Range", range->c_str(), 0);
@@ -240,7 +265,7 @@ using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
 }  // namespace
 
 Result<HttpResource> Ps5HttpFetcher::head(const std::string& url) {
-    std::lock_guard<std::mutex> lock(transfer_mutex());
+    std::lock_guard<std::mutex> lock(setup_mutex());
     NetContext& context = shared_context();
     if (!context.error.empty()) return Result<HttpResource>::failure(context.error);
 
@@ -271,19 +296,27 @@ Result<HttpResource> Ps5HttpFetcher::head(const std::string& url) {
 }
 
 Status Ps5HttpFetcher::download(const FetchRequest& request) {
+    if (request.end != 0) {
+        // One segment of a parallel download: [offset, end) written in place.
+        if (request.end <= request.offset) return Status::error("download segment is empty");
+        return download_impl(request.url, request.destination, request.offset,
+                             request.end - request.offset, request.total_bytes, request.progress,
+                             request.cancelled, true, request.written);
+    }
     return download_impl(request.url, request.destination, request.offset, 0, request.total_bytes,
-                         request.progress, request.cancelled);
+                         request.progress, request.cancelled, false, nullptr);
 }
 
 Status Ps5HttpFetcher::download_range(const std::string& url, const Path& destination, uint64_t offset,
                                       uint64_t max_bytes, Progress* progress,
                                       std::function<bool()> cancelled) {
-    return download_impl(url, destination, offset, max_bytes, 0, progress, cancelled);
+    return download_impl(url, destination, offset, max_bytes, 0, progress, cancelled, false, nullptr);
 }
 
 Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destination, uint64_t offset,
                                      uint64_t max_bytes, uint64_t total_bytes, Progress* progress,
-                                     const std::function<bool()>& cancelled) {
+                                     const std::function<bool()>& cancelled, bool in_place,
+                                     std::atomic<uint64_t>* written_out) {
     if (url.empty()) return Status::error("download needs a URL");
     if (destination.empty()) return Status::error("download needs a destination path");
 
@@ -297,7 +330,7 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
         }
     }
 
-    std::lock_guard<std::mutex> lock(transfer_mutex());
+    std::unique_lock<std::mutex> lock(setup_mutex());
     NetContext& context = shared_context();
     if (!context.error.empty()) return Status::error(context.error);
 
@@ -331,8 +364,29 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
         have_response_length = true;
     }
 
-    FilePtr file(std::fopen(destination.string().c_str(), offset > 0 ? "ab" : "wb"));
+    // The request is set up; the body below is read without the lock.
+    lock.unlock();
+
+    if (in_place && (decision != RangeDecision::append || status != 206)) {
+        // Restarting would erase the other segments of the file.
+        return Status::error(url + ": the server ignored the byte range (HTTP " +
+                             std::to_string(status) + ")");
+    }
+    if (in_place && headers.has_content_range && headers.content_range_start != offset) {
+        return Status::error(url + ": the server answered a different byte range");
+    }
+
+    FilePtr file(std::fopen(destination.string().c_str(),
+                            in_place ? "r+b" : (offset > 0 ? "ab" : "wb")));
     if (file == nullptr) return Status::error("cannot open " + destination.string() + " for writing");
+    if (in_place) {
+        // Unbuffered: a byte counted in written_out is in the file, so the resume
+        // state never claims more than the file holds.
+        if (fseeko(file.get(), static_cast<off_t>(offset), SEEK_SET) != 0) {
+            return Status::error("cannot seek in " + destination.string());
+        }
+        std::setvbuf(file.get(), nullptr, _IONBF, 0);
+    }
 
     uint64_t effective_offset = offset;
     if (decision == RangeDecision::restart && effective_offset > 0) {
@@ -363,6 +417,7 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
             return Status::error("failed while writing " + destination.string());
         }
         written += bytes;
+        if (written_out != nullptr) written_out->store(written, std::memory_order_relaxed);
 
         if (progress != nullptr && total_bytes > 0) {
             const uint64_t done = effective_offset + written;
@@ -380,6 +435,10 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
     if (std::fflush(file.get()) != 0) {
         return Status::error("cannot flush " + destination.string());
     }
+    if (in_place && written != max_bytes) {
+        return Status::error(url + ": short read, got " + std::to_string(written) + " of " +
+                             std::to_string(max_bytes) + " bytes");
+    }
     if (max_bytes == 0 && have_response_length && written != response_length) {
         return Status::error(url + ": short read, got " + std::to_string(written) + " of " +
                              std::to_string(response_length) + " bytes");
@@ -394,7 +453,7 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
 }
 
 Result<std::string> Ps5HttpFetcher::get_text(const std::string& url, size_t max_bytes) {
-    std::lock_guard<std::mutex> lock(transfer_mutex());
+    std::unique_lock<std::mutex> lock(setup_mutex());
     NetContext& context = shared_context();
     if (!context.error.empty()) return Result<std::string>::failure(context.error);
 
@@ -420,6 +479,8 @@ Result<std::string> Ps5HttpFetcher::get_text(const std::string& url, size_t max_
         return Result<std::string>::failure(url + ": response is larger than " +
                                             std::to_string(max_bytes) + " bytes");
     }
+
+    lock.unlock();  // the body is read without the lock
 
     std::string text;
     if (have_declared && declared > 0 && declared <= max_bytes) {

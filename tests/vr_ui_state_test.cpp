@@ -247,3 +247,193 @@ TEST_CASE("vr_ui_state: with UiApp, Options opens Settings and Circle at the roo
     CHECK(frame(0).scene_controls);
 }
 
+
+// ---- 0.6.0: Options resolves on release (OptionsGate) -----------------------
+// "Hold Options (~1 s) recentres the scene and the open window, tap Options
+// still opens the menu, and a hold never toggles." The gate sits between the
+// pads' button word and PanelMode::route(), in the same order vr_mode.cpp calls
+// them, with synthetic words and time.
+
+namespace {
+
+using viewer::OptionsGate;
+
+constexpr double kFrame = 1.0 / 60.0;
+
+// One frame of the VR loop's input: the gate, then the panel route.
+struct Frame {
+    OptionsGate::Step gate;
+    viewer::UiRoute route;
+};
+
+struct Rig {
+    OptionsGate gate;
+    PanelMode panel{true};
+    double now = 10.0;
+
+    Frame step(uint32_t buttons) {
+        Frame frame;
+        frame.gate = gate.update(buttons, now);
+        frame.route = panel.route(frame.gate.buttons);
+        now += kFrame;
+        return frame;
+    }
+    // `seconds` of frames with `buttons` held; returns how many frames each
+    // outcome happened on.
+    struct Totals {
+        int recentres = 0;
+        int opened = 0;
+        int menu_pressed = 0;
+        Frame last;
+    };
+    Totals hold(uint32_t buttons, double seconds) {
+        Totals totals;
+        const int frames = static_cast<int>(seconds / kFrame + 0.5);
+        for (int i = 0; i < frames; ++i) {
+            totals.last = step(buttons);
+            totals.recentres += totals.last.gate.recentre ? 1 : 0;
+            totals.opened += totals.last.route.opened ? 1 : 0;
+            totals.menu_pressed += (totals.last.route.ui_pressed & splat::Menu) != 0u ? 1 : 0;
+        }
+        return totals;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("vr_ui_state: an Options tap opens the menu on release, not on press") {
+    Rig rig;
+    rig.hold(0, 0.2);                       // the gate is armed by a frame without Options
+    const Rig::Totals down = rig.hold(kOptions, 0.15);
+    CHECK(down.opened == 0);                // pressed, not released: nothing yet
+    CHECK(down.last.gate.pending);
+    CHECK((down.last.gate.buttons & kOptions) == 0u);
+    CHECK_FALSE(rig.panel.open());
+    const Rig::Totals up = rig.hold(0, 0.05);
+    CHECK(up.opened == 1);                  // the release frame opens it, once
+    CHECK(up.recentres == 0);
+    CHECK(rig.panel.open());
+    CHECK_FALSE(up.last.gate.pending);
+    // Nothing repeats afterwards.
+    const Rig::Totals after = rig.hold(0, 0.5);
+    CHECK(after.opened == 0);
+    CHECK(after.recentres == 0);
+}
+
+TEST_CASE("vr_ui_state: an Options hold recentres once and never opens or toggles the menu") {
+    Rig rig;
+    rig.hold(0, 0.2);
+
+    // Panel closed: held 1.5 s, then released.
+    const Rig::Totals held = rig.hold(kOptions, 1.5);
+    CHECK(held.recentres == 1);
+    CHECK(held.opened == 0);
+    CHECK_FALSE(rig.panel.open());
+    CHECK(held.last.gate.progress == doctest::Approx(1.0f));
+    const Rig::Totals released = rig.hold(0, 0.3);
+    CHECK(released.opened == 0);            // the release after a hold is silent
+    CHECK(released.recentres == 0);
+    CHECK_FALSE(rig.panel.open());
+
+    // The next tap works as a tap again (the hold left nothing behind).
+    rig.hold(kOptions, 0.1);
+    CHECK(rig.hold(0, 0.05).opened == 1);
+    CHECK(rig.panel.open());
+
+    // Panel open: a hold is the recentre, and the panel never sees Options - not
+    // as a press, not as a held bit - so Settings does not open or close.
+    rig.hold(0, 0.2);
+    const Rig::Totals open_hold = rig.hold(kOptions, 1.4);
+    CHECK(open_hold.recentres == 1);
+    CHECK(open_hold.menu_pressed == 0);
+    CHECK((open_hold.last.route.ui_held & splat::Menu) == 0u);
+    CHECK(open_hold.last.route.panel_visible);
+    CHECK(rig.hold(0, 0.3).menu_pressed == 0);
+    CHECK(rig.panel.open());
+
+    // Panel open: a tap is the panel's own Options (Settings), once, on release.
+    rig.hold(kOptions, 0.1);
+    CHECK(rig.hold(0, 0.05).menu_pressed == 1);
+}
+
+TEST_CASE("vr_ui_state: the Options hold completes at one second and shows a bar after a quarter") {
+    Rig rig;
+    rig.hold(0, 0.2);
+    // 0.99 s: pending, no recentre yet; the bar follows the progress.
+    bool recentred = false;
+    float bar_at_100ms = -1.0f;
+    float bar_at_500ms = -1.0f;
+    for (int i = 0; i < 59; ++i) {
+        const Frame frame = rig.step(kOptions);
+        recentred = recentred || frame.gate.recentre;
+        if (i == 5) bar_at_100ms = frame.gate.bar;
+        if (i == 29) bar_at_500ms = frame.gate.bar;
+        CHECK(frame.gate.pending);
+    }
+    CHECK_FALSE(recentred);
+    CHECK(bar_at_100ms == doctest::Approx(0.0f));   // a tap must not flash the bar
+    CHECK(bar_at_500ms == doctest::Approx(0.5f).epsilon(0.05));
+    // Frame 60 reaches kRecentreHoldSeconds (1.0 s) exactly once.
+    int recentres = 0;
+    for (int i = 0; i < 5; ++i) recentres += rig.step(kOptions).gate.recentre ? 1 : 0;
+    CHECK(recentres == 1);
+    CHECK(OptionsGate::kBarAfterSeconds < viewer::pad::kRecentreHoldSeconds);
+}
+
+TEST_CASE("vr_ui_state: Options from the DualSense and the Sense pad are one press") {
+    Rig rig;
+    rig.hold(0, 0.2);
+    // The word the loop gives the gate is the OR of every pad: the DualSense
+    // releases at 0.6 s while the Sense controller (down since 0.4 s) holds on.
+    // One press from the first edge: the hold lands at 1.0 s after it, and the
+    // other pad's later edge restarts nothing.
+    int recentres = 0;
+    for (int i = 0; i < 60 * 2; ++i) {
+        const double t = i * kFrame;
+        const bool dualsense = t < 0.6;
+        const bool sense = t >= 0.4;
+        const Frame frame = rig.step((dualsense || sense) ? kOptions : 0u);
+        recentres += frame.gate.recentre ? 1 : 0;
+        if (frame.gate.recentre) CHECK(t == doctest::Approx(1.0).epsilon(0.05));
+    }
+    CHECK(recentres == 1);
+    CHECK_FALSE(rig.panel.open());
+}
+
+TEST_CASE("vr_ui_state: a launch press and other buttons pass the Options gate correctly") {
+    Rig rig;
+    // The title was launched with Options down: it is not a press on the menu,
+    // not a tap on release, and not the start of a hold.
+    const Rig::Totals launch = rig.hold(kOptions, 1.5);
+    CHECK(launch.recentres == 0);
+    CHECK(launch.opened == 0);
+    CHECK(rig.hold(0, 0.2).opened == 0);
+    CHECK_FALSE(rig.panel.open());
+    // The first real tap after it works.
+    rig.hold(kOptions, 0.1);
+    CHECK(rig.hold(0, 0.05).opened == 1);
+
+    // Every other button goes through untouched, with or without Options.
+    Rig other;
+    other.hold(0, 0.1);
+    const Frame mixed = other.step(kCross | kL1 | kOptions);
+    CHECK((mixed.gate.buttons & kCross) != 0u);
+    CHECK((mixed.gate.buttons & kL1) != 0u);
+    CHECK((mixed.gate.buttons & kOptions) == 0u);
+
+    // UI=0: no panel, and the hold still reports a recentre (the scene's).
+    OptionsGate gate;
+    PanelMode no_panel(false);
+    double t = 0.0;
+    int recentres = 0;
+    gate.update(0, t);
+    for (int i = 0; i < 100; ++i) {
+        t += kFrame;
+        const OptionsGate::Step step = gate.update(kOptions, t);
+        recentres += step.recentre ? 1 : 0;
+        const viewer::UiRoute route = no_panel.route(step.buttons);
+        CHECK_FALSE(route.panel_visible);
+        CHECK(route.scene_controls);
+    }
+    CHECK(recentres == 1);
+}

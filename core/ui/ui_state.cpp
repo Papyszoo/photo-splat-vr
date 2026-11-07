@@ -7,8 +7,14 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "gallery/gallery.h"
+#include "ui/services.h"
+#include "vfs/io.h"
 
 namespace splat {
 namespace {
@@ -24,9 +30,123 @@ bool read_text(const Path& path, std::string* text) {
     return !file.bad();
 }
 
+// The components of a location path's relative part, empty ones dropped. False
+// for "." and "..": the browser never produces them, and a stored one would
+// climb out of the folder the user chose.
+bool relative_components(const std::string& relative, std::vector<std::string>* out) {
+    out->clear();
+    std::size_t start = 0;
+    while (start <= relative.size()) {
+        const std::size_t slash = relative.find('/', start);
+        const std::string part = relative.substr(
+            start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (part == "." || part == "..") return false;
+        if (!part.empty()) out->push_back(part);
+        if (slash == std::string::npos) break;
+        start = slash + 1;
+    }
+    return true;
+}
+
+bool plain_text(const std::string& text) {
+    for (const char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f || c == '\\') return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 Path ui_state_path(const Path& state_dir) { return state_dir / "ui.json"; }
+
+bool valid_output_folder(const std::string& text) {
+    if (text.empty() || text.size() > kMaxOutputFolderChars || !plain_text(text)) return false;
+    std::string relative;
+    if (!vfs::split(Path(text), nullptr, &relative)) return false;
+    std::vector<std::string> parts;
+    if (!relative_components(relative, &parts)) return false;
+    // Canonical only: one spelling per folder, so two screens compare by text.
+    std::string canonical;
+    for (const std::string& part : parts) canonical += (canonical.empty() ? "" : "/") + part;
+    return canonical == relative;
+}
+
+std::string canonical_output_folder(const Path& folder) {
+    std::string id;
+    std::string relative;
+    if (!vfs::split(folder, &id, &relative) || !plain_text(folder.string())) return std::string();
+    std::vector<std::string> parts;
+    if (!relative_components(relative, &parts)) return std::string();
+    std::string joined;
+    for (const std::string& part : parts) joined += (joined.empty() ? "" : "/") + part;
+    const std::string text = vfs::join(id, joined).string();
+    return valid_output_folder(text) ? text : std::string();
+}
+
+namespace {
+
+const LocationView* find_location(const ILocationService* locations, const std::string& id,
+                                  std::vector<LocationView>* storage) {
+    if (locations == nullptr) return nullptr;
+    *storage = locations->list();
+    for (const LocationView& view : *storage) {
+        if (view.id == id) return &view;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+std::string network_folder_text(const ILocationService* locations, const Path& folder) {
+    std::string id;
+    std::string relative;
+    if (!vfs::split(folder, &id, &relative)) return folder.string();
+    std::vector<LocationView> storage;
+    const LocationView* location = find_location(locations, id, &storage);
+    if (location == nullptr) return id + " (removed)";
+    std::string text = location->name.empty() ? location->id : location->name;
+    std::vector<std::string> parts;
+    relative_components(relative, &parts);
+    for (const std::string& part : parts) text += " \xE2\x80\xBA " + part;
+    return text;
+}
+
+std::string output_folder_text(const UiState* state, const ILocationService* locations) {
+    if (state == nullptr || state->output_folder.empty()) return "Console";
+    return network_folder_text(locations, Path(state->output_folder));
+}
+
+Result<SceneTarget> scene_target(const UiState* state, const ILocationService* locations,
+                                 const Path& shelf_root, const std::string& shelf_album) {
+    SceneTarget target;
+    if (vfs::is_remote(shelf_root)) {
+        target.root = shelf_root;
+        target.album = shelf_album;
+        return Result<SceneTarget>::success(std::move(target));
+    }
+    if (state == nullptr || state->output_folder.empty()) {
+        target.album = shelf_album;
+        return Result<SceneTarget>::success(std::move(target));
+    }
+    const Path folder(state->output_folder);
+    std::vector<LocationView> storage;
+    if (find_location(locations, vfs::location_id(folder), &storage) == nullptr) {
+        return Result<SceneTarget>::failure(
+            "The output folder's network location was removed. Choose another in Settings.");
+    }
+    // The shelf's folder goes along as `<output folder>/<album>`, the console's
+    // own album rules deciding which names are usable: a name that is no folder
+    // name on the share is refused, never dropped or rewritten.
+    if (!shelf_album.empty() && !valid_album_name(shelf_album)) {
+        return Result<SceneTarget>::failure(
+            "This folder's name cannot be used on a network share. Rename the folder first.");
+    }
+    target.root = folder;
+    target.album = shelf_album;
+    target.from_setting = true;
+    return Result<SceneTarget>::success(std::move(target));
+}
 
 UiState load_ui_state(const Path& state_dir) {
     UiState state;
@@ -93,6 +213,13 @@ UiState load_ui_state(const Path& state_dir) {
             // largest, a -3 the smallest, and neither can break a grid.
             state.thumbnail_size = thumbnail_size_from_number(thumbnail->get<double>());
         }
+        const auto output = root.find("output_folder");
+        if (output != root.end() && output->is_string()) {
+            // A value the folder browser could not have produced (a local path,
+            // "..", an overlong or control-character string) is the console.
+            const std::string value = output->get<std::string>();
+            if (valid_output_folder(value)) state.output_folder = value;
+        }
     } catch (const std::exception&) {
         return UiState{};  // garbage: defaults, never a failure
     }
@@ -119,6 +246,9 @@ Status save_ui_state(const Path& state_dir, const UiState& state) {
     root["edge_softness"] = state.edge_softness;
     root["blending"] = state.blend_linear ? "linear" : "srgb";
     root["thumbnail_size"] = clamp_thumbnail_size(state.thumbnail_size);
+    // Only a value load_ui_state() would accept is written back.
+    root["output_folder"] = valid_output_folder(state.output_folder) ? state.output_folder
+                                                                     : std::string();
     const std::string text = root.dump(2) + "\n";
 
     const Path path = ui_state_path(state_dir);

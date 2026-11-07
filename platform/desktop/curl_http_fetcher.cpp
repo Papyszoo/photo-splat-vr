@@ -8,7 +8,10 @@
 
 #include <curl/curl.h>
 
+#include <sys/types.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +53,10 @@ struct TransferState {
     bool truncate_on_first_write = false;
     bool offsets_mismatch = false;
     bool write_failed = false;
+    // Segment mode (FetchRequest::end): a bounded range written in place.
+    bool segment = false;
+    bool range_ignored = false;
+    std::atomic<uint64_t>* written_out = nullptr;
     HeaderState header;
     Progress* progress = nullptr;
     const std::function<bool()>* cancelled = nullptr;
@@ -96,6 +103,18 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
     auto* state = static_cast<TransferState*>(userdata);
     const size_t bytes = size * count;
 
+    if (state->first_write && state->segment) {
+        state->first_write = false;
+        if (state->header.status != 206) {
+            // Restarting would erase the other segments of the file.
+            state->range_ignored = true;
+            return 0;
+        }
+        if (state->header.has_content_range && state->header.content_range_start != state->offset) {
+            state->offsets_mismatch = true;
+            return 0;
+        }
+    }
     if (state->first_write) {
         state->first_write = false;
         if (state->offset > 0 && state->header.status == 200) {
@@ -125,6 +144,9 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
         return 0;
     }
     state->written += bytes;
+    if (state->written_out != nullptr) {
+        state->written_out->store(state->written, std::memory_order_relaxed);
+    }
 
     if (state->progress != nullptr && state->total > 0) {
         const uint64_t done = state->offset + state->written;
@@ -234,8 +256,22 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     state.total = request.total_bytes;
     state.progress = request.progress;
     state.cancelled = &request.cancelled;
-    state.file = std::fopen(state.path.c_str(), request.offset > 0 ? "ab" : "wb");
+    state.segment = request.end != 0;
+    state.written_out = request.written;
+    if (state.segment && request.end <= request.offset) return Status::error("download segment is empty");
+    state.file = std::fopen(state.path.c_str(),
+                            state.segment ? "r+b" : (request.offset > 0 ? "ab" : "wb"));
     if (state.file == nullptr) return Status::error("cannot open " + state.path + " for writing");
+    if (state.segment) {
+        // Unbuffered: a byte counted in `written` is in the file, so the resume
+        // state of a parallel download never claims more than the file holds.
+        if (fseeko(state.file, static_cast<off_t>(request.offset), SEEK_SET) != 0) {
+            std::fclose(state.file);
+            state.file = nullptr;
+            return Status::error("cannot seek in " + state.path);
+        }
+        std::setvbuf(state.file, nullptr, _IONBF, 0);
+    }
 
     struct Closer {
         TransferState& state;
@@ -245,8 +281,9 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     } closer{state};
 
     struct curl_slist* headers = nullptr;
-    if (request.offset > 0) {
-        const std::string range = "Range: bytes=" + std::to_string(request.offset) + "-";
+    if (request.offset > 0 || state.segment) {
+        std::string range = "Range: bytes=" + std::to_string(request.offset) + "-";
+        if (state.segment) range += std::to_string(request.end - 1);
         headers = curl_slist_append(headers, range.c_str());
         curl_easy_setopt(curl.handle, CURLOPT_HTTPHEADER, headers);
     }
@@ -264,6 +301,10 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     const CURLcode code = curl_easy_perform(curl.handle);
     if (headers != nullptr) curl_slist_free_all(headers);
 
+    if (state.range_ignored) {
+        return Status::error(request.url + ": the server ignored the byte range (HTTP " +
+                             std::to_string(state.header.status) + ")");
+    }
     if (state.offsets_mismatch) {
         return Status::error(request.url + ": the server resumed at the wrong byte offset");
     }
@@ -283,6 +324,10 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
 
     if (std::fflush(state.file) != 0) {
         return Status::error("cannot flush " + request.destination.string());
+    }
+    if (state.segment && state.written != request.end - request.offset) {
+        return Status::error(request.url + ": short read, got " + std::to_string(state.written) +
+                             " of " + std::to_string(request.end - request.offset) + " bytes");
     }
     return Status::success();
 }

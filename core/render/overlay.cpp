@@ -576,38 +576,60 @@ Status OverlayRenderer::update_rgba_texture(uint32_t index, uint32_t width, uint
                           rgba_pixels);
 }
 
-Status OverlayRenderer::set_quads(std::vector<OverlayQuad> quads) {
-    if (context_ == nullptr) return Status::error("the overlay renderer has no Vulkan context");
+Status OverlayRenderer::check_textures(const std::vector<OverlayQuad>& quads) const {
     for (const OverlayQuad& quad : quads) {
         if (quad.texture >= textures_.size()) {
             return Status::error("overlay quad uses an unknown texture index " +
                                  std::to_string(quad.texture));
         }
     }
+    return Status::success();
+}
+
+Status OverlayRenderer::set_quads(std::vector<OverlayQuad> quads) {
+    if (context_ == nullptr) return Status::error("the overlay renderer has no Vulkan context");
+    const Status checked = check_textures(quads);
+    if (!checked.ok()) return checked;
     quads_ = std::move(quads);
-    if (quads_.empty()) {
+    return rebuild_vertices();
+}
+
+Status OverlayRenderer::set_tv_quads(std::vector<OverlayQuad> quads) {
+    if (context_ == nullptr) return Status::error("the overlay renderer has no Vulkan context");
+    const Status checked = check_textures(quads);
+    if (!checked.ok()) return checked;
+    tv_quads_ = std::move(quads);
+    return rebuild_vertices();
+}
+
+Status OverlayRenderer::rebuild_vertices() {
+    if (quads_.empty() && tv_quads_.empty()) {
         destroy_vulkan_buffer(*context_, vertices_);
         return Status::success();
     }
 
     std::vector<OverlayVertex> vertices;
-    vertices.reserve(quads_.size() * 6);
+    vertices.reserve((quads_.size() + tv_quads_.size()) * 6);
     // Two triangles per quad, corners in +u/+v space: top-left, bottom-left,
     // bottom-right, top-left, bottom-right, top-right. v = 0 is the top edge.
     const float corners[6][2] = {{-0.5f, 0.5f},  {-0.5f, -0.5f}, {0.5f, -0.5f},
                                  {-0.5f, 0.5f}, {0.5f, -0.5f},  {0.5f, 0.5f}};
-    for (const OverlayQuad& quad : quads_) {
-        for (const auto& corner : corners) {
-            OverlayVertex vertex{};
-            for (int axis = 0; axis < 3; ++axis) {
-                vertex.position[axis] = quad.center[axis] +
-                                        quad.right[axis] * (corner[0] * quad.width) +
-                                        quad.up[axis] * (corner[1] * quad.height);
+    // The eye list first, then the TV list: record() draws the first quads_.size()
+    // quads, record_tv() the ones behind them.
+    for (const std::vector<OverlayQuad>* list : {&quads_, &tv_quads_}) {
+        for (const OverlayQuad& quad : *list) {
+            for (const auto& corner : corners) {
+                OverlayVertex vertex{};
+                for (int axis = 0; axis < 3; ++axis) {
+                    vertex.position[axis] = quad.center[axis] +
+                                            quad.right[axis] * (corner[0] * quad.width) +
+                                            quad.up[axis] * (corner[1] * quad.height);
+                }
+                vertex.uv[0] = corner[0] + 0.5f;
+                vertex.uv[1] = 0.5f - corner[1];
+                std::memcpy(vertex.tint, quad.tint, sizeof(vertex.tint));
+                vertices.push_back(vertex);
             }
-            vertex.uv[0] = corner[0] + 0.5f;
-            vertex.uv[1] = 0.5f - corner[1];
-            std::memcpy(vertex.tint, quad.tint, sizeof(vertex.tint));
-            vertices.push_back(vertex);
         }
     }
     const VkDeviceSize bytes = vertices.size() * sizeof(OverlayVertex);
@@ -624,6 +646,7 @@ Status OverlayRenderer::set_quads(std::vector<OverlayQuad> quads) {
                                        vertices.data());
     if (!buffer.ok()) {
         quads_.clear();
+        tv_quads_.clear();
         return Status::error(buffer.message());
     }
     vertices_ = buffer.take();
@@ -632,7 +655,19 @@ Status OverlayRenderer::set_quads(std::vector<OverlayQuad> quads) {
 
 void OverlayRenderer::record(VkCommandBuffer command_buffer, const OverlayCamera& camera,
                              bool srgb_target) {
-    if (quads_.empty() || vertices_.buffer == VK_NULL_HANDLE) return;
+    record_range(command_buffer, camera, srgb_target, quads_, 0);
+}
+
+void OverlayRenderer::record_tv(VkCommandBuffer command_buffer, const OverlayCamera& camera,
+                                bool srgb_target) {
+    record_range(command_buffer, camera, srgb_target, tv_quads_, quads_.size());
+}
+
+// Draws `list`, whose first quad is quad number `first` in the vertex buffer.
+void OverlayRenderer::record_range(VkCommandBuffer command_buffer, const OverlayCamera& camera,
+                                   bool srgb_target, const std::vector<OverlayQuad>& list,
+                                   size_t first) {
+    if (list.empty() || vertices_.buffer == VK_NULL_HANDLE) return;
     const bool alt = alt_format_ != target_format_ && srgb_target != is_srgb_format(target_format_);
     const VkPipeline mask_pipeline = alt ? pipeline_alt_ : pipeline_;
     const VkPipeline rgba_pipeline = alt ? rgba_pipeline_alt_ : rgba_pipeline_;
@@ -664,8 +699,8 @@ void OverlayRenderer::record(VkCommandBuffer command_buffer, const OverlayCamera
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(push), &push);
     VkPipeline bound = mask_pipeline;
-    for (size_t i = 0; i < quads_.size(); ++i) {
-        const Texture& texture = textures_[quads_[i].texture];
+    for (size_t i = 0; i < list.size(); ++i) {
+        const Texture& texture = textures_[list[i].texture];
         // An RGBA panel texture draws its own colours; an R8 mask is tinted.
         const VkPipeline wanted =
             texture.format == VK_FORMAT_R8G8B8A8_SRGB ? rgba_pipeline : mask_pipeline;
@@ -675,7 +710,7 @@ void OverlayRenderer::record(VkCommandBuffer command_buffer, const OverlayCamera
         }
         vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
                                 0, 1, &texture.set, 0, nullptr);
-        vkCmdDraw(command_buffer, 6, 1, static_cast<uint32_t>(6 * i), 0);
+        vkCmdDraw(command_buffer, 6, 1, static_cast<uint32_t>(6 * (first + i)), 0);
     }
 }
 

@@ -291,7 +291,7 @@ UiRuntime make_ui_runtime(const Options& options) {
         runtime.jobs = build_job_setup(splat::Path(data_path("state")),
                                        splat::Path(options.scenes_dir),
                                        splat::Path(data_path("models")),
-                                       *runtime.model_setup);
+                                       *runtime.model_setup, runtime.services.locations);
         if (runtime.jobs != nullptr) runtime.services.jobs = runtime.jobs->service.get();
         splat::CaptureService::Options capture_options;
         capture_options.helper_dir = splat::Path(data_path("helper"));
