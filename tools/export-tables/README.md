@@ -41,10 +41,28 @@ copied from its generated headers, so keep the two in step if either changes.
 | Library | Firmware | Serves | Anchor |
 | --- | --- | --- | --- |
 | `libSceHmd2` | 1360 | 13.20, 13.60 | `Not Initialized` @ `0x7c686` |
+| `libSceHmd2` | 1240 | 12.20, 12.40; playback can become choppy after a few seconds | `Not Initialized` @ `0x7c67e` |
+| `libSceHmd2` | 1160 | 11.60 | `Not Initialized` @ `0x136ab2` |
+| `libSceHmd2` | 1000 | 10.00, 10.01, 10.20, 10.40, 10.60 | `Not Initialized` @ `0x136686` |
+| `libSceHmd2` | 900 | 9.00 | `Not Initialized` @ `0x13b4e2` |
+| `libSceHmd2` | 840 | 8.40 | `warped depth mip chain R` @ `0x13ae30` |
 | `libSceHmd2` | 761 | 7.20, 7.61 | `Awarped depth mip chain R` @ `0x1306c3` |
+| `libSceHmd2` | 550 | 5.50 | `SceHmd2ImageMutex` @ `0x11685e` |
 | `libSceVrTracker2` | 1360 | 13.20, 13.40, 13.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x1225e5` |
+| `libSceVrTracker2` | 1240 | 12.20, 12.40 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x1232e5` |
+| `libSceVrTracker2` | 1160 | 11.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x11ae8d` |
+| `libSceVrTracker2` | 1000 | 10.00, 10.01, 10.20, 10.40, 10.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x11aa7d` |
+| `libSceVrTracker2` | 900 | 9.00 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x115a3d` |
+| `libSceVrTracker2` | 840 | 8.40 | `SceVrtMtxDepthMapWork` @ `0x115421` |
 | `libSceVrTracker2` | 761 | 7.20, 7.61 | `SceVrtMtxDepthMapWork` @ `0x116779` |
+| `libSceVrTracker2` | 550 | 5.50 | `SCALEDPOTHOLE-THRESHOLD` @ `0xf8361` |
 | `libSceVrHand` | 1360 | 12.20 and later | `handPose_%02d` @ `0xb84e0` |
+| `libSceVrHand` | 1240 | 12.20, 12.40 | `handPose_%02d` @ `0xb8600` |
+
+Tested on a console by PS5VR: 13.60 and 12.40. The other tables were checked against that
+firmware's libraries, not run. 9.00 comes from Ghost-VR only; every other added firmware
+agrees between PS5VR and Ghost-VR. 12.40 playback can become choppy after a few seconds.
+libSceVrHand has no table below 12.20 (it takes other parameters there).
 
 Only the exports C7 calls are listed; PS5VR's tables carry more (mirroring, eye
 tracking, vibration, the camera opens). Add a name to `tables.json` and

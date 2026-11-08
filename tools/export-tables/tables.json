@@ -11,8 +11,13 @@
     "library's read-only segment, so a table can never be applied to a build it",
     "was not generated from.",
     "Source: PS5VR app/src/vr_exports_1360.h and vr_exports_761.h (GPL-3.0,",
-    "see platform/ps5/hmd2/NOTICE). 7.61 and 7.20 ship the same libraries, so",
-    "the 761 table serves both."
+    "Source: PS5VR app/src/vr_exports_*.h (GPL-3.0, see platform/ps5/hmd2/NOTICE);",
+    "9.00 only from Ghost-VR's vr_exports.h (theghostonline, GPL-3.0), which also",
+    "agrees with PS5VR on every other firmware here. 13.60 and 12.40 were run on a",
+    "console by PS5VR; the other tables were checked against that firmware's",
+    "libraries, not run. 7.61 and 7.20 ship the same libraries, so the 761 table",
+    "serves both. VrHand has a table for 12.20 and later only: below that it takes",
+    "other parameters."
   ],
   "libraries": {
     "libSceHmd2": {
@@ -47,6 +52,156 @@
             "sceHmd2ReprojectionSetMirroringOption": 139968
           }
         },
+        "1240": {
+          "covers": "12.20, 12.40; playback can become choppy after a few seconds",
+          "anchor": {
+            "va": 509566,
+            "text": "Not Initialized"
+          },
+          "exports": {
+            "sceHmd2Initialize": 172640,
+            "sceHmd2Terminate": 172800,
+            "sceHmd2Open": 172848,
+            "sceHmd2Close": 173264,
+            "sceHmd2GetDeviceInformation": 173952,
+            "sceHmd2GetFieldOfViewWithoutHandle": 161056,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 136304,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 136432,
+            "sceHmd2ReprojectionInitialize": 136624,
+            "sceHmd2ReprojectionTerminate": 137632,
+            "sceHmd2ReprojectionEnableVrMode": 137904,
+            "sceHmd2ReprojectionDisableVrMode": 138048,
+            "sceHmd2ReprojectionBeginFrame": 138368,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 138384,
+            "sceHmd2ReprojectionSetParam": 138432,
+            "sceHmd2ReprojectionSetRenderConfig": 138464,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 138592,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 138608,
+            "sceHmd2ReprojectionEnableMirroring": 138624,
+            "sceHmd2ReprojectionDisableMirroring": 138752,
+            "sceHmd2ReprojectionSetMirroringOption": 138864
+          }
+        },
+        "1160": {
+          "covers": "11.60",
+          "anchor": {
+            "va": 1272498,
+            "text": "Not Initialized"
+          },
+          "exports": {
+            "sceHmd2Initialize": 172224,
+            "sceHmd2Terminate": 172384,
+            "sceHmd2Open": 172432,
+            "sceHmd2Close": 172848,
+            "sceHmd2GetDeviceInformation": 173536,
+            "sceHmd2GetFieldOfViewWithoutHandle": 160608,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 136000,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 136128,
+            "sceHmd2ReprojectionInitialize": 136320,
+            "sceHmd2ReprojectionTerminate": 137328,
+            "sceHmd2ReprojectionEnableVrMode": 137600,
+            "sceHmd2ReprojectionDisableVrMode": 137744,
+            "sceHmd2ReprojectionBeginFrame": 138064,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 138080,
+            "sceHmd2ReprojectionSetParam": 138128,
+            "sceHmd2ReprojectionSetRenderConfig": 138160,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 138288,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 138304,
+            "sceHmd2ReprojectionEnableMirroring": 138320,
+            "sceHmd2ReprojectionDisableMirroring": 138448,
+            "sceHmd2ReprojectionSetMirroringOption": 138560
+          }
+        },
+        "1000": {
+          "covers": "10.00, 10.01, 10.20, 10.40, 10.60",
+          "anchor": {
+            "va": 1271430,
+            "text": "Not Initialized"
+          },
+          "exports": {
+            "sceHmd2Initialize": 171840,
+            "sceHmd2Terminate": 171984,
+            "sceHmd2Open": 172032,
+            "sceHmd2Close": 172448,
+            "sceHmd2GetDeviceInformation": 173136,
+            "sceHmd2GetFieldOfViewWithoutHandle": 160320,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 135840,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 135968,
+            "sceHmd2ReprojectionInitialize": 136128,
+            "sceHmd2ReprojectionTerminate": 137088,
+            "sceHmd2ReprojectionEnableVrMode": 137360,
+            "sceHmd2ReprojectionDisableVrMode": 137504,
+            "sceHmd2ReprojectionBeginFrame": 137840,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 137856,
+            "sceHmd2ReprojectionSetParam": 137904,
+            "sceHmd2ReprojectionSetRenderConfig": 137936,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 138064,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 138080,
+            "sceHmd2ReprojectionEnableMirroring": 138096,
+            "sceHmd2ReprojectionDisableMirroring": 138224,
+            "sceHmd2ReprojectionSetMirroringOption": 138336
+          }
+        },
+        "900": {
+          "covers": "9.00",
+          "anchor": {
+            "va": 1291490,
+            "text": "Not Initialized"
+          },
+          "exports": {
+            "sceHmd2Initialize": 172816,
+            "sceHmd2Terminate": 172960,
+            "sceHmd2Open": 173008,
+            "sceHmd2Close": 173424,
+            "sceHmd2GetDeviceInformation": 174112,
+            "sceHmd2GetFieldOfViewWithoutHandle": 161200,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 136608,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 136736,
+            "sceHmd2ReprojectionInitialize": 136896,
+            "sceHmd2ReprojectionTerminate": 137872,
+            "sceHmd2ReprojectionEnableVrMode": 138144,
+            "sceHmd2ReprojectionDisableVrMode": 138288,
+            "sceHmd2ReprojectionBeginFrame": 138624,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 138640,
+            "sceHmd2ReprojectionSetParam": 138688,
+            "sceHmd2ReprojectionSetRenderConfig": 138720,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 138848,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 138864,
+            "sceHmd2ReprojectionEnableMirroring": 138880,
+            "sceHmd2ReprojectionDisableMirroring": 139008,
+            "sceHmd2ReprojectionSetMirroringOption": 139120
+          }
+        },
+        "840": {
+          "covers": "8.40",
+          "anchor": {
+            "va": 1289776,
+            "text": "warped depth mip chain R"
+          },
+          "exports": {
+            "sceHmd2Initialize": 170544,
+            "sceHmd2Terminate": 170688,
+            "sceHmd2Open": 170736,
+            "sceHmd2Close": 171152,
+            "sceHmd2GetDeviceInformation": 171840,
+            "sceHmd2GetFieldOfViewWithoutHandle": 158976,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 135264,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 135392,
+            "sceHmd2ReprojectionInitialize": 135552,
+            "sceHmd2ReprojectionTerminate": 136512,
+            "sceHmd2ReprojectionEnableVrMode": 136784,
+            "sceHmd2ReprojectionDisableVrMode": 136928,
+            "sceHmd2ReprojectionBeginFrame": 137232,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 137248,
+            "sceHmd2ReprojectionSetParam": 137296,
+            "sceHmd2ReprojectionSetRenderConfig": 137328,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 137360,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 137376,
+            "sceHmd2ReprojectionEnableMirroring": 137392,
+            "sceHmd2ReprojectionDisableMirroring": 137520,
+            "sceHmd2ReprojectionSetMirroringOption": 137632
+          }
+        },
         "761": {
           "covers": "7.20, 7.61",
           "anchor": {
@@ -76,6 +231,36 @@
             "sceHmd2ReprojectionDisableMirroring": 127808,
             "sceHmd2ReprojectionSetMirroringOption": 127920
           }
+        },
+        "550": {
+          "covers": "5.50",
+          "anchor": {
+            "va": 1140830,
+            "text": "SceHmd2ImageMutex"
+          },
+          "exports": {
+            "sceHmd2Initialize": 114576,
+            "sceHmd2Terminate": 114720,
+            "sceHmd2Open": 114768,
+            "sceHmd2Close": 115088,
+            "sceHmd2GetDeviceInformation": 115632,
+            "sceHmd2GetFieldOfViewWithoutHandle": 103328,
+            "sceHmd2ReprojectionQueryBufferSizeAlign": 95920,
+            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 95952,
+            "sceHmd2ReprojectionInitialize": 96096,
+            "sceHmd2ReprojectionTerminate": 97040,
+            "sceHmd2ReprojectionEnableVrMode": 97312,
+            "sceHmd2ReprojectionDisableVrMode": 97456,
+            "sceHmd2ReprojectionBeginFrame": 97680,
+            "sceHmd2ReprojectionGetPredictedDisplayTime": 97696,
+            "sceHmd2ReprojectionSetParam": 97744,
+            "sceHmd2ReprojectionSetRenderConfig": 97776,
+            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 97808,
+            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 97824,
+            "sceHmd2ReprojectionEnableMirroring": 97840,
+            "sceHmd2ReprojectionDisableMirroring": 97968,
+            "sceHmd2ReprojectionSetMirroringOption": 98080
+          }
         }
       }
     },
@@ -96,6 +281,81 @@
             "sceVrTracker2GetResult": 10384
           }
         },
+        "1240": {
+          "covers": "12.20, 12.40",
+          "anchor": {
+            "va": 1192677,
+            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 560,
+            "sceVrTracker2Finalize": 4368,
+            "sceVrTracker2RegisterDevice": 4528,
+            "sceVrTracker2UnregisterDevice": 5024,
+            "sceVrTracker2GetResult": 10352
+          }
+        },
+        "1160": {
+          "covers": "11.60",
+          "anchor": {
+            "va": 1158797,
+            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 560,
+            "sceVrTracker2Finalize": 4352,
+            "sceVrTracker2RegisterDevice": 4512,
+            "sceVrTracker2UnregisterDevice": 5008,
+            "sceVrTracker2GetResult": 10336
+          }
+        },
+        "1000": {
+          "covers": "10.00, 10.01, 10.20, 10.40, 10.60",
+          "anchor": {
+            "va": 1157757,
+            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 560,
+            "sceVrTracker2Finalize": 4352,
+            "sceVrTracker2RegisterDevice": 4512,
+            "sceVrTracker2UnregisterDevice": 5024,
+            "sceVrTracker2GetResult": 10368
+          }
+        },
+        "900": {
+          "covers": "9.00",
+          "anchor": {
+            "va": 1137213,
+            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 544,
+            "sceVrTracker2Finalize": 4320,
+            "sceVrTracker2RegisterDevice": 4464,
+            "sceVrTracker2UnregisterDevice": 4992,
+            "sceVrTracker2GetResult": 10352
+          }
+        },
+        "840": {
+          "covers": "8.40",
+          "anchor": {
+            "va": 1135649,
+            "text": "SceVrtMtxDepthMapWork"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 544,
+            "sceVrTracker2Finalize": 4320,
+            "sceVrTracker2RegisterDevice": 4464,
+            "sceVrTracker2UnregisterDevice": 5008,
+            "sceVrTracker2GetResult": 10368
+          }
+        },
         "761": {
           "covers": "7.20, 7.61",
           "anchor": {
@@ -109,6 +369,21 @@
             "sceVrTracker2RegisterDevice": 3056,
             "sceVrTracker2UnregisterDevice": 3584,
             "sceVrTracker2GetResult": 8944
+          }
+        },
+        "550": {
+          "covers": "5.50",
+          "anchor": {
+            "va": 1016673,
+            "text": "SCALEDPOTHOLE-THRESHOLD"
+          },
+          "exports": {
+            "sceVrTracker2QueryMemory": 224,
+            "sceVrTracker2Initialize": 592,
+            "sceVrTracker2Finalize": 2832,
+            "sceVrTracker2RegisterDevice": 2976,
+            "sceVrTracker2UnregisterDevice": 3376,
+            "sceVrTracker2GetResult": 8832
           }
         }
       }
@@ -127,6 +402,20 @@
             "sceVrHandStart": 108368,
             "sceVrHandStop": 108224,
             "sceVrHandGetResult": 108960
+          }
+        },
+        "1240": {
+          "covers": "12.20, 12.40",
+          "anchor": {
+            "va": 755200,
+            "text": "handPose_%02d"
+          },
+          "exports": {
+            "sceVrHandInitialize": 103696,
+            "sceVrHandFinalize": 107152,
+            "sceVrHandStart": 107680,
+            "sceVrHandStop": 107536,
+            "sceVrHandGetResult": 108272
           }
         }
       }

@@ -29,6 +29,136 @@ static const export_sig_t kExports_libSceHmd2_1360[] = {
 };
 static const export_anchor_t kAnchor_libSceHmd2_1360 = {0x7c686u, "Not Initialized"};
 
+/* libSceHmd2 12.40 (12.20, 12.40; playback can become choppy after a few seconds) */
+static const export_sig_t kExports_libSceHmd2_1240[] = {
+    {"sceHmd2Initialize", 0x2a260u},
+    {"sceHmd2Terminate", 0x2a300u},
+    {"sceHmd2Open", 0x2a330u},
+    {"sceHmd2Close", 0x2a4d0u},
+    {"sceHmd2GetDeviceInformation", 0x2a780u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x27520u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x21470u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x214f0u},
+    {"sceHmd2ReprojectionInitialize", 0x215b0u},
+    {"sceHmd2ReprojectionTerminate", 0x219a0u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x21ab0u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x21b40u},
+    {"sceHmd2ReprojectionBeginFrame", 0x21c80u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x21c90u},
+    {"sceHmd2ReprojectionSetParam", 0x21cc0u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x21ce0u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x21d60u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x21d70u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x21d80u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x21e00u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x21e70u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_1240 = {0x7c67eu, "Not Initialized"};
+
+/* libSceHmd2 11.60 (11.60) */
+static const export_sig_t kExports_libSceHmd2_1160[] = {
+    {"sceHmd2Initialize", 0x2a0c0u},
+    {"sceHmd2Terminate", 0x2a160u},
+    {"sceHmd2Open", 0x2a190u},
+    {"sceHmd2Close", 0x2a330u},
+    {"sceHmd2GetDeviceInformation", 0x2a5e0u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x27360u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x21340u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x213c0u},
+    {"sceHmd2ReprojectionInitialize", 0x21480u},
+    {"sceHmd2ReprojectionTerminate", 0x21870u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x21980u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x21a10u},
+    {"sceHmd2ReprojectionBeginFrame", 0x21b50u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x21b60u},
+    {"sceHmd2ReprojectionSetParam", 0x21b90u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x21bb0u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x21c30u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x21c40u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x21c50u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x21cd0u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x21d40u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_1160 = {0x136ab2u, "Not Initialized"};
+
+/* libSceHmd2 10.00 (10.00, 10.01, 10.20, 10.40, 10.60) */
+static const export_sig_t kExports_libSceHmd2_1000[] = {
+    {"sceHmd2Initialize", 0x29f40u},
+    {"sceHmd2Terminate", 0x29fd0u},
+    {"sceHmd2Open", 0x2a000u},
+    {"sceHmd2Close", 0x2a1a0u},
+    {"sceHmd2GetDeviceInformation", 0x2a450u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x27240u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x212a0u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x21320u},
+    {"sceHmd2ReprojectionInitialize", 0x213c0u},
+    {"sceHmd2ReprojectionTerminate", 0x21780u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x21890u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x21920u},
+    {"sceHmd2ReprojectionBeginFrame", 0x21a70u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x21a80u},
+    {"sceHmd2ReprojectionSetParam", 0x21ab0u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x21ad0u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x21b50u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x21b60u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x21b70u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x21bf0u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x21c60u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_1000 = {0x136686u, "Not Initialized"};
+
+/* libSceHmd2 9.00 (9.00) */
+static const export_sig_t kExports_libSceHmd2_900[] = {
+    {"sceHmd2Initialize", 0x2a310u},
+    {"sceHmd2Terminate", 0x2a3a0u},
+    {"sceHmd2Open", 0x2a3d0u},
+    {"sceHmd2Close", 0x2a570u},
+    {"sceHmd2GetDeviceInformation", 0x2a820u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x275b0u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x215a0u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x21620u},
+    {"sceHmd2ReprojectionInitialize", 0x216c0u},
+    {"sceHmd2ReprojectionTerminate", 0x21a90u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x21ba0u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x21c30u},
+    {"sceHmd2ReprojectionBeginFrame", 0x21d80u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x21d90u},
+    {"sceHmd2ReprojectionSetParam", 0x21dc0u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x21de0u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x21e60u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x21e70u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x21e80u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x21f00u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x21f70u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_900 = {0x13b4e2u, "Not Initialized"};
+
+/* libSceHmd2 8.40 (8.40) */
+static const export_sig_t kExports_libSceHmd2_840[] = {
+    {"sceHmd2Initialize", 0x29a30u},
+    {"sceHmd2Terminate", 0x29ac0u},
+    {"sceHmd2Open", 0x29af0u},
+    {"sceHmd2Close", 0x29c90u},
+    {"sceHmd2GetDeviceInformation", 0x29f40u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x26d00u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x21060u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x210e0u},
+    {"sceHmd2ReprojectionInitialize", 0x21180u},
+    {"sceHmd2ReprojectionTerminate", 0x21540u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x21650u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x216e0u},
+    {"sceHmd2ReprojectionBeginFrame", 0x21810u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x21820u},
+    {"sceHmd2ReprojectionSetParam", 0x21850u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x21870u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x21890u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x218a0u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x218b0u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x21930u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x219a0u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_840 = {0x13ae30u, "warped depth mip chain R"};
+
 /* libSceHmd2 7.61 (7.20, 7.61) */
 static const export_sig_t kExports_libSceHmd2_761[] = {
     {"sceHmd2Initialize", 0x22f60u},
@@ -55,9 +185,41 @@ static const export_sig_t kExports_libSceHmd2_761[] = {
 };
 static const export_anchor_t kAnchor_libSceHmd2_761 = {0x1306c3u, "Awarped depth mip chain R"};
 
+/* libSceHmd2 5.50 (5.50) */
+static const export_sig_t kExports_libSceHmd2_550[] = {
+    {"sceHmd2Initialize", 0x1bf90u},
+    {"sceHmd2Terminate", 0x1c020u},
+    {"sceHmd2Open", 0x1c050u},
+    {"sceHmd2Close", 0x1c190u},
+    {"sceHmd2GetDeviceInformation", 0x1c3b0u},
+    {"sceHmd2GetFieldOfViewWithoutHandle", 0x193a0u},
+    {"sceHmd2ReprojectionQueryBufferSizeAlign", 0x176b0u},
+    {"sceHmd2ReprojectionQueryDisplayBufferSizeAlign", 0x176d0u},
+    {"sceHmd2ReprojectionInitialize", 0x17760u},
+    {"sceHmd2ReprojectionTerminate", 0x17b10u},
+    {"sceHmd2ReprojectionEnableVrMode", 0x17c20u},
+    {"sceHmd2ReprojectionDisableVrMode", 0x17cb0u},
+    {"sceHmd2ReprojectionBeginFrame", 0x17d90u},
+    {"sceHmd2ReprojectionGetPredictedDisplayTime", 0x17da0u},
+    {"sceHmd2ReprojectionSetParam", 0x17dd0u},
+    {"sceHmd2ReprojectionSetRenderConfig", 0x17df0u},
+    {"sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign", 0x17e10u},
+    {"sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign", 0x17e20u},
+    {"sceHmd2ReprojectionEnableMirroring", 0x17e30u},
+    {"sceHmd2ReprojectionDisableMirroring", 0x17eb0u},
+    {"sceHmd2ReprojectionSetMirroringOption", 0x17f20u},
+};
+static const export_anchor_t kAnchor_libSceHmd2_550 = {0x11685eu, "SceHmd2ImageMutex"};
+
 static const export_table_t kTables_libSceHmd2[] = {
     {1360, kExports_libSceHmd2_1360, sizeof kExports_libSceHmd2_1360 / sizeof *kExports_libSceHmd2_1360, &kAnchor_libSceHmd2_1360},
+    {1240, kExports_libSceHmd2_1240, sizeof kExports_libSceHmd2_1240 / sizeof *kExports_libSceHmd2_1240, &kAnchor_libSceHmd2_1240},
+    {1160, kExports_libSceHmd2_1160, sizeof kExports_libSceHmd2_1160 / sizeof *kExports_libSceHmd2_1160, &kAnchor_libSceHmd2_1160},
+    {1000, kExports_libSceHmd2_1000, sizeof kExports_libSceHmd2_1000 / sizeof *kExports_libSceHmd2_1000, &kAnchor_libSceHmd2_1000},
+    {900, kExports_libSceHmd2_900, sizeof kExports_libSceHmd2_900 / sizeof *kExports_libSceHmd2_900, &kAnchor_libSceHmd2_900},
+    {840, kExports_libSceHmd2_840, sizeof kExports_libSceHmd2_840 / sizeof *kExports_libSceHmd2_840, &kAnchor_libSceHmd2_840},
     {761, kExports_libSceHmd2_761, sizeof kExports_libSceHmd2_761 / sizeof *kExports_libSceHmd2_761, &kAnchor_libSceHmd2_761},
+    {550, kExports_libSceHmd2_550, sizeof kExports_libSceHmd2_550 / sizeof *kExports_libSceHmd2_550, &kAnchor_libSceHmd2_550},
 };
 
 /* libSceVrTracker2 13.60 (13.20, 13.40, 13.60) */
@@ -71,6 +233,61 @@ static const export_sig_t kExports_libSceVrTracker2_1360[] = {
 };
 static const export_anchor_t kAnchor_libSceVrTracker2_1360 = {0x1225e5u, "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"};
 
+/* libSceVrTracker2 12.40 (12.20, 12.40) */
+static const export_sig_t kExports_libSceVrTracker2_1240[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x230u},
+    {"sceVrTracker2Finalize", 0x1110u},
+    {"sceVrTracker2RegisterDevice", 0x11b0u},
+    {"sceVrTracker2UnregisterDevice", 0x13a0u},
+    {"sceVrTracker2GetResult", 0x2870u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_1240 = {0x1232e5u, "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"};
+
+/* libSceVrTracker2 11.60 (11.60) */
+static const export_sig_t kExports_libSceVrTracker2_1160[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x230u},
+    {"sceVrTracker2Finalize", 0x1100u},
+    {"sceVrTracker2RegisterDevice", 0x11a0u},
+    {"sceVrTracker2UnregisterDevice", 0x1390u},
+    {"sceVrTracker2GetResult", 0x2860u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_1160 = {0x11ae8du, "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"};
+
+/* libSceVrTracker2 10.00 (10.00, 10.01, 10.20, 10.40, 10.60) */
+static const export_sig_t kExports_libSceVrTracker2_1000[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x230u},
+    {"sceVrTracker2Finalize", 0x1100u},
+    {"sceVrTracker2RegisterDevice", 0x11a0u},
+    {"sceVrTracker2UnregisterDevice", 0x13a0u},
+    {"sceVrTracker2GetResult", 0x2880u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_1000 = {0x11aa7du, "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"};
+
+/* libSceVrTracker2 9.00 (9.00) */
+static const export_sig_t kExports_libSceVrTracker2_900[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x220u},
+    {"sceVrTracker2Finalize", 0x10e0u},
+    {"sceVrTracker2RegisterDevice", 0x1170u},
+    {"sceVrTracker2UnregisterDevice", 0x1380u},
+    {"sceVrTracker2GetResult", 0x2870u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_900 = {0x115a3du, "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"};
+
+/* libSceVrTracker2 8.40 (8.40) */
+static const export_sig_t kExports_libSceVrTracker2_840[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x220u},
+    {"sceVrTracker2Finalize", 0x10e0u},
+    {"sceVrTracker2RegisterDevice", 0x1170u},
+    {"sceVrTracker2UnregisterDevice", 0x1390u},
+    {"sceVrTracker2GetResult", 0x2880u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_840 = {0x115421u, "SceVrtMtxDepthMapWork"};
+
 /* libSceVrTracker2 7.61 (7.20, 7.61) */
 static const export_sig_t kExports_libSceVrTracker2_761[] = {
     {"sceVrTracker2QueryMemory", 0xe0u},
@@ -82,9 +299,26 @@ static const export_sig_t kExports_libSceVrTracker2_761[] = {
 };
 static const export_anchor_t kAnchor_libSceVrTracker2_761 = {0x116779u, "SceVrtMtxDepthMapWork"};
 
+/* libSceVrTracker2 5.50 (5.50) */
+static const export_sig_t kExports_libSceVrTracker2_550[] = {
+    {"sceVrTracker2QueryMemory", 0xe0u},
+    {"sceVrTracker2Initialize", 0x250u},
+    {"sceVrTracker2Finalize", 0xb10u},
+    {"sceVrTracker2RegisterDevice", 0xba0u},
+    {"sceVrTracker2UnregisterDevice", 0xd30u},
+    {"sceVrTracker2GetResult", 0x2280u},
+};
+static const export_anchor_t kAnchor_libSceVrTracker2_550 = {0xf8361u, "SCALEDPOTHOLE-THRESHOLD"};
+
 static const export_table_t kTables_libSceVrTracker2[] = {
     {1360, kExports_libSceVrTracker2_1360, sizeof kExports_libSceVrTracker2_1360 / sizeof *kExports_libSceVrTracker2_1360, &kAnchor_libSceVrTracker2_1360},
+    {1240, kExports_libSceVrTracker2_1240, sizeof kExports_libSceVrTracker2_1240 / sizeof *kExports_libSceVrTracker2_1240, &kAnchor_libSceVrTracker2_1240},
+    {1160, kExports_libSceVrTracker2_1160, sizeof kExports_libSceVrTracker2_1160 / sizeof *kExports_libSceVrTracker2_1160, &kAnchor_libSceVrTracker2_1160},
+    {1000, kExports_libSceVrTracker2_1000, sizeof kExports_libSceVrTracker2_1000 / sizeof *kExports_libSceVrTracker2_1000, &kAnchor_libSceVrTracker2_1000},
+    {900, kExports_libSceVrTracker2_900, sizeof kExports_libSceVrTracker2_900 / sizeof *kExports_libSceVrTracker2_900, &kAnchor_libSceVrTracker2_900},
+    {840, kExports_libSceVrTracker2_840, sizeof kExports_libSceVrTracker2_840 / sizeof *kExports_libSceVrTracker2_840, &kAnchor_libSceVrTracker2_840},
     {761, kExports_libSceVrTracker2_761, sizeof kExports_libSceVrTracker2_761 / sizeof *kExports_libSceVrTracker2_761, &kAnchor_libSceVrTracker2_761},
+    {550, kExports_libSceVrTracker2_550, sizeof kExports_libSceVrTracker2_550 / sizeof *kExports_libSceVrTracker2_550, &kAnchor_libSceVrTracker2_550},
 };
 
 /* libSceVrHand 13.60 (12.20 and later only; 10.x and 11.60 take other parameters) */
@@ -97,8 +331,19 @@ static const export_sig_t kExports_libSceVrHand_1360[] = {
 };
 static const export_anchor_t kAnchor_libSceVrHand_1360 = {0xb84e0u, "handPose_%02d"};
 
+/* libSceVrHand 12.40 (12.20, 12.40) */
+static const export_sig_t kExports_libSceVrHand_1240[] = {
+    {"sceVrHandInitialize", 0x19510u},
+    {"sceVrHandFinalize", 0x1a290u},
+    {"sceVrHandStart", 0x1a4a0u},
+    {"sceVrHandStop", 0x1a410u},
+    {"sceVrHandGetResult", 0x1a6f0u},
+};
+static const export_anchor_t kAnchor_libSceVrHand_1240 = {0xb8600u, "handPose_%02d"};
+
 static const export_table_t kTables_libSceVrHand[] = {
     {1360, kExports_libSceVrHand_1360, sizeof kExports_libSceVrHand_1360 / sizeof *kExports_libSceVrHand_1360, &kAnchor_libSceVrHand_1360},
+    {1240, kExports_libSceVrHand_1240, sizeof kExports_libSceVrHand_1240 / sizeof *kExports_libSceVrHand_1240, &kAnchor_libSceVrHand_1240},
 };
 
 #endif /* HMD2_EXPORTS_H */
