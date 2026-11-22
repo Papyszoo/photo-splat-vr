@@ -97,46 +97,9 @@ struct LayerSet {
 };
 
 // -- Hmd2 and VrTracker2, resolved at runtime -------------------------------
-#define HMD2_FUNCS(X)                                                                           \
-    X(int, sceHmd2Initialize, (const void *param))                                              \
-    X(int, sceHmd2Terminate, (void))                                                            \
-    X(int, sceHmd2Open, (int user_id, int type, int index, const void *param))                  \
-    X(int, sceHmd2Close, (int handle))                                                          \
-    X(int, sceHmd2GetDeviceInformation, (void *info))                                           \
-    X(int, sceHmd2GetFieldOfViewWithoutHandle, (void *fov))                                     \
-    X(SizeAlign, sceHmd2ReprojectionQueryBufferSizeAlign, (void))                                \
-    X(SizeAlign, sceHmd2ReprojectionQueryDisplayBufferSizeAlign, (void))                         \
-    X(int, sceHmd2ReprojectionInitialize, (const void *param, const void *reserved))            \
-    X(int, sceHmd2ReprojectionEnableVrMode, (uint64_t mode))                                    \
-    X(int, sceHmd2ReprojectionDisableVrMode, (void))                                            \
-    X(int, sceHmd2ReprojectionBeginFrame, (uint64_t frame))                                     \
-    X(int, sceHmd2ReprojectionGetPredictedDisplayTime, (uint64_t frame, uint64_t *time))        \
-    X(int, sceHmd2ReprojectionSetParam, (uint32_t buffer, uint64_t frame, const void *param,     \
-                                         const void *trace))                                   \
-    X(int, sceHmd2ReprojectionSetRenderConfig, (uint64_t half_rate, uint64_t r0, uint64_t r1))  \
-    X(int, sceHmd2ReprojectionTerminate, (void))
-// The TV mirror's five exports are optional: a library without them costs the
-// TV, not the VR session, so they are resolved (only when Config::mirror asks
-// for them) apart from the required slots above.
-#define HMD2_MIRROR_FUNCS(X)                                                                    \
-    X(SizeAlign, sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign, (void))                     \
-    X(SizeAlign, sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign, (void))                  \
-    X(int, sceHmd2ReprojectionSetMirroringOption, (const void *option))                          \
-    X(int, sceHmd2ReprojectionEnableMirroring, (const void *param))                              \
-    X(int, sceHmd2ReprojectionDisableMirroring, (void))
-#define VRTRACKER2_FUNCS(X)                                                                     \
-    X(int, sceVrTracker2QueryMemory, (const void *param, void *out))                            \
-    X(int, sceVrTracker2Initialize, (const void *param))                                        \
-    X(int, sceVrTracker2Finalize, (void))                                                       \
-    X(int, sceVrTracker2RegisterDevice, (int type, int handle))                                 \
-    X(int, sceVrTracker2UnregisterDevice, (int handle))                                         \
-    X(int, sceVrTracker2GetResult, (const void *param, void *result))
-#define VRHAND_FUNCS(X)                                                                         \
-    X(int, sceVrHandInitialize, (const void *param))                                            \
-    X(int, sceVrHandFinalize, (void))                                                           \
-    X(int, sceVrHandStart, (void))                                                              \
-    X(int, sceVrHandStop, (void))                                                               \
-    X(int, sceVrHandGetResult, (const void *param, void *result))
+// The export lists are hmd2_funcs.h's, so tests/hmd2_tables_test.cpp expands the
+// same names this file resolves.
+#include "hmd2_funcs.h"
 
 #define DECLARE_PTR(ret, name, args) ret (*name) args = nullptr;
 HMD2_FUNCS(DECLARE_PTR)
@@ -274,7 +237,7 @@ struct State {
     int errors = 0;
     uint64_t worn_checked = 0;
     DeviceState device = {0, true, 0};
-    Error error = {"", 0};
+    Error error = {"", 0, nullptr};
 
     // Pacing (HLA-PSVR2's rules): the previous BeginFrame and its predicted
     // display, the caller's measured work, and the frames Hmd2 has opened but
@@ -314,6 +277,7 @@ void logf(const char *fmt, ...) {
 bool fail(const char *step, int32_t rc) {
     s.error.step = step;
     s.error.rc = rc;
+    s.error.missing_table_library = nullptr;
     logf("hmd2: %s -> 0x%08x (failed)", step, (unsigned)rc);
     return false;
 }
@@ -408,8 +372,11 @@ bool anchor_matches(const ModuleInfo *info, uintptr_t base, const export_anchor_
 }
 
 // The table of the firmware whose anchor sits in this library, or nullptr.
+// `no_table` (optional) distinguishes "the library carries no table for this
+// build" from a missing module record: the viewer draws its unsupported-
+// firmware card for the former.
 const export_table_t *module_table(int handle, const char *file, const export_table_t *tables,
-                                size_t tables_n, uintptr_t *base) {
+                                size_t tables_n, uintptr_t *base, bool *no_table = nullptr) {
     ModuleInfo info;
     *base = module_base(handle, file, &info);
     if (*base == 0) {
@@ -425,16 +392,18 @@ const export_table_t *module_table(int handle, const char *file, const export_ta
     }
     logf("hmd2: %s: no export table for this firmware (base %p)", file,
          reinterpret_cast<void *>(*base));
+    if (no_table != nullptr) *no_table = true;
     return nullptr;
 }
 
 // sceKernelDlsym first; at the export offsets of the firmware's table when the
 // library does not export the name. `required` logs each missing export; an
 // optional call returns false quietly, so its caller logs one line instead of
-// one per missing export.
+// one per missing export. `no_table` is raised only when the failure is a
+// library with no matching export table (see module_table).
 bool resolve_module(int handle, const char *file, const Slot *slots, size_t n,
                     const export_table_t *tables, size_t tables_n, const char **failed_name,
-                    bool required = true) {
+                    bool required = true, bool *no_table = nullptr) {
     uintptr_t base = 0;
     const export_table_t *table = nullptr;
     bool tried_table = false;
@@ -443,7 +412,7 @@ bool resolve_module(int handle, const char *file, const Slot *slots, size_t n,
         if (sceKernelDlsym(handle, slots[i].name, slots[i].slot) == 0 && *slots[i].slot != nullptr)
             continue;
         if (!tried_table) {
-            table = module_table(handle, file, tables, tables_n, &base);
+            table = module_table(handle, file, tables, tables_n, &base, no_table);
             tried_table = true;
             if (table != nullptr && s.fw == 0)
                 s.fw = table->fw;
@@ -931,14 +900,14 @@ bool setup(const Config &config) {
     if (s.inited)
         return true;
     s.failed = false;
-    s.error = {"", 0};
+    s.error = {"", 0, nullptr};
     s.fw = 0;
     s.submits = 0;
     s.errors = 0;
     s.external = config.external != nullptr && config.external_count > 0;
     if (s.external) {
         if (config.external_count > kMaxBuffers) {
-            s.error = {"external eye buffers", -1};
+            s.error = {"external eye buffers", -1, nullptr};
             logf("hmd2: %d external eye buffers, at most %d", config.external_count, kMaxBuffers);
             return false;
         }
@@ -957,7 +926,7 @@ bool setup(const Config &config) {
                 ok = false;
         }
         if (!ok) {
-            s.error = {"external eye buffers (address or size)", -1};
+            s.error = {"external eye buffers (address or size)", -1, nullptr};
             logf("hmd2: external eye buffers need %ux%u RGBA8, 256-byte aligned, %zu bytes each",
                  2 * s.eye_w, s.eye_h, s.image_bytes);
             return false;
@@ -988,13 +957,16 @@ bool setup(const Config &config) {
     };
 
     const char *missing = nullptr;
+    bool no_table = false;
     int handle = load_sysmodule(kSysmoduleHmd2, "libSceHmd2");
     if (handle < 0 || !resolve_module(handle, "libSceHmd2.sprx", kHmd2Slots, kSlots(kHmd2Slots),
                                       kTables_libSceHmd2,
                                       sizeof kTables_libSceHmd2 / sizeof *kTables_libSceHmd2,
-                                      &missing)) {
-        s.error.step = missing != nullptr ? missing : "load libSceHmd2";
-        s.error.rc = handle < 0 ? handle : 0;    // the resolve log has the detail
+                                      &missing, true, &no_table)) {
+        // The viewer draws its unsupported-firmware card for a missing table;
+        // every other failure keeps the plain FAIL path.
+        s.error = {missing != nullptr ? missing : "load libSceHmd2",
+                   handle < 0 ? handle : 0, no_table ? "libSceHmd2" : nullptr};
         return abort_setup();
     }
     // The mirroring exports are optional: MIRROR=0 does not resolve them at
@@ -1012,13 +984,15 @@ bool setup(const Config &config) {
                  mirror_missing != nullptr ? mirror_missing : "the mirroring exports");
         }
     }
+    missing = nullptr;
+    no_table = false;
     handle = load_sysmodule(kSysmoduleVrTracker2, "libSceVrTracker2");
     if (handle < 0 || !resolve_module(handle, "libSceVrTracker2.sprx", kVrTracker2Slots,
                                       kSlots(kVrTracker2Slots), kTables_libSceVrTracker2,
                                       sizeof kTables_libSceVrTracker2 / sizeof *kTables_libSceVrTracker2,
-                                      &missing)) {
-        s.error.step = missing != nullptr ? missing : "load libSceVrTracker2";
-        s.error.rc = handle < 0 ? handle : 0;
+                                      &missing, true, &no_table)) {
+        s.error = {missing != nullptr ? missing : "load libSceVrTracker2",
+                   handle < 0 ? handle : 0, no_table ? "libSceVrTracker2" : nullptr};
         return abort_setup();
     }
 
@@ -1177,7 +1151,7 @@ bool setup(const Config &config) {
     s.submits = 0;
     s.errors = 0;
     s.frame_open = false;
-    s.error = {"", 0};
+    s.error = {"", 0, nullptr};
     s.failed = false;
     s.inited = true;
     s.active = true;
@@ -1221,7 +1195,7 @@ bool submit_flip(uint32_t buf, uint64_t frame, uint64_t display, const Pose &pos
             logf("hmd2: frame %llu SetParam 0x%08x SubmitFlip 0x%08x", (unsigned long long)frame,
                  (unsigned)r1, (unsigned)r2);
         s.error = {r1 != 0 ? "sceHmd2ReprojectionSetParam" : "sceVideoOutSubmitFlip",
-                   r1 != 0 ? r1 : r2};
+                   r1 != 0 ? r1 : r2, nullptr};
     }
     return r1 == 0 && r2 == 0;
 }
@@ -1302,7 +1276,7 @@ bool begin_frame() {
     if (rc != 0) {
         if (s.errors++ < 20)
             logf("hmd2: BeginFrame(%llu) -> 0x%08x", (unsigned long long)frame, (unsigned)rc);
-        s.error = {"sceHmd2ReprojectionBeginFrame", rc};
+        s.error = {"sceHmd2ReprojectionBeginFrame", rc, nullptr};
         return false;
     }
     s.frame = frame;

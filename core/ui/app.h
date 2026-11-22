@@ -87,6 +87,9 @@ public:
 private:
     Rect content_rect(uint32_t canvas_width, uint32_t canvas_height) const;
     void tick_services(double dt);
+    // True when the top screen draws the model rows: only then is the model
+    // service asked to re-read its state directory.
+    bool shows_models() const;
     void update_toast(double dt);
     void handle_navigation(const UiInput& input, UiInput& local);
     // One klog line per screen change and per toast: an unattended console run

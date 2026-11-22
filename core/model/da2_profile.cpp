@@ -143,11 +143,16 @@ Result<SafeTensorsHeader> read_header(const Path& path, const ConvertOptions& op
         return Result<SafeTensorsHeader>::failure(path.string() + ": no convertible tensors");
     }
 
-    // The digest is always computed: it goes into the GGUF metadata, and rule 2
-    // additionally requires it to match the pinned checkpoint.
-    const Result<std::string> digest = sha256_file(path);
-    if (!digest.ok()) return Result<SafeTensorsHeader>::failure(digest.message());
-    *source_sha256 = lowercase(digest.value());
+    // The digest is always part of the GGUF metadata, and rule 2 additionally
+    // requires it to match the pinned checkpoint. The manager passes the digest
+    // its hash-while-downloading produced; otherwise it is computed here.
+    *source_sha256 =
+        options.source_sha256.empty() ? std::string() : lowercase(options.source_sha256);
+    if (source_sha256->empty()) {
+        const Result<std::string> digest = sha256_file(path);
+        if (!digest.ok()) return Result<SafeTensorsHeader>::failure(digest.message());
+        *source_sha256 = lowercase(digest.value());
+    }
     if (options.verify_sha256 && *source_sha256 != kDepthAnythingV2SmallSha256) {
         return Result<SafeTensorsHeader>::failure(
             path.string() + ": SHA-256 " + *source_sha256 + " does not match the pinned " +

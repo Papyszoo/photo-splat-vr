@@ -32,6 +32,34 @@ bool starts_with(const std::string& text, const char* prefix) {
     return text.size() >= length && text.compare(0, length, prefix) == 0;
 }
 
+// The line shown while ModelService fetches the text on its worker.
+constexpr char kLicenceLoadingText[] = "Loading the licence text\xE2\x80\xA6";
+
+// The one place the three licence_text() results become screen state: a real
+// text (available, hashed), a message starting with kLicenceUnavailablePrefix,
+// or the fetch still running (kLicenceLoadingPrefix). The loading flag is set
+// here too, so the screen never has to recognise the loading line again.
+void apply_licence_text(const std::string& text, int width, int size,
+                        std::vector<std::string>* lines, std::string* digest, bool* available,
+                        bool* loading) {
+    *loading = starts_with(text, kLicenceLoadingPrefix);
+    if (*loading) {
+        *available = false;
+        digest->clear();
+        *lines = wrap_licence_text(kLicenceLoadingText, width, size);
+        return;
+    }
+    if (starts_with(text, kLicenceUnavailablePrefix)) {
+        *available = false;
+        digest->clear();
+        *lines = wrap_licence_text(text.substr(std::strlen(kLicenceUnavailablePrefix)), width, size);
+        return;
+    }
+    *available = true;
+    *digest = Sha256::of_hex(text.data(), text.size()).substr(0, 12);
+    *lines = wrap_licence_text(text, width, size);
+}
+
 }  // namespace
 
 std::vector<std::string> wrap_licence_text(const std::string& text, int width_px, int size) {
@@ -141,6 +169,7 @@ void LicenceScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
     digest_prefix_.clear();
     lines_.clear();
     text_available_ = false;
+    loading_ = false;
     scroll_ = 0;
 
     if (ctx.svc.models == nullptr) {
@@ -158,21 +187,15 @@ void LicenceScreen::on_enter(UiContext& ctx, const ScreenArgs& args) {
     }
 
     const std::string text = ctx.svc.models->licence_text(model_id_);
-    if (starts_with(text, kLicenceUnavailablePrefix)) {
-        const std::string reason =
-            text.substr(std::strlen(kLicenceUnavailablePrefix));
-        lines_ = wrap_licence_text(reason, text_width(ctx), text_size(ctx.theme));
-    } else {
-        text_available_ = true;
-        digest_prefix_ = Sha256::of_hex(text.data(), text.size()).substr(0, 12);
-        lines_ = wrap_licence_text(text, text_width(ctx), text_size(ctx.theme));
-    }
+    apply_licence_text(text, text_width(ctx), text_size(ctx.theme), &lines_, &digest_prefix_,
+                       &text_available_, &loading_);
     layout(ctx.content, ctx.theme);
 }
 
 void LicenceScreen::accept_and_download(UiContext& ctx) {
     if (!text_available_) {
-        ctx.toast("The licence text is not available; nothing was accepted");
+        ctx.toast(loading_ ? "The licence text is still loading"
+                           : "The licence text is not available; nothing was accepted");
         return;
     }
     const Status accepted = ctx.svc.models->accept(model_id_);
@@ -187,6 +210,20 @@ void LicenceScreen::accept_and_download(UiContext& ctx) {
 
 void LicenceScreen::update(UiContext& ctx, const UiInput& input) {
     layout(ctx.content, ctx.theme);
+
+    // The text is fetched on ModelService's worker, so this screen never waits
+    // for the network or for a wedged download's body read. Ask again each
+    // frame while the loading flag is set; a real text or an error then
+    // replaces it. An error stays until the screen is entered again.
+    if (loading_ && ctx.svc.models != nullptr) {
+        const std::string text = ctx.svc.models->licence_text(model_id_);
+        if (!starts_with(text, kLicenceLoadingPrefix)) {
+            apply_licence_text(text, text_width(ctx), text_size(ctx.theme), &lines_, &digest_prefix_,
+                               &text_available_, &loading_);
+            layout(ctx.content, ctx.theme);
+            ctx.invalidate();
+        }
+    }
 
     if ((input.pressed & Back) != 0) {
         // UiApp pops on Circle before the screen sees it; this keeps the screen

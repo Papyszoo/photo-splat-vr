@@ -9,8 +9,17 @@
 #include "common/path.h"
 #include "common/progress.h"
 #include "common/status.h"
+#include "model/sha256.h"
 
 namespace splat {
+
+// Why another thread called IHttpFetcher::abort(). Only the message a fetcher
+// returns for the interrupted transfer depends on it; the abort itself is the
+// same call.
+enum class FetchAbort {
+    cancelled,  // the user cancelled, or the title is shutting down
+    stalled,    // no byte moved for the manager's stall deadline
+};
 
 // C1 network seam. The model manager only needs three things from the network:
 // the size of a resource, a ranged GET streamed to a file, and a bounded text
@@ -52,10 +61,23 @@ struct FetchRequest {
     // `offset` and only ever increasing. The segmented download saves it as the
     // resume position, so an implementation must keep it exact. May be null.
     std::atomic<uint64_t>* written = nullptr;
+
+    // Hash while downloading (spec rule 2 without a second full read): the
+    // caller has already fed the `offset` bytes present in `destination` into
+    // this state, and the implementation feeds every body byte to it after the
+    // byte is in the file, in order. A fetcher that has to restart the file
+    // (server ignored the Range header) calls reset() before writing byte 0.
+    // Segment mode (end != 0) must not touch it: the segments write out of
+    // order, so the manager hashes that file once after the transfer. May be
+    // null. An implementation that does not feed it makes the manager's digest
+    // differ from the pin, which fails the download like a corrupt one.
+    Sha256* hash = nullptr;
 };
 
 // download() may be called from several threads at once (segment mode); head()
-// and get_text() must also stay usable while a download runs.
+// and get_text() must also stay usable while a download runs. The PS5 backend
+// makes them wait for the transfer's current body read, never for the whole
+// transfer (the setup lock is exclusive for setup/teardown, shared per read).
 class IHttpFetcher {
 public:
     virtual ~IHttpFetcher() = default;
@@ -72,6 +94,15 @@ public:
     // GET into memory, refusing responses larger than max_bytes. Used for
     // LICENSE_MODEL: the licence text is never bundled with the app.
     virtual Result<std::string> get_text(const std::string& url, size_t max_bytes) = 0;
+
+    // Stops every transfer running now, from another thread. It must return
+    // promptly and make a blocked call (a read that never returns) fail: the
+    // model service's stall watchdog and the title's shutdown call this while
+    // the transfer thread sits inside download()/head()/get_text(). A backend
+    // whose transfers already poll FetchRequest::cancelled can ignore it (the
+    // default); the console's sceHttp cannot, so Ps5HttpFetcher aborts its live
+    // request there.
+    virtual void abort(FetchAbort reason) { (void)reason; }
 
 protected:
     IHttpFetcher() = default;

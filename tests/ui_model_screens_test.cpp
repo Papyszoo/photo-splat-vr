@@ -17,6 +17,7 @@
 
 #include "model/sha256.h"
 #include "ui/fakes.h"
+#include "ui/model_service.h"
 #include "ui/screen_stack.h"
 #include "ui/screens/licence.h"
 #include "ui/screens/models.h"
@@ -26,6 +27,17 @@ namespace {
 using splat::FakeModelService;
 using splat::LicenceScreen;
 using splat::ModelsScreen;
+
+// A model service whose licence text is still loading: what the real
+// ModelService returns while its worker fetches the text.
+class PendingLicenceModels : public FakeModelService {
+public:
+    std::string licence_text(const std::string& id) override {
+        if (!ready) return std::string(splat::kLicenceLoadingPrefix) + "SHARP";
+        return FakeModelService::licence_text(id);
+    }
+    bool ready = false;
+};
 
 splat::UiInput press(uint32_t action) {
     splat::UiInput input;
@@ -130,6 +142,34 @@ TEST_CASE("ui_model_screens wraps licence text at the panel width") {
     CHECK(collapsed[0] == "a b c d");
     CHECK(splat::wrap_licence_text("", 600, kSize).size() == 1);
     CHECK(splat::wrap_licence_text("", 600, kSize)[0].empty());
+}
+
+TEST_CASE("ui_model_screens shows a loading licence and picks the text up") {
+    // Item 3: the render thread never waits for the licence fetch. A loading
+    // result draws a loading line, Cross says it is still loading, and the next
+    // update picks the text up without leaving the screen.
+    PendingLicenceModels models;
+    Fixture fixture;
+    fixture.services.models = &models;
+    LicenceScreen* screen = fixture.open_licence("sharp");
+    REQUIRE(screen != nullptr);
+    CHECK_FALSE(screen->text_available());
+    CHECK(screen->loading());
+    REQUIRE(screen->lines().size() == 1);
+    CHECK(screen->lines()[0].find("Loading") != std::string::npos);
+    CHECK(screen->digest_prefix().empty());
+
+    fixture.stack.update(fixture.context, press(splat::Select));
+    CHECK(fixture.toast.find("still loading") != std::string::npos);
+    CHECK(fixture.stack.size() == 1);  // still on the licence, nothing accepted
+    CHECK(models.selected().empty());
+
+    models.ready = true;
+    fixture.stack.update(fixture.context, press(0));
+    CHECK(screen->text_available());
+    CHECK_FALSE(screen->loading());
+    CHECK(screen->digest_prefix().size() == 12);
+    CHECK(screen->lines().size() > 1);
 }
 
 TEST_CASE("ui_model_screens pages and scrolls the licence text") {

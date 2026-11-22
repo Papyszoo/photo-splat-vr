@@ -23,7 +23,7 @@ all: $(LIB)
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
-hmd2.o: hmd2.cpp hmd2.h hmd2_exports.h
+hmd2.o: hmd2.cpp hmd2.h hmd2_exports.h hmd2_funcs.h
 	$(CXX) $(CXXFLAGS) -c -o $@ hmd2.cpp
 
 clean:

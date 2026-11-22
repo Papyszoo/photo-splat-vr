@@ -89,6 +89,44 @@ TEST_CASE("sha256_file streams a file and reports open failures") {
     CHECK_FALSE(missing.ok());
 }
 
+TEST_CASE("sha256_update_prefix hashes a resume's existing bytes, then the rest") {
+    // The hash-while-downloading resume: the prefix on disk is fed once, the
+    // transfer feeds the appended bytes. The result must equal one pass over
+    // the whole file, and the file must be verified just as strongly.
+    splat_test::TempDir temp("sha256-prefix");
+    const auto path = temp.path() / "part.bin";
+    std::string payload;
+    for (int i = 0; i < 3000; ++i) payload.push_back(static_cast<char>((i * 13) & 0xff));
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    }
+
+    for (uint64_t prefix : {uint64_t{0}, uint64_t{1}, uint64_t{64}, uint64_t{1200},
+                            static_cast<uint64_t>(payload.size())}) {
+        INFO("prefix " << prefix);
+        Sha256 hash;
+        const splat::Status fed = splat::sha256_update_prefix(path, prefix, hash, 97);
+        REQUIRE_MESSAGE(fed.ok(), fed.message());
+        hash.update(payload.data() + prefix, payload.size() - static_cast<size_t>(prefix));
+        CHECK(Sha256::hex(hash.finish()) == hex_of(payload));
+    }
+
+    // A resume that claims more bytes than the file holds is an error, not a
+    // silent short hash: the download then restarts instead of trusting it.
+    Sha256 short_hash;
+    const splat::Status short_fed = splat::sha256_update_prefix(path, 4000, short_hash);
+    CHECK_FALSE(short_fed.ok());
+    CHECK(short_fed.message().find("resume needs") != std::string::npos);
+
+    // reset() makes a restarted transfer hash from byte 0 again.
+    Sha256 reset_hash;
+    reset_hash.update(payload.data(), 100);
+    reset_hash.reset();
+    reset_hash.update(payload.data(), payload.size());
+    CHECK(Sha256::hex(reset_hash.finish()) == hex_of(payload));
+}
+
 TEST_CASE("the pinned checkpoint hash is a lowercase SHA-256") {
     const std::string pinned = splat::kSharpCheckpointSha256;
     CHECK(pinned.size() == 64);

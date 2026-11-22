@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace viewer {
@@ -28,6 +29,11 @@ struct VrOptions {
     // scene without the VR window or HUD there, plus the flat menu while it is
     // open (tv_output.h); a port that will not open falls back to the mirror.
     bool tv_output = true;
+    // kern.sdk_version as main.cpp logged it (0x0A010000 for 10.01); 0 when it
+    // could not be read. Only the "no export table" card's title uses it
+    // (firmware_message.h): the tables themselves are chosen by anchor, never
+    // by version.
+    uint32_t firmware = 0;
 };
 
 // Runs one VR session against the headset and returns the title's exit status:
@@ -43,10 +49,12 @@ struct VrOptions {
 // next one in the album, and when none reads the session takes that same
 // empty-view path; a scene that fails later leaves the previous view up.
 //
-// The session writes /data/ps5-splat-vr/logs/session-<UTC>.csv (one file per
+// The session can write /data/ps5-splat-vr/logs/session-<UTC>.csv (one file per
 // run, one row per submitted frame, flushed every second and size-capped) for
-// matching a recorded video; see docs/console-runbook.md, step 1d, for the
-// columns. A /data that refuses the write only costs that file.
+// matching a recorded video; viewer.env's POSE_LOG=1 turns it on, off is the
+// default (a per-frame /data write on the render thread). See
+// docs/console-runbook.md, step 1d, for the columns. A /data that refuses the
+// write only costs that file.
 //
 // The session does its own teardown on every path (the pads and the Sense
 // controllers closed, VR mode off, buffers unregistered, display/Hmd2/tracker

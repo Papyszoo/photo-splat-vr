@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.1
+
+### Fixed
+
+- SHARP model download on the console. 0.6.0's four ranged transfers wedged with nothing transferred; the console now asks with one plain GET (no Range header), 64 KiB reads and the 0.5.x sceHttp pools. The Models row no longer sits at 5%: a transfer that moves no byte for 60 s is aborted through `sceHttpAbortRequest` (the row shows Failed and Retry), Cancel ends it the same way, and Quit stops the model threads within 2 s instead of waiting on a fetcher call. The licence text is fetched on a worker, so the render thread never waits for the network or for the fetcher lock.
+- Quit. The TV worker is joined before Hmd2 shuts down and the main VideoOut port closes after VR mode is off, so the display changes mode once and Quit no longer waits ~15 s on the HDMI/HDCP transition.
+- SHARP gets ready faster. The checkpoint is hashed while downloading (no second 2.8 GB read to verify it), the converter reads the torch zip front to back in 1 MiB chunks, writes through a 1 MiB buffer with 64 MiB fsync batches and no longer rehashes the GGUF. The download, verify and convert phases log their time and MB/s.
+- The per-frame pose CSV is off unless `POSE_LOG=1` in `viewer.env`; a normal session makes no `/data` write on the render thread. The Models screen is the only trigger of the row refresh.
+- PSVR2 export tables for 5.50, 8.40, 10.00 (10.01), 11.60 and 12.40 from the PS5VR project (GPL-3.0), next to 7.61 and 13.60. A firmware whose libraries match no anchor gets a TV card that names the library and explains how to help add support, instead of a silent return to the home screen.
+
+### Changed
+
+- The version is 0.6.1 (`contentVersion` `01.006.001`).
+
 ## 0.6.0
 
 ### Added

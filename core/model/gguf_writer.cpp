@@ -1,10 +1,13 @@
 #include "model/gguf_writer.h"
 
+#include <cstdio>
 #include <cstring>
 #include <utility>
 
 #include "ggml.h"
 #include "gguf.h"
+
+#include "model/io_hint.h"
 
 namespace splat {
 namespace {
@@ -107,6 +110,14 @@ void GgufWriter::set_strings(const std::string& key, const std::vector<std::stri
 Status GgufWriter::open_file(const Path& path) {
     file_ = std::fopen(path.string().c_str(), "wb");
     if (file_ == nullptr) return Status::error("cannot open " + path.string() + " for writing");
+    // One write per MiB, plus the 64 MiB fsync/drop batches in write_raw().
+    stream_buffer_.assign(1u << 20, 0);
+    if (std::setvbuf(file_, stream_buffer_.data(), _IOFBF, stream_buffer_.size()) != 0) {
+        std::fclose(file_);
+        file_ = nullptr;
+        return Status::error("cannot buffer " + path.string());
+    }
+    unsynced_bytes_ = 0;
     return Status::success();
 }
 
@@ -116,6 +127,9 @@ Status GgufWriter::write_header() {
     if (!gguf_write_to_file_ptr(gguf_, file_, /*only_meta=*/true)) {
         return Status::error("cannot write the GGUF header");
     }
+    // The stream buffer holds ~1 MiB; flush before measuring so the data offset
+    // is a real file position in every libc's ftell.
+    if (std::fflush(file_) != 0) return Status::error("cannot flush the GGUF header");
     const long offset = std::ftell(file_);
     if (offset < 0) return Status::error("cannot determine the GGUF data offset");
     data_offset_ = static_cast<uint64_t>(offset);
@@ -128,6 +142,18 @@ Status GgufWriter::write_raw(const void* data, size_t size) {
     if (size == 0) return Status::success();
     if (std::fwrite(data, 1, size, file_) != size) return Status::error("short write to the GGUF file");
     bytes_written_ += size;
+    unsynced_bytes_ += size;
+    if (unsynced_bytes_ >= kCacheBatchBytes) {
+        // Bound the dirty pages of a 1.3 GB output: sync each 64 MiB batch and
+        // drop it from the page cache (io_hint.h). A failed flush or fsync is a
+        // failed conversion, like a short write: the bytes are not on the disk.
+        if (std::fflush(file_) != 0) return Status::error("cannot flush the GGUF file");
+        if (!splat::sync_and_drop(::fileno(file_), bytes_written_ - unsynced_bytes_,
+                                  unsynced_bytes_)) {
+            return Status::error("cannot sync the GGUF file to the disk");
+        }
+        unsynced_bytes_ = 0;
+    }
     return Status::success();
 }
 
@@ -205,8 +231,17 @@ Status GgufWriter::finish() {
                              " tensors");
     }
     const bool flushed = std::fflush(file_) == 0;
+    bool synced = true;
+    if (flushed && unsynced_bytes_ > 0) {
+        // The tail batch: put it on the disk and drop it as well. A failed fsync
+        // fails the conversion, as a failed write does.
+        synced = splat::sync_and_drop(::fileno(file_), bytes_written_ - unsynced_bytes_,
+                                      unsynced_bytes_);
+        unsynced_bytes_ = 0;
+    }
     close();
     if (!flushed) return Status::error("cannot flush the GGUF file");
+    if (!synced) return Status::error("cannot sync the GGUF file to the disk");
     return Status::success();
 }
 
@@ -227,6 +262,7 @@ void GgufWriter::close() {
     tensor_open_ = false;
     tensor_bytes_ = 0;
     next_tensor_ = 0;
+    unsynced_bytes_ = 0;
 }
 
 size_t GgufWriter::tensor_count() const { return tensors_.size(); }

@@ -23,8 +23,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,12 +97,65 @@ public:
         return stats;
     }
 
-    // Joins the worker and gives the port back; safe to call twice and on any path.
-    void stop() {
+    // Presents one still RGBA frame (kTvWidth x kTvHeight, R, G, B, A bytes)
+    // and returns once the worker has flipped it: the "this firmware has no
+    // export table" card, which runs before a renderer exists and publishes
+    // nothing. `pixels` must stay valid until this returns. False means
+    // nothing was shown; `error` says why. Call it before the first publish().
+    bool present_still(const uint8_t* pixels, std::string& error) {
+        if (pixels == nullptr) {
+            error = "no pixels";
+            return false;
+        }
+        if (!running()) {
+            error = failed_ ? failure_ : "the TV output is not running";
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(still_mutex_);
+            if (still_waiting_) {
+                error = "a still frame is already being presented";
+                return false;
+            }
+            still_waiting_ = true;
+            still_pixels_ = pixels;
+            still_done_ = false;
+            still_ok_ = false;
+            still_error_.clear();
+        }
+        std::unique_lock<std::mutex> lock(still_mutex_);
+        if (!still_wake_.wait_for(lock, std::chrono::seconds(2),
+                                  [this] { return still_done_; })) {
+            lock.unlock();
+            // The worker may still be in the flip: stop and join it before the
+            // caller frees the pixels it was handed.
+            stop_worker();
+            lock.lock();
+            still_pixels_ = nullptr;
+            still_waiting_ = false;
+            error = "the TV worker did not present the still frame";
+            return false;
+        }
+        still_waiting_ = false;
+        error = still_error_;
+        return still_ok_;
+    }
+
+    // Joins the worker: no TV frame is presented after this returns. The port
+    // stays open with its last frame on screen. Teardown calls this before VR
+    // mode is turned off (no TV flip runs into that display transition) and
+    // stop() after it, so the main port is closed only once VR mode is off.
+    // Safe to call twice and without start().
+    void stop_worker() {
         stop_ = true;
         queue_.close();
         if (worker_.joinable()) worker_.join();
         running_ = false;
+    }
+
+    // Joins the worker and gives the port back; safe to call twice and on any path.
+    void stop() {
+        stop_worker();
         std::string problems;
         display_.close(&problems);
         if (!problems.empty()) line("viewer: vr tv output: closing the port: %s", problems.c_str());
@@ -123,6 +178,26 @@ private:
         int unconfirmed_in_a_row = 0;
         uint64_t unconfirmed_seen = display_.unconfirmed_flips();
         while (!stop_) {
+            // A still card handed over by present_still() (the start-up
+            // failure path) is presented once, before any slot frame.
+            const uint8_t* still = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(still_mutex_);
+                still = still_pixels_;
+                still_pixels_ = nullptr;   // one flip per handoff
+            }
+            if (still != nullptr) {
+                std::string still_error;
+                const bool ok = display_.present(still, &tile_ms, still_error, true);
+                {
+                    std::lock_guard<std::mutex> lock(still_mutex_);
+                    still_ok_ = ok;
+                    still_error_ = still_error;
+                    still_done_ = true;
+                }
+                still_wake_.notify_all();
+                continue;
+            }
             const int slot = queue_.take(std::chrono::milliseconds(100));
             if (slot < 0) continue;
             const uint8_t* pixels = pixels_ ? pixels_(slot) : nullptr;
@@ -174,6 +249,16 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> failed_{false};
     std::string failure_;   // written before failed_ is set, read after it is seen
+    // The still handoff (present_still): the worker takes the pointer, presents
+    // it once and marks it done. Only the start-up failure path uses it, before
+    // any publish().
+    std::mutex still_mutex_;
+    std::condition_variable still_wake_;
+    const uint8_t* still_pixels_ = nullptr;
+    bool still_waiting_ = false;
+    bool still_done_ = false;
+    bool still_ok_ = false;
+    std::string still_error_;
     std::atomic<uint64_t> presents_{0};
     std::atomic<uint64_t> errors_{0};
     std::atomic<uint64_t> tile_us_sum_{0};

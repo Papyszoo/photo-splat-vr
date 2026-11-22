@@ -29,8 +29,10 @@ int sceHttpTerm(int httpCtxId);
 int sceHttpCreateTemplate(int httpCtxId, const char* userAgent, int httpVer, int autoProxyConf);
 int sceHttpDeleteTemplate(int tmplId);
 int sceHttpSetResponseHeaderMaxSize(int id, size_t headerSize);
-// id is a template, connection or request id. In the stub, never called by
-// ProsperoMgr; the console probe showed 262144 accepted.
+// id is a template, connection or request id. In the stub. The fetcher no
+// longer calls it: sceHttp's own receive block is what moved the 2.8 GB
+// download on this console (see the kChunkBytes comment in
+// ps5_http_fetcher.cpp). The bench probe can still force a block size.
 int sceHttpSetRecvBlockSize(int id, unsigned int blockSize);
 int sceHttpSetAutoRedirect(int id, int enable);
 int sceHttpSetResolveTimeOut(int id, unsigned int usec);
@@ -47,5 +49,9 @@ int sceHttpGetStatusCode(int reqId, int* statusCode);
 int sceHttpGetResponseContentLength(int reqId, int* contentLengthType, uint64_t* contentLength);
 int sceHttpReadData(int reqId, void* data, size_t size);
 int sceHttpGetAllResponseHeaders(int reqId, char** header, size_t* headerSize);
+// Aborts the transfer of a request from any thread: a sceHttpReadData blocked
+// inside the call returns an error. Exported by libSceHttp (ref/sdk/sce_stubs/
+// libSceHttp.c); ShadowMountPlus calls it with this signature on the console.
+int sceHttpAbortRequest(int reqId);
 
 }  // extern "C"

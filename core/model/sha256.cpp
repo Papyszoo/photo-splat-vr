@@ -92,6 +92,13 @@ void Sha256::update(const void* data, size_t size) {
     }
 }
 
+void Sha256::reset() {
+    state_ = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+              0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    block_len_ = 0;
+    bit_count_ = 0;
+}
+
 std::array<uint8_t, Sha256::kDigestBytes> Sha256::finish() {
     // Append 0x80, pad with zeros to 56 bytes mod 64, then the bit count.
     const uint64_t bits = bit_count_;
@@ -159,6 +166,38 @@ Result<std::string> sha256_file(const Path& path, size_t chunk_bytes) {
     std::fclose(file);
     if (!error.empty()) return Result<std::string>::failure(std::move(error));
     return Result<std::string>::success(Sha256::hex(hash.finish()));
+}
+
+Status sha256_update_prefix(const Path& path, uint64_t bytes, Sha256& hash, size_t chunk_bytes) {
+    if (chunk_bytes == 0) chunk_bytes = 1u << 20;
+    if (bytes == 0) return Status::success();
+
+    std::FILE* file = std::fopen(path.string().c_str(), "rb");
+    if (file == nullptr) return Status::error("cannot open " + path.string());
+
+    std::vector<uint8_t> buffer(chunk_bytes);
+    std::string error;
+    uint64_t left = bytes;
+    while (left > 0) {
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(left, buffer.size()));
+        const size_t got = std::fread(buffer.data(), 1, want, file);
+        if (got > 0) {
+            hash.update(buffer.data(), got);
+            left -= got;
+        }
+        if (got < want) {
+            if (std::ferror(file) != 0) {
+                error = "read error in " + path.string();
+            } else {
+                error = path.string() + " holds " + std::to_string(bytes - left) + " of the " +
+                        std::to_string(bytes) + " bytes the resume needs";
+            }
+            break;
+        }
+    }
+    std::fclose(file);
+    if (!error.empty()) return Status::error(std::move(error));
+    return Status::success();
 }
 
 }  // namespace splat

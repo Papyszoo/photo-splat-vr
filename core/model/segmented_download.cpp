@@ -166,6 +166,10 @@ Status download_segmented(const SegmentedDownload& job) {
     }
     const std::vector<DownloadSegment>& segments = job.segments;
     const size_t count = segments.size();
+    if (job.transferred != nullptr) {
+        // Resumed bytes count as progress from the first poll.
+        job.transferred->store(segments_done(segments), std::memory_order_relaxed);
+    }
 
     std::error_code error;
     const Path parent = job.part.parent_path();
@@ -202,6 +206,14 @@ Status download_segmented(const SegmentedDownload& job) {
     std::atomic<bool> stop{false};
     std::mutex mutex;
     std::condition_variable wake;
+    // The start gate: at most `limit` transfers inside the fetcher at once, and
+    // with one at a time the segments start in index order (`ticket`/`turn`),
+    // so the .part grows front to back instead of in four far-apart places.
+    std::condition_variable start;
+    const size_t limit = job.max_in_flight > 0 ? static_cast<size_t>(job.max_in_flight) : count;
+    size_t active = 0;       // transfers inside the fetcher now (guarded by mutex)
+    size_t turn = 0;         // limit == 1: the ticket allowed to start (guarded by mutex)
+    size_t next_ticket = 0;  // assigned here, in index order
     size_t running = 0;  // guarded by mutex
     Status first_error;  // guarded by mutex
     for (const DownloadSegment& segment : segments) {
@@ -211,32 +223,56 @@ Status download_segmented(const SegmentedDownload& job) {
     std::vector<std::thread> threads;
     for (size_t index = 0; index < count; ++index) {
         if (segments[index].done >= segments[index].end - segments[index].begin) continue;
-        threads.emplace_back([&, index] {
+        const size_t ticket = next_ticket++;
+        threads.emplace_back([&, index, ticket] {
             const DownloadSegment& segment = segments[index];
-            FetchRequest request;
-            request.url = job.url;
-            request.destination = job.part;
-            request.offset = segment.begin + segment.done;
-            request.end = segment.end;
-            request.total_bytes = segment.end - segment.begin;
-            request.written = &written[index];
-            request.cancelled = [&stop] { return stop.load(std::memory_order_relaxed); };
+            // Wait for a free slot; a cancel or a sibling's failure releases the
+            // wait so no thread sits behind a turn that will never come.
+            bool taken = false;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                start.wait(lock, [&] {
+                    return stop.load(std::memory_order_relaxed) ||
+                           (active < limit && (limit > 1 || turn == ticket));
+                });
+                if (!stop.load(std::memory_order_relaxed)) {
+                    ++active;
+                    taken = true;
+                }
+            }
 
-            Status status = job.fetcher->download(request);
-            const uint64_t wanted = segment.end - request.offset;
-            if (status.ok() && written[index].load() != wanted) {
-                status = Status::error(job.url + ": a segment ended after " +
-                                       std::to_string(written[index].load()) + " of " +
-                                       std::to_string(wanted) + " bytes");
+            // A thread that never got its turn reports the cancel: a sibling's
+            // own cause already sits in first_error and is the one returned.
+            Status status = Status::error("download cancelled");
+            if (taken) {
+                FetchRequest request;
+                request.url = job.url;
+                request.destination = job.part;
+                request.offset = segment.begin + segment.done;
+                request.end = segment.end;
+                request.total_bytes = segment.end - segment.begin;
+                request.written = &written[index];
+                request.cancelled = [&stop] { return stop.load(std::memory_order_relaxed); };
+
+                status = job.fetcher->download(request);
+                const uint64_t wanted = segment.end - request.offset;
+                if (status.ok() && written[index].load() != wanted) {
+                    status = Status::error(job.url + ": a segment ended after " +
+                                           std::to_string(written[index].load()) + " of " +
+                                           std::to_string(wanted) + " bytes");
+                }
             }
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                if (taken) --active;
+                if (limit == 1) ++turn;
                 if (!status.ok()) {
                     if (first_error.ok()) first_error = status;
                     stop.store(true);  // after the cause is recorded: siblings only echo "cancelled"
                 }
                 --running;
             }
+            start.notify_all();
             wake.notify_all();
         });
     }
@@ -244,10 +280,16 @@ Status download_segmented(const SegmentedDownload& job) {
     uint64_t saved_done = segments_done(segments);
     Clock::time_point last_saved = Clock::now();
     for (;;) {
-        if (!stop.load() && job.cancelled && job.cancelled()) stop.store(true);
+        if (!stop.load() && job.cancelled && job.cancelled()) {
+            stop.store(true);
+            start.notify_all();  // a thread waiting for its turn must not wait for a turn that never comes
+        }
 
         const std::vector<DownloadSegment> now = snapshot();
         const uint64_t done = segments_done(now);
+        if (job.transferred != nullptr) {
+            job.transferred->store(done, std::memory_order_relaxed);
+        }
         if (job.progress != nullptr) {
             job.progress->report(
                 static_cast<float>(static_cast<double>(done) / static_cast<double>(job.total)),
@@ -266,6 +308,9 @@ Status download_segmented(const SegmentedDownload& job) {
     for (std::thread& thread : threads) thread.join();
 
     const std::vector<DownloadSegment> final_segments = snapshot();
+    if (job.transferred != nullptr) {
+        job.transferred->store(segments_done(final_segments), std::memory_order_relaxed);
+    }
     bool complete = true;
     for (const DownloadSegment& segment : final_segments) {
         if (segment.done != segment.end - segment.begin) complete = false;

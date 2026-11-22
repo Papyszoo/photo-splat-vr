@@ -20,6 +20,10 @@ public:
     Sha256();
 
     void update(const void* data, size_t size);
+    // Back to the empty-input state. The download path calls it when a server
+    // ignores the Range header and the fetcher restarts the file at byte 0:
+    // the prefix the caller already fed no longer belongs to the file.
+    void reset();
     // Finishes the hash. Only call once, and do not update() afterwards.
     std::array<uint8_t, kDigestBytes> finish();
 
@@ -39,5 +43,12 @@ private:
 
 // Streams the file in 1 MiB chunks. Returns the lowercase hex digest.
 Result<std::string> sha256_file(const Path& path, size_t chunk_bytes = 1u << 20);
+
+// Feeds the first `bytes` bytes of `path` into `hash`, in 1 MiB chunks, and
+// leaves the rest of the file unread. The resume half of hash-while-downloading
+// (model_manager.cpp): the prefix already on disk is hashed once, then the
+// transfer feeds the bytes it appends, so the file is read once in total.
+Status sha256_update_prefix(const Path& path, uint64_t bytes, Sha256& hash,
+                            size_t chunk_bytes = 1u << 20);
 
 }  // namespace splat

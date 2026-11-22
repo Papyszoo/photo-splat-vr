@@ -2,18 +2,43 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <vector>
 
 #include "common/half.h"
 #include "model/gguf_writer.h"
+#include "model/io_hint.h"
 #include "model/sha256.h"
 
 namespace splat {
 namespace {
 
 constexpr char kTorchPrefix[] = "monodepth_model.monodepth_predictor.";
+
+// The converter's progress line cadence (issue-1-crash sharp-slow-report.md
+// §5): one line per ~5 s of tensor I/O, plus one at the end.
+constexpr std::chrono::milliseconds kLogInterval{5000};
+
+std::string gigabyte_text(uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.2f GB", static_cast<double>(bytes) / 1e9);
+    return text;
+}
+
+std::string rate_text(uint64_t bytes, double seconds) {
+    char text[32];
+    if (seconds <= 0.0) return "? MB/s";
+    std::snprintf(text, sizeof(text), "%.1f MB/s", static_cast<double>(bytes) / seconds / 1e6);
+    return text;
+}
+
+std::string seconds_text(double seconds) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f", seconds);
+    return text;
+}
 
 // The two timm ImageNet classifier heads the reference never calls: TimmViT
 // overrides forward and stops at the pre-logits features
@@ -171,11 +196,19 @@ Result<ConvertStats> convert_checkpoint(const Path& in, const Path& out, const C
     if (file_error) return Result<ConvertStats>::failure("cannot stat " + in.string() + ": " + file_error.message());
     stats.source_bytes = source_bytes;
 
-    // The digest is always computed: it goes into the GGUF metadata. Rule 2
-    // additionally requires it to match the pinned checkpoint.
-    const Result<std::string> digest = sha256_file(in);
-    if (!digest.ok()) return Result<ConvertStats>::failure(digest.message());
-    stats.source_sha256 = lowercase(digest.value());
+    // The digest is always part of the GGUF metadata, and with verify_sha256 it
+    // has to match the pinned checkpoint (spec rule 2). A caller that just
+    // hashed the file (the manager's hash-while-downloading) hands it in, so the
+    // 2.8 GB checkpoint is not read a second time (converter.cpp's old :176
+    // pass).
+    std::string digest =
+        options.source_sha256.empty() ? std::string() : lowercase(options.source_sha256);
+    if (digest.empty()) {
+        const Result<std::string> hashed = sha256_file(in);
+        if (!hashed.ok()) return Result<ConvertStats>::failure(hashed.message());
+        digest = lowercase(hashed.value());
+    }
+    stats.source_sha256 = digest;
     if (options.verify_sha256 && stats.source_sha256 != kSharpCheckpointSha256) {
         return Result<ConvertStats>::failure(
             in.string() + ": SHA-256 " + stats.source_sha256 + " does not match the pinned " +
@@ -207,17 +240,29 @@ Result<ConvertStats> convert_checkpoint(const Path& in, const Path& out, const C
                                                  std::to_string(tensor.record.shape.size()) +
                                                  "; GGUF converts ranks 1..4");
         }
-        GgufTensorDesc description;
-        description.name = gguf_tensor_name(tensor.record.name);
-        description.shape = tensor.record.shape;
-        description.fp16 = !options.keep_fp32 && tensor.record.shape.size() >= 2;
-        descriptions.push_back(std::move(description));
-        full_names.push_back(tensor.record.name);
         kept.push_back(&tensor);
         stats.source_tensor_bytes += tensor.record.numel() * 4;
     }
 
     if (kept.empty()) return Result<ConvertStats>::failure("checkpoint has no convertible tensors");
+
+    // File order, not state-dict order: the GGUF tensor order is free (every
+    // reader looks a tensor up by name), while the checkpoint is then one
+    // forward sweep instead of 91 jumps across 2.8 GB. This is the read side of
+    // runs/issue-1-crash/sharp-slow-report.md §1.4; the output's tensor order is
+    // the documented, intended difference from 0.6.0.
+    std::sort(kept.begin(), kept.end(), [](const CheckpointTensor* a, const CheckpointTensor* b) {
+        return a->zip_offset < b->zip_offset;
+    });
+
+    for (const CheckpointTensor* tensor : kept) {
+        GgufTensorDesc description;
+        description.name = gguf_tensor_name(tensor->record.name);
+        description.shape = tensor->record.shape;
+        description.fp16 = !options.keep_fp32 && tensor->record.shape.size() >= 2;
+        descriptions.push_back(std::move(description));
+        full_names.push_back(tensor->record.name);
+    }
 
     GgufWriter writer;
     Status status = writer.begin(out, std::move(descriptions));
@@ -255,6 +300,14 @@ Result<ConvertStats> convert_checkpoint(const Path& in, const Path& out, const C
     stats.data_offset = writer.data_offset();
 
     const size_t total = kept.size();
+    const auto log_line = options.log;
+    auto last_log = started;
+    uint64_t tensors_read_bytes = 0;  // checkpoint bytes the loop has consumed
+    // Page-cache batches of the read side (io_hint.h): the tensor data now
+    // arrives in file order, so a 64 MiB window of it is dropped behind the
+    // read head instead of competing with the renderer for memory.
+    uint64_t drop_from = 0;
+    uint64_t pending_drop = 0;
     for (size_t i = 0; i < total; ++i) {
         const CheckpointTensor& tensor = *kept[i];
         const bool fp16 = !options.keep_fp32 && tensor.record.shape.size() >= 2;
@@ -286,7 +339,32 @@ Result<ConvertStats> convert_checkpoint(const Path& in, const Path& out, const C
         }
         progress.report(0.1f + 0.9f * static_cast<float>(i + 1) / static_cast<float>(total),
                         "converting tensors");
+
+        const uint64_t tensor_bytes = tensor.record.numel() * 4;
+        tensors_read_bytes += tensor_bytes;
+        if (pending_drop == 0) drop_from = tensor.zip_offset;
+        pending_drop += tensor_bytes;
+        if (pending_drop >= kCacheBatchBytes) {
+            drop_file_cache(in, drop_from, pending_drop);
+            pending_drop = 0;
+        }
+
+        if (log_line) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_log >= kLogInterval || i + 1 == total) {
+                const double elapsed = std::chrono::duration<double>(now - started).count();
+                log_line("converter: " + std::to_string(i + 1) + "/" + std::to_string(total) +
+                         " tensors, " + gigabyte_text(tensors_read_bytes) + " read, " +
+                         gigabyte_text(writer.bytes_written() - stats.data_offset) +
+                         " written, " + seconds_text(elapsed) + " s (" +
+                         rate_text(tensors_read_bytes, elapsed) + " read, " +
+                         rate_text(writer.bytes_written() - stats.data_offset, elapsed) +
+                         " write)");
+                last_log = now;
+            }
+        }
     }
+    if (pending_drop > 0) drop_file_cache(in, drop_from, pending_drop);
 
     status = writer.finish();
     if (!status.ok()) return Result<ConvertStats>::failure(status.message());

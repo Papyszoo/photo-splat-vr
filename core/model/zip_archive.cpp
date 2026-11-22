@@ -1,7 +1,13 @@
 #include "model/zip_archive.h"
 
+#include <sys/types.h>
+
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 extern "C" {
 #include "miniz/miniz.h"
@@ -10,6 +16,23 @@ extern "C" {
 
 namespace splat {
 namespace {
+
+// A stored entry is read from the raw file, not through miniz's 64 KiB extract
+// buffer: the checkpoint's tensors are 2.6 GB of method-0 entries and the
+// console's per-call cost is what the slow conversion was made of
+// (runs/issue-1-crash/sharp-slow-report.md §1.4).
+constexpr size_t kStoredReadBytes = 1u << 20;
+constexpr uint32_t kLocalHeaderSignature = 0x04034b50u;
+constexpr size_t kLocalHeaderBytes = 30;
+
+uint32_t little_u16(const uint8_t* bytes) {
+    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8);
+}
+
+uint32_t little_u32(const uint8_t* bytes) {
+    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+}
 
 // Callback state for mz_zip_reader_extract_to_callback. miniz calls this with
 // monotonically increasing offsets; we forward the chunks to the caller's sink.
@@ -35,6 +58,7 @@ size_t sink_callback(void* opaque, mz_uint64 file_ofs, const void* buffer, size_
 
 struct ZipArchive::Impl {
     mz_zip_archive archive{};
+    std::FILE* raw = nullptr;  // the same file, for the stored-entry fast path
     std::vector<ZipEntryInfo> entries;
     bool zip64 = false;
     bool open = false;
@@ -59,6 +83,11 @@ Status ZipArchive::open(const Path& path) {
     }
     impl_->open = true;
     impl_->zip64 = mz_zip_is_zip64(&impl_->archive) != 0;
+    impl_->raw = std::fopen(path.string().c_str(), "rb");
+    if (impl_->raw == nullptr) {
+        close();
+        return Status::error("cannot open " + path.string() + " for reading");
+    }
 
     const mz_uint count = mz_zip_reader_get_num_files(&impl_->archive);
     impl_->entries.reserve(count);
@@ -73,12 +102,18 @@ Status ZipArchive::open(const Path& path) {
         entry.uncompressed_bytes = stat.m_uncomp_size;
         entry.compressed_bytes = stat.m_comp_size;
         entry.method = stat.m_method;
+        entry.crc32 = stat.m_crc32;
+        entry.local_header_offset = stat.m_local_header_ofs;
         impl_->entries.push_back(std::move(entry));
     }
     return Status::success();
 }
 
 void ZipArchive::close() {
+    if (impl_ && impl_->raw != nullptr) {
+        std::fclose(impl_->raw);
+        impl_->raw = nullptr;
+    }
     if (impl_ && impl_->open) {
         mz_zip_reader_end(&impl_->archive);
         impl_->open = false;
@@ -138,6 +173,7 @@ Status ZipArchive::stream_entry(const ZipEntryInfo& entry, const ZipSink& sink) 
 
     const int index = find(entry.name);
     if (index < 0) return Status::error("no zip entry " + entry.name);
+    if (entry.method == 0) return stream_stored(entry, sink);
 
     SinkContext context;
     context.sink = &sink;
@@ -152,6 +188,63 @@ Status ZipArchive::stream_entry(const ZipEntryInfo& entry, const ZipSink& sink) 
         return Status::error("zip entry " + entry.name + " yielded " +
                              std::to_string(context.bytes) + " of " +
                              std::to_string(entry.uncompressed_bytes) + " bytes");
+    }
+    return Status::success();
+}
+
+Status ZipArchive::stream_stored(const ZipEntryInfo& entry, const ZipSink& sink) {
+    if (impl_->raw == nullptr) return Status::error("zip archive is not open");
+
+    uint8_t header[kLocalHeaderBytes] = {};
+    if (::fseeko(impl_->raw, static_cast<off_t>(entry.local_header_offset), SEEK_SET) != 0 ||
+        std::fread(header, 1, sizeof(header), impl_->raw) != sizeof(header)) {
+        return Status::error("cannot read the local header of " + entry.name + " in " +
+                             impl_->path.string());
+    }
+    if (little_u32(header) != kLocalHeaderSignature) {
+        return Status::error("zip entry " + entry.name + " has no local header");
+    }
+    if ((little_u16(header + 6) & 1u) != 0) {
+        return Status::error("zip entry " + entry.name + " is encrypted");
+    }
+    const uint32_t name_len = little_u16(header + 26);
+    const uint32_t extra_len = little_u16(header + 28);
+    if (name_len > 4096) return Status::error("zip entry " + entry.name + " has a corrupt name length");
+    std::string local_name(name_len, '\0');
+    if (name_len > 0 &&
+        std::fread(local_name.data(), 1, name_len, impl_->raw) != name_len) {
+        return Status::error("cannot read the local name of " + entry.name);
+    }
+    if (local_name != entry.name) {
+        return Status::error("zip entry " + entry.name + " has the local name '" + local_name + "'");
+    }
+
+    const uint64_t data_offset = entry.local_header_offset + kLocalHeaderBytes + name_len + extra_len;
+    if (::fseeko(impl_->raw, static_cast<off_t>(data_offset), SEEK_SET) != 0) {
+        return Status::error("cannot seek to the data of " + entry.name);
+    }
+
+    std::vector<uint8_t> buffer;
+    buffer.reserve(static_cast<size_t>(std::min<uint64_t>(kStoredReadBytes, entry.uncompressed_bytes)));
+    uint64_t offset = 0;
+    mz_ulong crc = MZ_CRC32_INIT;
+    while (offset < entry.uncompressed_bytes) {
+        const size_t want = static_cast<size_t>(
+            std::min<uint64_t>(kStoredReadBytes, entry.uncompressed_bytes - offset));
+        buffer.resize(want);
+        if (std::fread(buffer.data(), 1, want, impl_->raw) != want) {
+            return Status::error("zip entry " + entry.name + " ended after " +
+                                 std::to_string(offset) + " of " +
+                                 std::to_string(entry.uncompressed_bytes) + " bytes");
+        }
+        crc = mz_crc32(crc, buffer.data(), want);
+        if (!sink(offset, buffer.data(), want)) {
+            return Status::error("zip entry sink refused data at offset " + std::to_string(offset));
+        }
+        offset += want;
+    }
+    if (static_cast<uint32_t>(crc) != entry.crc32) {
+        return Status::error("zip entry " + entry.name + " failed its CRC check");
     }
     return Status::success();
 }

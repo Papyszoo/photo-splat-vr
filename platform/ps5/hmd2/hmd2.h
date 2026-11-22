@@ -128,6 +128,11 @@ struct DeviceState {
 struct Error {
     const char *step;  // "" when nothing failed
     int32_t rc;
+    // The library whose export table did not match this firmware, when that is
+    // why the step failed: "libSceHmd2" or "libSceVrTracker2". Null for every
+    // other failure, including a table that matched but lacked a name. The
+    // viewer shows its "not supported on this firmware" card when this is set.
+    const char *missing_table_library;
 };
 
 // Per-frame averages of the pacing since the last take_pace(), in
@@ -243,7 +248,7 @@ int frame_errors();
 int repeated_frames();        // abandoned frames re-shown with the last image
 int queue_full_waits();       // BeginFrame retries because Hmd2's queue was full
 int missed_frames();          // display times skipped, from the predicted-time step
-int firmware_table();         // 1360/761 when a table bound the modules, 0 if dlsym did
+int firmware_table();         // the table's fw tag (e.g. 1360, 1000) when one bound the modules, 0 if dlsym did
 // The user the Hmd2 session was opened for: Config::user_id, or the console's
 // first logged-in user (pick_user), after init(). 0xff when none was reported.
 // A title that opens the DualSense with scePadOpen needs the same id.

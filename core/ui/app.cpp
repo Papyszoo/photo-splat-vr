@@ -76,9 +76,23 @@ void UiApp::start() {
 void UiApp::tick_services(double dt) {
     if (dt <= 0.0) return;
     if (services_.jobs != nullptr) services_.jobs->tick(dt);
-    if (services_.models != nullptr) services_.models->tick(dt);
+    // The model rows are a disk snapshot: only a screen that shows them asks the
+    // worker side to re-read the state directory (the external-change watch).
+    // Every other screen - and a VR session with the panel closed - makes no
+    // /data call for the models at all (issue-1-crash sharp-fast-verify.md
+    // section 4.3a).
+    if (services_.models != nullptr && shows_models()) services_.models->tick(dt);
     if (services_.captures != nullptr) services_.captures->tick(dt);
     if (services_.locations != nullptr) services_.locations->tick(dt);
+}
+
+bool UiApp::shows_models() const {
+    // Only the Models screen draws and acts on the rows (the licence screen
+    // pops back to it before a download starts, and Settings/Convert read the
+    // snapshot once). Ticking it anywhere else would put a 2/s status rebuild
+    // on /data while the user converts, which is the disk the conversion is
+    // writing (issue-1-crash sharp-fast-verify.md section 4.3a).
+    return !nav_.empty() && nav_.top_id() == ScreenId::Models;
 }
 
 void UiApp::update_toast(double dt) {

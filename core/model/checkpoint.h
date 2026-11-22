@@ -26,6 +26,10 @@ inline constexpr uint64_t kSharpCheckpointTensorBytes = 2809220676ull;
 struct CheckpointTensor {
     TensorRecord record;
     std::string zip_name;  // "<prefix>/data/<storage key>"
+    // Offset of this entry's local header in the file. Sorting the kept tensors
+    // by it is the file order, which is what lets the converter read the
+    // checkpoint once, start to end.
+    uint64_t zip_offset = 0;
 };
 
 struct Checkpoint {

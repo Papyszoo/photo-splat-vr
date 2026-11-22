@@ -9,6 +9,18 @@
 // resume state are here, so the Mac tests cover them and every fetcher gets the
 // speed-up.
 //
+// How many segments run at once is the caller's call (SegmentedDownload::
+// max_in_flight). The probe that justified four connections started them behind
+// one gate: every request was created and sent first, and only then did the four
+// bodies read together. Console sceHttp is not documented as reentrant, and
+// ProsperoMgr - the reference client - holds one lock across a whole transfer.
+// The console's first real four-way download wedged with nothing transferred;
+// the frame loop was delayed at the same time. That the four concurrent
+// transfers caused both is the leading hypothesis, not a measured fact (the
+// klog has no marker for the HEAD-to-body transition: runs/issue-1-crash/
+// sharp-dl-verify.md section 1.3). The console therefore asks for one transfer
+// at a time until the gated create/read split is proven there.
+//
 // Resume state is `<part>.segments`, a small JSON file next to the .part:
 //
 //   {"version":1,"total":2809738232,"segments":[[begin,end,done],...]}
@@ -22,6 +34,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -83,12 +96,27 @@ struct SegmentedDownload {
     // Polled from the calling thread; true stops every segment. The .part and
     // its segments file stay for a later resume.
     std::function<bool()> cancelled;
+    // Bytes of the whole file known to be in the .part (resumed bytes included),
+    // stored from the calling thread's poll loop and at the end. The caller's
+    // stall watchdog reads it; a transfer that stops moving is aborted there.
+    // May be null.
+    std::atomic<uint64_t>* transferred = nullptr;
+    // How many segments may be inside the fetcher at the same time. 0 starts
+    // every unfinished segment together (the 0.6.0 behaviour); 1 is the one
+    // discipline console sceHttp is proven with - ProsperoMgr holds a single
+    // lock across each whole transfer, and a body read must never overlap
+    // another request's create or delete (see ps5_http_fetcher.cpp's note on
+    // the lock). With 1 the segments also start in index order, so the .part is
+    // written front to back. A test seam and a console setting, not a guess:
+    // 4 at once is kept for fetchers that have proven it.
+    int max_in_flight = 0;
 };
 
-// Runs every unfinished segment on its own thread and returns when all have
-// finished or stopped. Success means every byte of [0, total) is in the .part;
-// the segments file is gone then. A failure or a cancel stops all segments and
-// leaves .part + segments file for a resume.
+// Runs every unfinished segment on its own thread, at most
+// `job.max_in_flight` of them inside the fetcher at once, and returns when all
+// have finished or stopped. Success means every byte of [0, total) is in the
+// .part; the segments file is gone then. A failure or a cancel stops all
+// segments and leaves .part + segments file for a resume.
 Status download_segmented(const SegmentedDownload& job);
 
 }  // namespace splat

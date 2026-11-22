@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,6 +82,8 @@ bool contains(const std::string& text, const std::string& needle) {
 
 // In-memory fetcher. block_after > 0 stops the transfer after that many bytes
 // until release is set (progress test) or a cancel arrives (cancel test).
+// abort() is the model service's stall watchdog reaching a blocked transfer, as
+// the console's sceHttp fetch does it: the reason decides the message.
 class MemoryFetcher final : public IHttpFetcher {
 public:
     std::map<std::string, std::string> files;
@@ -89,7 +92,37 @@ public:
     std::atomic<uint64_t> block_after{0};
     std::atomic<bool> release{false};
     std::atomic<bool> blocked{false};
+    // A blocked transfer that keeps reporting the bytes it already has, like the
+    // segmented download's 100 ms poll: the stall line is read from exactly
+    // that (ui_model_service logs it).
+    bool report_while_blocked = false;
     std::atomic<int> head_calls{0};
+    std::atomic<int> abort_calls{0};
+    std::atomic<int> abort_reason{0};  // int(FetchAbort) + 1, 0 before any abort
+    // Who ran abort(): never the render thread. Atomic because the watchdog can
+    // still be writing it when the test reads it (a delayed abort after the
+    // transfer stopped), and a plain id there is a data race.
+    std::atomic<std::thread::id> abort_thread{};
+    std::atomic<bool> aborted{false};
+    // False: abort() records the call but does not end a blocked transfer, like
+    // a console sceHttp call that ignores sceHttpAbortRequest and whose reading
+    // thread never returns to poll `cancelled`.
+    bool honor_abort = true;
+    bool honor_cancel = true;
+    // The licence fetch: block on the worker until released, so the test can see
+    // that the caller of licence_text() never waits for it.
+    std::atomic<bool> block_text{false};
+    std::atomic<bool> text_blocked{false};
+    std::atomic<bool> release_text{false};
+
+    void abort(splat::FetchAbort reason) override {
+        abort_thread.store(std::this_thread::get_id());
+        ++abort_calls;
+        abort_reason.store(static_cast<int>(reason) + 1);
+        if (!honor_abort) return;
+        aborted.store(true);
+        release.store(true);  // wake the blocked loop like sceHttpAbortRequest does
+    }
 
     Result<HttpResource> head(const std::string& url) override {
         ++head_calls;
@@ -102,6 +135,8 @@ public:
     }
 
     Status download(const FetchRequest& request) override {
+        aborted.store(false);
+        abort_reason.store(0);
         const auto found = files.find(request.url);
         if (found == files.end()) return Status::error("no such url: " + request.url);
         const std::string& payload = found->second;
@@ -116,7 +151,11 @@ public:
         constexpr size_t kChunk = 256;
         uint64_t written = 0;
         for (size_t at = static_cast<size_t>(request.offset); at < payload.size(); at += kChunk) {
-            if (request.cancelled && request.cancelled()) {
+            if (aborted.load()) {
+                std::fclose(file);
+                return abort_status();
+            }
+            if (honor_cancel && request.cancelled && request.cancelled()) {
                 std::fclose(file);
                 return Status::error("download cancelled");
             }
@@ -125,7 +164,9 @@ public:
                 std::fclose(file);
                 return Status::error("write failed");
             }
+            if (request.hash != nullptr) request.hash->update(payload.data() + at, take);
             written += take;
+            if (request.written != nullptr) request.written->store(written);
             if (request.progress != nullptr && request.total_bytes > 0) {
                 request.progress->report(static_cast<float>(
                                              static_cast<double>(request.offset + written) /
@@ -136,11 +177,28 @@ public:
             if (limit > 0 && request.offset + written >= limit) {
                 blocked.store(true);
                 while (!release.load()) {
-                    if (request.cancelled && request.cancelled()) {
+                    if (aborted.load()) {
+                        std::fclose(file);
+                        return abort_status();
+                    }
+                    if (honor_cancel && request.cancelled && request.cancelled()) {
                         std::fclose(file);
                         return Status::error("download cancelled");
                     }
+                    // The bytes did not move; the progress sink still hears from
+                    // the transfer, as the segmented download's poll does.
+                    if (report_while_blocked && request.progress != nullptr &&
+                        request.total_bytes > 0) {
+                        request.progress->report(
+                            static_cast<float>(static_cast<double>(request.offset + written) /
+                                               static_cast<double>(request.total_bytes)),
+                            "downloading");
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                if (aborted.load()) {
+                    std::fclose(file);
+                    return abort_status();
                 }
                 block_after.store(0);
             }
@@ -151,8 +209,23 @@ public:
 
     Result<std::string> get_text(const std::string& url, size_t max_bytes) override {
         if (url != licence_url) return Result<std::string>::failure("no such url: " + url);
+        if (block_text.load()) {
+            text_blocked.store(true);
+            while (block_text.load() && !release_text.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            text_blocked.store(false);
+        }
         if (licence.size() > max_bytes) return Result<std::string>::failure("too large");
         return Result<std::string>::success(licence);
+    }
+
+private:
+    Status abort_status() const {
+        if (abort_reason.load() == static_cast<int>(splat::FetchAbort::stalled) + 1) {
+            return Status::error("the transfer stopped making progress and was aborted");
+        }
+        return Status::error("download cancelled");
     }
 };
 
@@ -183,9 +256,8 @@ Result<ConvertStats> write_fake_gguf(const ModelBackendSpec& spec, const Path& o
 }
 
 ModelManagerOptions::Converter fake_converter() {
-    return [](const ModelBackendSpec& spec, const Path&, const Path& out, Progress& progress) {
-        return write_fake_gguf(spec, out, progress);
-    };
+    return [](const ModelBackendSpec& spec, const Path&, const Path& out, const std::string&,
+              Progress& progress) { return write_fake_gguf(spec, out, progress); };
 }
 
 ModelBackendSpec test_spec(const std::string& name, const std::string& payload) {
@@ -240,6 +312,22 @@ const splat::ModelView* find_view(const std::vector<splat::ModelView>& views,
         if (view.id == id) return &view;
     }
     return nullptr;
+}
+
+// licence_text() starts the fetch on ModelService's worker and reports loading
+// until it arrives; waits for the final text (or the failure message).
+std::string wait_for_licence(ModelService& service, const std::string& id, double seconds = 10.0) {
+    std::string text;
+    const bool done = wait_until([&] {
+        text = service.licence_text(id);
+        return text.rfind(splat::kLicenceLoadingPrefix, 0) != 0;
+    }, seconds);
+    REQUIRE_MESSAGE(done, "the licence fetch did not finish: " << text);
+    return text;
+}
+
+double seconds_since(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 }
 
 }  // namespace
@@ -303,6 +391,70 @@ TEST_CASE("ui_model_service lists the pinned models in order") {
     CHECK(service.selected().empty());
 }
 
+TEST_CASE("ui_model_service list() is a cached snapshot, not a state-directory read") {
+    // The render thread's list() must not open, stat or parse anything: the
+    // SHARP slow report's §3.3 measured ~40 /data calls per frame from this
+    // path, and each cost tens of ms at the page-cache wall.
+    Fixture fixture;
+    const Path legacy_dir = fixture.temp.path() / "legacy-models";
+    std::filesystem::create_directories(legacy_dir);
+    const Path legacy = legacy_dir / "da2.gguf";
+    {
+        Progress progress;
+        const Result<ConvertStats> written =
+            write_fake_gguf(test_spec("da2", fixture.payload), legacy, progress);
+        REQUIRE_MESSAGE(written.ok(), written.message());
+    }
+    ModelServiceOptions options = fixture.options;
+    options.legacy_models_dir = legacy_dir;
+    options.cache_refresh_seconds = 3600.0;  // no worker refresh behind the test's back
+    ModelService service(fixture.manager, fixture.state, options);
+
+    std::vector<splat::ModelView> views = service.list();
+    const splat::ModelView* da2 = find_view(views, "da2");
+    REQUIRE(da2 != nullptr);
+    REQUIRE(da2->state == "ready");
+
+    // Remove every file that snapshot came from. list() still serves the
+    // snapshot (it lags until the worker refreshes), and it does not fail or
+    // block on the missing disk. A rebuild here would drop the legacy row.
+    std::filesystem::remove_all(fixture.temp.path());
+    service.tick(1.0);
+    views = service.list();
+    da2 = find_view(views, "da2");
+    REQUIRE(da2 != nullptr);
+    CHECK(da2->state == "ready");
+    CHECK(contains(da2->message, "models/da2.gguf"));
+}
+
+TEST_CASE("ui_model_service refreshes the row cache on the worker side") {
+    // The other half of the contract: the flag tick() sets is drained by the
+    // stall-watch thread, so an external change does become visible - without
+    // the render thread ever reading the state directory.
+    Fixture fixture;
+    const Path legacy_dir = fixture.temp.path() / "legacy-models";
+    std::filesystem::create_directories(legacy_dir);
+    const Path legacy = legacy_dir / "da2.gguf";
+    {
+        Progress progress;
+        REQUIRE_MESSAGE(write_fake_gguf(test_spec("da2", fixture.payload), legacy, progress).ok(),
+                        "gguf");
+    }
+    ModelServiceOptions options = fixture.options;
+    options.legacy_models_dir = legacy_dir;
+    options.cache_refresh_seconds = 0.0;
+    ModelService service(fixture.manager, fixture.state, options);
+    REQUIRE(find_view(service.list(), "da2")->state == "ready");
+
+    write_file(legacy, "not a gguf");
+    service.tick(0.3);
+    REQUIRE(wait_until([&] {
+        const std::vector<splat::ModelView> views = service.list();
+        const splat::ModelView* da2 = find_view(views, "da2");
+        return da2 != nullptr && da2->state != "ready";
+    }));
+}
+
 TEST_CASE("ui_model_service gates SHARP on the licence text shown") {
     Fixture fixture;
     ModelService service(fixture.manager, fixture.state, fixture.options);
@@ -315,7 +467,7 @@ TEST_CASE("ui_model_service gates SHARP on the licence text shown") {
 
     // Nothing can be accepted before its text was shown.
     CHECK_FALSE(service.accept("sharp").ok());
-    CHECK(service.licence_text("sharp") == fixture.fetcher.licence);
+    CHECK(wait_for_licence(service, "sharp") == fixture.fetcher.licence);
     CHECK(service.selected().empty());
 
     // Accepting an ungated model is refused.
@@ -347,7 +499,7 @@ TEST_CASE("ui_model_service gates SHARP on the licence text shown") {
     ModelServiceOptions offline_options;
     offline_options.state_dir = fixture.temp.path() / "offline";
     ModelService offline_service(manager, state, offline_options);
-    const std::string text = offline_service.licence_text("sharp");
+    const std::string text = wait_for_licence(offline_service, "sharp");
     CHECK(text.rfind(splat::kLicenceUnavailablePrefix, 0) == 0);
     CHECK(contains(text, "no HTTP fetcher"));
     CHECK_FALSE(offline_service.accept("sharp").ok());
@@ -387,6 +539,287 @@ TEST_CASE("ui_model_service publishes download progress from the worker") {
     CHECK_FALSE(service.downloading());
 }
 
+TEST_CASE("ui_model_service logs a download's start, stall and end") {
+    // The klog lines are the only way an unattended console run can tell "no
+    // bytes arrived" from "the panel did not repaint" (the 0.6.1 stall).
+    Fixture fixture;
+    std::mutex lines_mutex;
+    std::vector<std::string> lines;
+    fixture.options.log = [&](const std::string& text) {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        lines.push_back(text);
+    };
+    // Ten seconds per progress report: one line per report.
+    double now = 0.0;
+    fixture.options.clock = [&now] { return now += 10.0; };
+    ModelService service(fixture.manager, fixture.state, fixture.options);
+    fixture.fetcher.block_after.store(fixture.payload.size() / 4);
+    fixture.fetcher.report_while_blocked = true;
+
+    const auto copy_lines = [&] {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        return lines;
+    };
+
+    REQUIRE_MESSAGE(service.download("da2").ok(), "start");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+    REQUIRE(wait_until([&] {
+        for (const std::string& line : copy_lines()) {
+            if (line.find("no progress") != std::string::npos) return true;
+        }
+        return false;
+    }));
+    const std::vector<std::string> logged = copy_lines();
+    REQUIRE(logged.size() >= 2);
+    CHECK(logged[0].find("model download: da2 started") != std::string::npos);
+    CHECK(logged[1].find("model download: da2 ") != std::string::npos);
+    CHECK(logged[1].find("%") != std::string::npos);
+    // The blocked transfer keeps reporting the bytes it already has, and the
+    // line says the bytes did not move.
+    CHECK(logged.back().find("no progress") != std::string::npos);
+
+    fixture.fetcher.release.store(true);
+    service.wait_for_idle();
+    const std::vector<std::string> after = copy_lines();
+    REQUIRE_FALSE(after.empty());
+    CHECK(after.back().find("model download: da2 finished") != std::string::npos);
+}
+
+TEST_CASE("ui_model_service never says no progress while verifying or converting") {
+    // D3: only the transfer has bytes. Verify and convert report a fraction with
+    // the file already complete, and used to append ", no progress" - which a
+    // klog reads as a stalled transfer while the converter is working.
+    splat_test::TempDir temp("ui-model-convert-log");
+    const std::string payload = make_payload(4096);
+    MemoryFetcher fetcher;
+    fetcher.files[kPayloadUrl] = payload;
+
+    ModelManagerOptions manager_options;
+    manager_options.state_dir = temp.path();
+    manager_options.fetcher = &fetcher;
+    manager_options.specs = {test_spec("da2", payload)};
+    // A converter that reports like the real streaming one does while it works.
+    manager_options.converter = [](const ModelBackendSpec& spec, const Path&, const Path& out,
+                                   const std::string&, Progress& progress) {
+        for (int step = 1; step <= 4; ++step) {
+            progress.report(0.25f * static_cast<float>(step), "converting");
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return write_fake_gguf(spec, out, progress);
+    };
+    ModelManager manager(std::move(manager_options));
+
+    UiState state;
+    std::mutex lines_mutex;
+    std::vector<std::string> lines;
+    ModelServiceOptions options;
+    options.state_dir = temp.path();
+    options.log = [&](const std::string& text) {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        lines.push_back(text);
+    };
+    // Every progress report is ten seconds after the last, so each verify and
+    // convert report takes a log line.
+    double now = 0.0;
+    options.clock = [&now] { return now += 10.0; };
+    ModelService service(manager, state, options);
+
+    REQUIRE_MESSAGE(service.download("da2").ok(), "download");
+    service.wait_for_idle();
+
+    std::vector<std::string> copy;
+    {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        copy = lines;
+    }
+    REQUIRE_FALSE(copy.empty());
+    CHECK(copy.back().find("model download: da2 finished") != std::string::npos);
+    // The conversion's reports are in the log (a complete file), and none of
+    // them claims a stalled transfer.
+    bool converted_line = false;
+    for (const std::string& line : copy) {
+        CHECK_MESSAGE(line.find("no progress") == std::string::npos, line);
+        if (line.find("(4096 of 4096 bytes)") != std::string::npos) converted_line = true;
+    }
+    CHECK(converted_line);
+}
+
+TEST_CASE("ui_model_service aborts a transfer that stops moving") {
+    // D1: a transfer whose bytes stop moving is aborted from another thread (the
+    // transfer itself is blocked and cannot notice), and the row reaches Failed
+    // through the existing manager failure path, with the .part kept for retry.
+    Fixture fixture;
+    fixture.options.stall_timeout_seconds = 0.5;
+    ModelService service(fixture.manager, fixture.state, fixture.options);
+    fixture.fetcher.block_after.store(fixture.payload.size() / 4);
+
+    REQUIRE_MESSAGE(service.download("da2").ok(), "start");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+    REQUIRE(wait_until(
+        [&] {
+            const std::vector<splat::ModelView> views = service.list();
+            const splat::ModelView* view = find_view(views, "da2");
+            return view != nullptr && view->state == "failed";
+        },
+        10.0));
+
+    CHECK(fixture.fetcher.abort_calls.load() >= 1);
+    CHECK(fixture.fetcher.abort_reason.load() ==
+          static_cast<int>(splat::FetchAbort::stalled) + 1);
+    CHECK_FALSE(service.downloading());
+    const Result<ModelRecord> record = fixture.manager.status("da2");
+    REQUIRE(record.ok());
+    CHECK(record.value().state == ModelState::Failed);
+    CHECK(contains(record.value().message, "progress"));
+    CHECK(std::filesystem::exists(fixture.temp.path() / "downloads" / "model.bin.part"));
+
+    // The existing retry path starts again from the .part.
+    fixture.fetcher.block_after.store(0);
+    fixture.fetcher.aborted.store(false);
+    REQUIRE_MESSAGE(service.download("da2").ok(), "retry");
+    service.wait_for_idle();
+    const std::vector<splat::ModelView> views = service.list();
+    const splat::ModelView* view = find_view(views, "da2");
+    REQUIRE(view != nullptr);
+    CHECK(view->state == "ready");
+}
+
+TEST_CASE("ui_model_service bounded stop gives up on a read that ignores abort") {
+    // The console failure this pass bounds: the transfer sits inside a sceHttp
+    // read that sceHttpAbortRequest does not unblock. ModelService::stop() must
+    // return false in about 2 s, and the caller then leaves the service (and
+    // the manager and fetcher it uses) alone - the process is ending.
+    Fixture fixture;
+    fixture.fetcher.honor_abort = false;
+    fixture.fetcher.honor_cancel = false;
+    fixture.options.stall_timeout_seconds = 0.0;  // the watchdog is not what ends it
+    std::mutex lines_mutex;
+    std::vector<std::string> lines;
+    fixture.options.log = [&](const std::string& text) {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        lines.push_back(text);
+    };
+    fixture.fetcher.block_after.store(fixture.payload.size() / 4);
+
+    // Intentionally never destroyed: stop() said a thread still uses it.
+    auto* service = new ModelService(fixture.manager, fixture.state, fixture.options);
+    REQUIRE_MESSAGE(service->download("da2").ok(), "start");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+
+    const auto started = std::chrono::steady_clock::now();
+    const bool stopped = service->stop();
+    const double seconds = seconds_since(started);
+    INFO("the bounded stop took " << seconds << " s");
+    CHECK_FALSE(stopped);
+    CHECK_MESSAGE(seconds < 3.0, "the bounded stop took " << seconds << " s");
+    CHECK_MESSAGE(seconds >= 1.5, "the stop did not use its bound: " << seconds);
+    // The abort was attempted but the transfer ignored it; the host's one line
+    // says what is still running (the service does not free anything).
+    CHECK(fixture.fetcher.abort_calls.load() >= 1);
+    CHECK(service->running_text().find("download") != std::string::npos);
+    CHECK(service->downloading());
+
+    // Let the worker finish; its last log line is written after the manager is
+    // done with it, so the fixture can go (the service itself stays leaked,
+    // like the panel on the console's quit path).
+    fixture.fetcher.release.store(true);
+    const bool finished = wait_until([&] {
+        std::lock_guard<std::mutex> lock(lines_mutex);
+        for (const std::string& line : lines) {
+            if (line.find("model download: da2 finished") != std::string::npos) return true;
+        }
+        return false;
+    }, 15.0);
+    CHECK(finished);
+}
+
+TEST_CASE("ui_model_service bounded stop joins a worker that honours it") {
+    // The other half of the contract: a transfer that ends on the flag/abort is
+    // stopped and joined inside the bound, so the host may destroy the runtime.
+    Fixture fixture;
+    fixture.fetcher.block_after.store(fixture.payload.size() / 4);
+    ModelService service(fixture.manager, fixture.state, fixture.options);
+    REQUIRE_MESSAGE(service.download("da2").ok(), "start");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+
+    const auto started = std::chrono::steady_clock::now();
+    const bool stopped = service.stop();
+    const double seconds = seconds_since(started);
+    INFO("the bounded stop took " << seconds << " s");
+    CHECK(stopped);
+    CHECK_MESSAGE(seconds < 2.0, "the bounded stop took " << seconds << " s");
+    CHECK_FALSE(service.downloading());
+
+    // A second stop is the destructor's: nothing is left to join.
+    CHECK(service.stop());
+    CHECK(service.running_text().empty());
+}
+
+TEST_CASE("ui_model_service bounded stop covers a blocked licence fetch") {
+    // D1's licence half: the licence worker uses the same manager and fetcher,
+    // so a fetch that is still inside them after the bound must make stop()
+    // return false - the host then leaks the runtime instead of freeing them.
+    Fixture fixture;
+    fixture.fetcher.block_text.store(true);
+    ModelServiceOptions options = fixture.options;
+
+    auto* service = new ModelService(fixture.manager, fixture.state, options);
+    REQUIRE(service->licence_text("sharp").rfind(splat::kLicenceLoadingPrefix, 0) == 0);
+    REQUIRE(wait_until([&] { return fixture.fetcher.text_blocked.load(); }));
+
+    const auto started = std::chrono::steady_clock::now();
+    const bool stopped = service->stop();
+    const double seconds = seconds_since(started);
+    INFO("the bounded stop took " << seconds << " s");
+    CHECK_FALSE(stopped);
+    CHECK_MESSAGE(seconds < 3.0, "the bounded stop took " << seconds << " s");
+    CHECK(service->running_text().find("licence") != std::string::npos);
+
+    // Let the fetch finish; the service stays leaked, as the console's quit
+    // path leaves the panel.
+    fixture.fetcher.block_text.store(false);
+    fixture.fetcher.release_text.store(true);
+    CHECK(wait_until([&] { return service->licence_text("sharp") == fixture.fetcher.licence; }));
+}
+
+TEST_CASE("ui_model_service fetches a licence without blocking the caller") {
+    // Item 3: the render thread must never wait on the fetcher's setup lock. The
+    // licence text is fetched on a worker, so a download that is stuck (and a
+    // licence server that does not answer) cannot freeze a frame.
+    Fixture fixture;
+    fixture.fetcher.block_after.store(fixture.payload.size() / 4);
+    fixture.fetcher.block_text.store(true);
+    ModelService service(fixture.manager, fixture.state, fixture.options);
+
+    REQUIRE_MESSAGE(service.download("da2").ok(), "download");
+    REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
+
+    const auto first_started = std::chrono::steady_clock::now();
+    const std::string loading = service.licence_text("sharp");
+    const double first_seconds = seconds_since(first_started);
+    INFO("the first licence_text() call returned in " << first_seconds << " s");
+    CHECK(loading.rfind(splat::kLicenceLoadingPrefix, 0) == 0);
+    CHECK_MESSAGE(first_seconds < 0.5, "licence_text blocked for " << first_seconds << " s");
+    REQUIRE(wait_until([&] { return fixture.fetcher.text_blocked.load(); }));
+
+    // Still non-blocking while the fetch is in flight, and nothing is accepted
+    // before the exact text is shown.
+    const auto second_started = std::chrono::steady_clock::now();
+    CHECK(service.licence_text("sharp").rfind(splat::kLicenceLoadingPrefix, 0) == 0);
+    const double second_seconds = seconds_since(second_started);
+    CHECK_MESSAGE(second_seconds < 0.5, "licence_text blocked for " << second_seconds << " s");
+    CHECK_FALSE(service.accept("sharp").ok());
+
+    fixture.fetcher.block_text.store(false);
+    fixture.fetcher.release_text.store(true);
+    REQUIRE(wait_until(
+        [&] { return service.licence_text("sharp") == fixture.fetcher.licence; }, 10.0));
+    CHECK(service.accept("sharp").ok());
+
+    fixture.fetcher.release.store(true);
+    service.wait_for_idle();
+}
+
 TEST_CASE("ui_model_service shows the time left from the byte rate while downloading") {
     Fixture fixture;
     // A synthetic clock: every progress report is one minute after the last, so
@@ -420,6 +853,9 @@ TEST_CASE("ui_model_service cancel stops the fetcher and keeps the .part") {
     Fixture fixture;
     ModelService service(fixture.manager, fixture.state, fixture.options);
     fixture.fetcher.block_after.store(1536);  // six whole chunks
+    // The transfer ignores the polled cancel flag, so only the watchdog's abort
+    // can end it: cancel() itself must never enter the fetcher on this thread.
+    fixture.fetcher.honor_cancel = false;
 
     REQUIRE_MESSAGE(service.download("da2").ok(), "start");
     REQUIRE(wait_until([&] { return fixture.fetcher.blocked.load(); }));
@@ -427,7 +863,14 @@ TEST_CASE("ui_model_service cancel stops the fetcher and keeps the .part") {
     const Status cancelled = service.cancel("da2");
     REQUIRE_MESSAGE(cancelled.ok(), cancelled.message());
 
+    REQUIRE_MESSAGE(wait_until([&] { return !service.downloading(); }, 5.0),
+                    "the cancel did not stop the transfer");
     service.wait_for_idle();
+    CHECK(fixture.fetcher.abort_calls.load() >= 1);
+    CHECK(fixture.fetcher.abort_reason.load() ==
+          static_cast<int>(splat::FetchAbort::cancelled) + 1);
+    // The abort ran on the watchdog thread, not on the caller of cancel().
+    CHECK(fixture.fetcher.abort_thread.load() != std::this_thread::get_id());
     const Path part = fixture.temp.path() / "downloads" / "model.bin.part";
     REQUIRE(std::filesystem::exists(part));
     CHECK(std::filesystem::file_size(part) == 1536);
@@ -493,7 +936,7 @@ TEST_CASE("ui_model_service refuses a download that does not fit") {
 
     // SHARP waits for the licence first, then quotes the ~4 GB it needs.
     REQUIRE_FALSE(service.download("sharp").ok());
-    REQUIRE(service.licence_text("sharp") == fetcher.licence);
+    REQUIRE(wait_for_licence(service, "sharp") == fetcher.licence);
     REQUIRE(service.accept("sharp").ok());
     const Status sharp_refused = service.download("sharp");
     REQUIRE_FALSE(sharp_refused.ok());
@@ -581,9 +1024,15 @@ TEST_CASE("ui_model_service accepts a verified legacy GGUF and deletes it") {
     REQUIRE_MESSAGE(service.select("da2").ok(), "select the legacy file");
     CHECK(service.selected() == "da2");
 
-    // A corrupt legacy file does not count as ready any more.
+    // A corrupt legacy file does not count as ready any more. The refresh runs
+    // on the worker side (tick only flags it), so wait for the published rows.
     write_file(legacy, "not a gguf");
-    service.tick(0.3);  // drop the cached rows
+    service.tick(0.3);  // ask the worker side to re-read the rows
+    REQUIRE(wait_until([&] {
+        const std::vector<splat::ModelView> views = service.list();
+        const splat::ModelView* current = find_view(views, "da2");
+        return current != nullptr && current->state != "ready";
+    }));
     const std::vector<splat::ModelView> corrupt_views = service.list();
     view = find_view(corrupt_views, "da2");
     REQUIRE(view != nullptr);
@@ -659,7 +1108,7 @@ TEST_CASE("ui_model_service sees W18's SHARP names and never gives them to da2")
 TEST_CASE("ui_model_service resolved model path prefers the manager's Ready file") {
     Fixture fixture;
     ModelService service(fixture.manager, fixture.state, fixture.options);
-    REQUIRE(service.licence_text("sharp") == fixture.fetcher.licence);
+    REQUIRE(wait_for_licence(service, "sharp") == fixture.fetcher.licence);
     REQUIRE(service.accept("sharp").ok());
     REQUIRE_MESSAGE(service.download("sharp").ok(), "download");
     service.wait_for_idle();
@@ -675,7 +1124,7 @@ TEST_CASE("ui_model_service resolved model path prefers the manager's Ready file
 TEST_CASE("ui_model_service delete keeps the licence acceptance and clears the files") {
     Fixture fixture;
     ModelService service(fixture.manager, fixture.state, fixture.options);
-    REQUIRE(service.licence_text("sharp") == fixture.fetcher.licence);
+    REQUIRE(wait_for_licence(service, "sharp") == fixture.fetcher.licence);
     REQUIRE(service.accept("sharp").ok());
     REQUIRE_MESSAGE(service.download("sharp").ok(), "download");
     service.wait_for_idle();

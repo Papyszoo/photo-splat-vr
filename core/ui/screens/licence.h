@@ -39,6 +39,7 @@ public:
     const std::vector<std::string>& lines() const { return lines_; }
     const std::string& digest_prefix() const { return digest_prefix_; }
     bool text_available() const { return text_available_; }
+    bool loading() const { return loading_; }
     int scroll() const { return scroll_; }
     int visible_lines() const { return visible_; }
     std::size_t page() const { return page_; }
@@ -55,6 +56,9 @@ private:
     std::string digest_prefix_;
     std::vector<std::string> lines_;
     bool text_available_ = false;
+    // The fetch is still running (kLicenceLoadingPrefix was the last result);
+    // apply_licence_text() owns this state, the screen never re-derives it.
+    bool loading_ = false;
     int scroll_ = 0;
     int visible_ = 1;
     int line_height_ = 24;

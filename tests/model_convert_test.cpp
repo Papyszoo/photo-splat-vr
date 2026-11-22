@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -262,12 +263,20 @@ void check_gguf_matches(const Path& gguf_path, const Manifest& manifest,
     const std::vector<std::string> full_names = file.string_array_key("sharp.source_tensor_names");
     REQUIRE(full_names.size() == manifest.tensors.size());
 
+    // The GGUF tensor order is the checkpoint's file order (zip-offset order),
+    // not the pickle order of the manifest: every tensor is looked up by name.
+    // The two arrays stay index-aligned.
+    std::map<std::string, const ManifestTensor*> by_gguf_name;
+    for (const ManifestTensor& tensor : manifest.tensors) by_gguf_name[tensor.gguf_name] = &tensor;
+
     uint64_t expected_data = 0;
-    for (size_t i = 0; i < manifest.tensors.size(); ++i) {
-        const ManifestTensor& expected = manifest.tensors[i];
+    for (int64_t i = 0; i < file.tensor_count(); ++i) {
+        const std::string written_name = gguf_get_tensor_name(file.raw(), i);
+        const auto found = by_gguf_name.find(written_name);
+        REQUIRE_MESSAGE(found != by_gguf_name.end(), "unexpected tensor " << written_name);
+        const ManifestTensor& expected = *found->second;
         INFO("tensor " << i << " " << expected.gguf_name);
-        CHECK(full_names[i] == expected.name);
-        CHECK(gguf_get_tensor_name(file.raw(), static_cast<int64_t>(i)) == expected.gguf_name);
+        CHECK(full_names[static_cast<size_t>(i)] == expected.name);
 
         const int64_t id = file.find_tensor(expected.gguf_name);
         REQUIRE_MESSAGE(id >= 0, "missing tensor " << expected.gguf_name);
@@ -542,6 +551,68 @@ TEST_CASE("synthetic checkpoint converts to a GGUF that reads back") {
         CHECK(name.find(".head.weight") == std::string::npos);
         CHECK(name.size() < 64);
     }
+}
+
+TEST_CASE("the GGUF data follows the checkpoint's file order") {
+    // The read side of the "Preparing" fix: tensors are written in zip-offset
+    // order, so the checkpoint is one forward sweep. GGUF tensor order is free
+    // (lookups are by name); this pins the property so a refactor cannot put the
+    // 91 jumps across 2.8 GB back.
+    const Path checkpoint = fixture_path("synthetic.pt");
+    splat_test::TempDir temp("convert-order");
+    const Path output = temp.path() / "order.gguf";
+
+    ConvertOptions options;
+    options.verify_sha256 = false;
+    Progress progress;
+    const auto result = splat::convert_checkpoint(checkpoint, output, options, progress);
+    REQUIRE_MESSAGE(result.ok(), result.message());
+
+    const auto opened = splat::open_checkpoint(checkpoint);
+    REQUIRE_MESSAGE(opened.ok(), opened.message());
+    std::vector<std::pair<uint64_t, std::string>> expected;
+    for (const splat::CheckpointTensor& tensor : opened.value().tensors) {
+        if (splat::is_dead_tensor(tensor.record.name)) continue;
+        expected.emplace_back(tensor.zip_offset, splat::gguf_tensor_name(tensor.record.name));
+    }
+    std::sort(expected.begin(), expected.end());
+
+    GgufFile file;
+    REQUIRE(file.open(output));
+    REQUIRE(file.tensor_count() == static_cast<int64_t>(expected.size()));
+    for (size_t i = 0; i < expected.size(); ++i) {
+        INFO("tensor " << i << " " << expected[i].second);
+        CHECK(gguf_get_tensor_name(file.raw(), static_cast<int64_t>(i)) == expected[i].second);
+    }
+}
+
+TEST_CASE("a verified digest handed to the converter is reused, not recomputed") {
+    // The manager's hash-while-downloading produces the digest once; the
+    // converter must put exactly that into the metadata and check it against the
+    // pin, instead of reading 2.8 GB again (converter.cpp's old second SHA).
+    const Path checkpoint = fixture_path("synthetic.pt");
+    const Manifest manifest = load_manifest(fixture_path("synthetic.json"));
+    splat_test::TempDir temp("convert-reuse-digest");
+
+    ConvertOptions options;
+    options.verify_sha256 = false;
+    options.source_sha256 = manifest.sha256;
+    Progress progress;
+    const Path output = temp.path() / "reused.gguf";
+    const auto result = splat::convert_checkpoint(checkpoint, output, options, progress);
+    REQUIRE_MESSAGE(result.ok(), result.message());
+    CHECK(result.value().source_sha256 == manifest.sha256);
+    check_gguf_matches(output, manifest, manifest.source, manifest.sha256);
+
+    // With verification on, the wrong digest is refused before any tensor is
+    // read - the pin is as strong as the separate pass was.
+    options.verify_sha256 = true;
+    options.source_sha256 = std::string(64, '0');
+    const Path refused = temp.path() / "refused.gguf";
+    const auto bad = splat::convert_checkpoint(checkpoint, refused, options, progress);
+    REQUIRE_FALSE(bad.ok());
+    CHECK(bad.message().find("does not match the pinned") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(refused));
 }
 
 TEST_CASE("conversion refuses a checkpoint whose SHA-256 is not pinned") {

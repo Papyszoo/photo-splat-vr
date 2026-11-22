@@ -679,7 +679,7 @@ keeps streaming until that window closes even after the end line, so pass
   <118>[PPSA99202] viewer: config /data/ps5-splat-vr/bench/viewer.env: mode=vr scene=(first) seconds=1800 comfort_radius=0.250 m world_scale=1.00 preload=1 mirror=1 tv_output=1
   <118>[PPSA99202] viewer: mode vr (MODE=vr in /data/ps5-splat-vr/bench/viewer.env); TV mode is MODE=tv
   <118>[PPSA99202] viewer: vr session (mode vr): eye 1984x2048 per eye, 60 rendered -> 120 Hz reprojected, cap 1800 s
-  <118>[PPSA99202] viewer: vr log: /data/ps5-splat-vr/logs/session-20261027-190102.csv (one row per submitted frame, flushed every second, at most 32 MiB)
+  <118>[PPSA99202] viewer: vr log: off (POSE_LOG=1 in viewer.env enables the per-frame CSV)
   <118>[PPSA99202] viewer: vr scenes: 2 folder(s) under /data/ps5-splat-vr/scenes
   <118>[PPSA99202] viewer: vr scene 1/2 01_sharp_photo1: 1179648 splats, load 221.0 ms
   <118>[PPSA99202] viewer: vr capture intrinsics fx 1664.10 fy 1664.10 cx 960.0 cy 720.0, image 1920x1440
@@ -742,15 +742,20 @@ keeps streaming until that window closes even after the end line, so pass
 
 #### The head-pose and input log (matching a recorded video)
 
-Each VR run writes **one CSV per run**,
-`/data/ps5-splat-vr/logs/session-<YYYYmmdd-HHMMSS>.csv` (UTC, the folder is
-created on the first run; a `/data` that refuses the write logs `cannot write …
-the session runs without the pose log` and nothing else changes). It is one row
-per submitted frame, flushed every second (a killed run keeps its rows up to the
-last flush) and capped at 32 MiB — a 30-minute session at 60 fps is about 20 MiB,
-so the cap only matters past the cap. `frame` is the submitted-frame counter, the
-same one the `vr pose` line and the `t=…s` lines count, and `t_s` is seconds
-since the session start (so `t_s` and the `vr pose` lines share one clock).
+The per-frame CSV is opt-in: with **`POSE_LOG=1` in `viewer.env`** (written by
+`console-run.sh`'s `CASE_ENV`, or add the line by hand) each VR run writes **one
+CSV per run**, `/data/ps5-splat-vr/logs/session-<YYYYmmdd-HHMMSS>.csv` (UTC, the
+folder is created on the first run; a `/data` that refuses the write logs
+`cannot write … the session runs without the pose log` and nothing else
+changes). Without `POSE_LOG=1` the session logs `viewer: vr log: off (POSE_LOG=1
+in viewer.env enables the per-frame CSV)` and writes no file, so a run with no
+CSV is not a failure any more: the render thread never touches `/data` in a
+normal session. With the flag it is one row per submitted frame, flushed every
+second (a killed run keeps its rows up to the last flush) and capped at 32 MiB —
+a 30-minute session at 60 fps is about 20 MiB, so the cap only matters past the
+cap. `frame` is the submitted-frame counter, the same one the `vr pose` line and
+the `t=…s` lines count, and `t_s` is seconds since the session start (so `t_s`
+and the `vr pose` lines share one clock).
 
 | Column | Meaning |
 | --- | --- |

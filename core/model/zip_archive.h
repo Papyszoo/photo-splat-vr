@@ -16,6 +16,12 @@ struct ZipEntryInfo {
     uint64_t uncompressed_bytes = 0;
     uint64_t compressed_bytes = 0;
     uint32_t method = 0;  // 0 = stored, 8 = deflate
+    uint32_t crc32 = 0;   // as the central directory carries it
+    // Offset of the entry's local file header. Sorting entries by it gives the
+    // order of the file itself: the converter writes the GGUF tensors in that
+    // order, so the checkpoint is one forward read (issue-1-crash
+    // sharp-slow-report.md §1.4).
+    uint64_t local_header_offset = 0;
 };
 
 // Streaming receiver for one entry: called with successive byte ranges whose
@@ -50,12 +56,16 @@ public:
     // a tensor blob by accident.
     Result<std::vector<uint8_t>> read_entry(const std::string& name, uint64_t max_bytes);
 
-    // Streams one entry through `sink`. Chunks are bounded by miniz's own read
-    // buffer (64 KiB), never by the entry size.
+    // Streams one entry through `sink`. A stored entry (the torch checkpoint's
+    // tensors are all method 0) is read straight from the file in 1 MiB chunks
+    // with its CRC checked; a deflated entry goes through miniz in its own
+    // 64 KiB chunks. Either way nothing larger than one chunk is buffered.
     Status stream_entry(const std::string& name, const ZipSink& sink);
     Status stream_entry(const ZipEntryInfo& entry, const ZipSink& sink);
 
 private:
+    Status stream_stored(const ZipEntryInfo& entry, const ZipSink& sink);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

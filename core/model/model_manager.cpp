@@ -1,10 +1,12 @@
 #include "model/model_manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <system_error>
 
@@ -22,6 +24,38 @@ namespace {
 
 constexpr uint32_t kStateFormatVersion = 1;
 constexpr uint64_t kMaxStateBytes = 1u << 20;
+
+std::string seconds_text(double seconds) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f", seconds);
+    return text;
+}
+
+std::string megabyte_text(uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f MB", static_cast<double>(bytes) / 1e6);
+    return text;
+}
+
+std::string rate_text(uint64_t bytes, double seconds) {
+    char text[32];
+    if (seconds <= 0.0) return "? MB/s";
+    std::snprintf(text, sizeof(text), "%.2f MB/s", static_cast<double>(bytes) / seconds / 1e6);
+    return text;
+}
+
+// Marks the model manager's network phase active for its lifetime; the model
+// service's stall watchdog reads the flag (and the byte counters) from another
+// thread.
+struct ActiveFlag {
+    std::atomic<bool>& flag;
+    explicit ActiveFlag(std::atomic<bool>& value) : flag(value) {
+        flag.store(true, std::memory_order_relaxed);
+    }
+    ~ActiveFlag() { flag.store(false, std::memory_order_relaxed); }
+    ActiveFlag(const ActiveFlag&) = delete;
+    ActiveFlag& operator=(const ActiveFlag&) = delete;
+};
 
 Path record_path(const Path& state_dir, const std::string& backend) {
     return state_dir / "models" / (backend + ".json");
@@ -205,7 +239,9 @@ ModelManager::ModelManager(ModelManagerOptions options)
       specs_(options.specs),
       converter_(std::move(options.converter)),
       segment_min_bytes_(options.segment_min_bytes),
-      segment_count_(options.segment_count) {
+      segment_count_(options.segment_count),
+      max_parallel_transfers_(options.max_parallel_transfers),
+      log_(std::move(options.log)) {
     if (specs_.empty()) {
         specs_.push_back(sharp_model_spec());
         specs_.push_back(da2_model_spec());
@@ -217,6 +253,14 @@ const ModelBackendSpec* ModelManager::backend(const std::string& name) const {
         if (spec.name == name) return &spec;
     }
     return nullptr;
+}
+
+void ModelManager::abort_transfer(FetchAbort reason) {
+    if (fetcher_ != nullptr) fetcher_->abort(reason);
+}
+
+void ModelManager::log_line(const std::string& text) const {
+    if (log_) log_(text);
 }
 
 std::vector<std::string> ModelManager::backend_names() const {
@@ -471,7 +515,8 @@ Status ModelManager::verify_gguf(const std::string& name, const Path& gguf) cons
 }
 
 Status ModelManager::convert_and_store(const ModelBackendSpec& spec, const Path& source,
-                                       ModelRecord& record, Progress& progress) {
+                                       const std::string& verified_sha256, ModelRecord& record,
+                                       Progress& progress) {
     record.state = ModelState::Converting;
     record.message.clear();
     record.source_path = source;
@@ -492,22 +537,32 @@ Status ModelManager::convert_and_store(const ModelBackendSpec& spec, const Path&
         progress.report(0.80f + 0.19f * fraction, stage);
     });
 
+    const auto convert_started = std::chrono::steady_clock::now();
     Result<ConvertStats> converted = Result<ConvertStats>::failure("no converter configured");
     if (converter_) {
-        converted = converter_(spec, source, temporary, inner);
+        converted = converter_(spec, source, temporary, verified_sha256, inner);
     } else if (spec.name == "da2") {
         ConvertOptions options;
         options.backend = spec.name;
+        options.source_sha256 = verified_sha256;
         converted = convert_depth_anything_v2(source, temporary, options, inner);
     } else {
         ConvertOptions options;
         options.backend = spec.name;
+        options.source_sha256 = verified_sha256;
         converted = convert_checkpoint(source, temporary, options, inner);
     }
     if (!converted.ok()) {
         remove_if_present(temporary);
         return fail(record, "conversion failed: " + converted.message());
     }
+    const double convert_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - convert_started).count();
+    uint64_t converted_bytes = converted.value().gguf_bytes;
+    if (converted_bytes == 0) converted_bytes = size_or_zero(temporary);  // a test seam may not fill it
+    log_line("model fetch: " + spec.name + " convert: " + megabyte_text(converted_bytes) + " in " +
+             seconds_text(convert_seconds) + " s (" + rate_text(converted_bytes, convert_seconds) +
+             ", " + std::to_string(converted.value().tensor_count) + " tensors)");
 
     const Status check = verify_gguf(spec.name, temporary);
     if (!check.ok()) {
@@ -574,11 +629,22 @@ Status ModelManager::import_verified(const ModelBackendSpec& spec, const Path& f
     std::error_code error;
     const bool same_file =
         path_exists(destination) && std::filesystem::equivalent(file, destination, error) && !error;
+    std::string verified_sha256 = digest.value();
     if (!same_file) {
         const Status moved = move_or_copy(file, destination, move_source);
         if (!moved.ok()) return fail(record, moved.message());
+        // The converter reads the destination. When it is a copy, check it too:
+        // the old converter-side hash pass covered a bad copy, and the digest
+        // handed on below must describe the file that is actually converted.
+        const Result<std::string> copied = sha256_file(destination);
+        if (!copied.ok()) return fail(record, copied.message());
+        if (copied.value() != verified_sha256) {
+            return fail(record, "the imported copy " + destination.string() + " has SHA-256 " +
+                                    copied.value() + ", not " + verified_sha256 +
+                                    "; refusing to convert it");
+        }
     }
-    return convert_and_store(spec, destination, record, progress);
+    return convert_and_store(spec, destination, verified_sha256, record, progress);
 }
 
 Status ModelManager::import(const std::string& name, const Path& file, Progress& progress) {
@@ -622,6 +688,20 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
     const ModelBackendSpec* spec = backend(name);
     if (spec == nullptr) return Status::error("unknown backend '" + name + "'");
 
+    // Every phase reports its total time and MB/s through log_line(); one run
+    // then dates each fix without a second instrumented build
+    // (runs/issue-1-crash/sharp-fast-report.md).
+    const auto fetch_started = std::chrono::steady_clock::now();
+    const auto finish = [&](Status result) {
+        if (result.ok()) {
+            const double total =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started)
+                    .count();
+            log_line("model fetch: " + spec->name + " ready in " + seconds_text(total) + " s total");
+        }
+        return result;
+    };
+
     Result<ModelRecord> loaded = load_record(*spec);
     if (!loaded.ok()) return Status::error(loaded.message());
     ModelRecord record = loaded.take();
@@ -655,7 +735,7 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
         if (size_or_zero(source) == spec->source_bytes) {
             const Result<std::string> digest = sha256_file(source);
             if (digest.ok() && digest.value() == spec->source_sha256) {
-                return convert_and_store(*spec, source, record, progress);
+                return finish(convert_and_store(*spec, source, digest.value(), record, progress));
             }
         }
         remove_if_present(source);
@@ -688,11 +768,27 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
 
     // A complete .part left by a crash between the last byte and the rename is
     // verified directly: asking for Range: bytes=<size>- would fail with 416.
+    //
+    // One SHA-256, not two: the digest is produced by the transfer itself when
+    // the file is written front to back (a plain GET, the console's only path),
+    // with the prefix a resume already had hashed once before the transfer
+    // starts. A parallel download writes its segments out of order, so that one
+    // is hashed after the transfer; either way the file is compared with the
+    // pinned hash before it is converted, exactly as before.
+    std::string verified_sha256;
+    bool hashed_while_downloading = false;
     if (offset < spec->source_bytes) {
         if (fetcher_ == nullptr) {
             return fail(record, "no HTTP fetcher; put '" + spec->source_filename + "' in " +
                                     inbox_dir().string() + " for the offline path");
         }
+
+        // The network phase: the stall watchdog sees this flag (not verify or
+        // convert) and the byte counters the fetchers update, so a transfer that
+        // stops moving is aborted from another thread (ModelService).
+        transfer_written_.store(0, std::memory_order_relaxed);
+        transfer_base_.store(offset, std::memory_order_relaxed);
+        ActiveFlag network_phase(transfer_active_);
 
         const Result<HttpResource> head = fetcher_->head(spec->source_url);
         if (!head.ok()) {
@@ -713,6 +809,22 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
             layout = SegmentsState::none;
             offset = 0;
         }
+        // Whether this manager segments at all: UINT64_MAX is the off switch
+        // (the console asks for one plain GET). A layout can only be continued
+        // by a segmented download: when segmentation is off, a layout an older
+        // build left must not bring the ranged path back, and its .part can hold
+        // bytes of a segment that did not start at 0, which a plain prefix
+        // append would corrupt.
+        const bool segmentation_off = segment_min_bytes_ == std::numeric_limits<uint64_t>::max();
+        if (segmentation_off && layout == SegmentsState::valid) {
+            remove_part_files(part);
+            layout = SegmentsState::none;
+            offset = 0;
+        }
+        // A valid layout is always continued, even when fewer than
+        // segment_min_bytes_ are left: that is a near-finished download, not a
+        // manager with segmentation off. A fresh download segments only when at
+        // least that much is left.
         const bool parallel =
             ranges && (layout == SegmentsState::valid ||
                        spec->source_bytes - offset >= segment_min_bytes_);
@@ -728,6 +840,16 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
             progress.report(kFetchDownloadStart + kFetchDownloadSpan * fraction, stage);
         });
 
+        const auto download_started = std::chrono::steady_clock::now();
+        Sha256 hasher;
+        const bool hash_in_transfer = !parallel;
+        if (hash_in_transfer && offset > 0) {
+            // A resume: hash the bytes already in the .part once, then the
+            // transfer feeds the rest as it writes it (FetchRequest::hash).
+            const Status fed = sha256_update_prefix(part, offset, hasher);
+            if (!fed.ok()) return fail(record, "cannot hash the resume prefix: " + fed.message());
+        }
+
         Status downloaded = Status::success();
         if (parallel) {
             SegmentedDownload job;
@@ -740,6 +862,10 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
                                : plan_segments(offset, spec->source_bytes, segment_count_);
             job.progress = &download_progress;
             job.cancelled = cancelled;
+            job.max_in_flight = max_parallel_transfers_;
+            // Absolute bytes of the file; the transfer's base is 0.
+            transfer_base_.store(0, std::memory_order_relaxed);
+            job.transferred = &transfer_written_;
             downloaded = download_segmented(job);
         } else {
             FetchRequest request;
@@ -749,11 +875,28 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
             request.total_bytes = spec->source_bytes;
             request.progress = &download_progress;
             request.cancelled = cancelled;
+            // Bytes this request wrote, counted from `offset` (the watchdog adds
+            // transfer_base_). Re-stored here: the HEAD/ranges checks above can
+            // reset `offset` to 0 after the first store.
+            transfer_base_.store(offset, std::memory_order_relaxed);
+            request.written = &transfer_written_;
+            request.hash = &hasher;
             downloaded = fetcher_->download(request);
         }
         if (!downloaded.ok()) {
             record.downloaded_bytes = part_bytes(part, spec->source_bytes);
             return fail(record, "download failed: " + downloaded.message());  // kept for resume
+        }
+        const double download_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - download_started)
+                .count();
+        const uint64_t moved = spec->source_bytes - offset;
+        log_line("model fetch: " + spec->name + " download: " + megabyte_text(moved) + " in " +
+                 seconds_text(download_seconds) + " s (" + rate_text(moved, download_seconds) +
+                 (offset > 0 ? ", resumed at " + std::to_string(offset) + " bytes" : "") + ")");
+        if (hash_in_transfer) {
+            verified_sha256 = Sha256::hex(hasher.finish());
+            hashed_while_downloading = true;
         }
     }
 
@@ -772,15 +915,30 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
                                 std::to_string(spec->source_bytes) +
                                 "; the partial file was removed");
     }
-    const Result<std::string> digest = sha256_file(part);
-    if (!digest.ok()) {
-        remove_part_files(part);
-        return fail(record, digest.message());
+    if (verified_sha256.empty()) {
+        const auto verify_started = std::chrono::steady_clock::now();
+        const Result<std::string> digest = sha256_file(part);
+        if (!digest.ok()) {
+            remove_part_files(part);
+            return fail(record, digest.message());
+        }
+        const double verify_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - verify_started)
+                .count();
+        verified_sha256 = digest.value();
+        log_line("model fetch: " + spec->name + " verify: " + megabyte_text(downloaded_bytes) +
+                 " hashed in " + seconds_text(verify_seconds) + " s (" +
+                 rate_text(downloaded_bytes, verify_seconds) + ")");
     }
-    if (digest.value() != spec->source_sha256) {
+    if (verified_sha256 != spec->source_sha256) {
         remove_part_files(part);
-        return fail(record, "SHA-256 mismatch: downloaded " + digest.value() + ", expected the pinned " +
-                                spec->source_sha256 + "; the partial file was removed");
+        return fail(record, "SHA-256 mismatch: downloaded " + verified_sha256 +
+                                ", expected the pinned " + spec->source_sha256 +
+                                "; the partial file was removed");
+    }
+    if (hashed_while_downloading) {
+        log_line("model fetch: " + spec->name + " verify: hash computed while downloading, " +
+                 verified_sha256 + " matches the pin");
     }
 
     std::error_code error;
@@ -789,7 +947,7 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
         return fail(record, "cannot move the verified download into place: " + error.message());
     }
     remove_if_present(segments_path(part));  // a crash after the last byte can leave it behind
-    return convert_and_store(*spec, source, record, progress);
+    return finish(convert_and_store(*spec, source, verified_sha256, record, progress));
 }
 
 }  // namespace splat

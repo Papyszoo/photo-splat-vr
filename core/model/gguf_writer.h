@@ -77,6 +77,11 @@ private:
     ggml_context* ggml_ = nullptr;
     gguf_context* gguf_ = nullptr;
     std::FILE* file_ = nullptr;
+    // The stream's own buffer: one 1 MiB write per flush instead of one per
+    // 32 KiB converter chunk (the console's write cost is per call,
+    // runs/issue-1-crash/sharp-slow-report.md §1.4/§2.6).
+    std::vector<char> stream_buffer_;
+    uint64_t unsynced_bytes_ = 0;  // written since the last fsync + page-cache drop
     bool header_written_ = false;
     size_t next_tensor_ = 0;
     uint64_t tensor_bytes_ = 0;  // bytes appended for the current tensor

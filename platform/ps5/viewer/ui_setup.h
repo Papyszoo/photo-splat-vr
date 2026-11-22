@@ -177,6 +177,15 @@ private:
 // may be called before or after the renderer exists.
 UiRuntime make_ui_runtime(const Options& options);
 
+// The Quit path's rule for the models chain, the same leak-on-exit policy the
+// VR path already applies to a running conversion: ask the service for its own
+// bounded stop (ModelService::stop(), at most 2 s). True when no model thread is
+// left, so the caller may destroy the runtime. False: a download, hash, convert
+// or licence fetch is still inside a fetcher call; the one line naming it is
+// written here, and the caller must leave the whole runtime to the process exit
+// instead of freeing the manager and the fetcher under that thread.
+bool stop_models_for_exit(UiRuntime& runtime);
+
 // The UI keys of the Options, read from the environment main.cpp exported from
 // viewer.env (load_env_file setenvs every entry). The VR session receives a
 // VrOptions, not this struct, and must not parse viewer.env a second time.

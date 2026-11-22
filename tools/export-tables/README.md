@@ -36,45 +36,70 @@ database at all. The anchor selection (first printable string of 12+ characters
 in the read-only `PT_LOAD`, regex included) is PS5VR's, unchanged; anchors were
 copied from its generated headers, so keep the two in step if either changes.
 
+All of PS5VR's tables for the libraries this app resolves are imported below
+(16 tables: 7 each for `libSceHmd2` and `libSceVrTracker2`, 2 for
+`libSceVrHand`). `libSceSystemService` is not: this app ends itself with
+`sceSystemServiceLoadExec`, not PS5VR's `sceShellCoreUtilExitApp`.
+
 ## The data
 
 | Library | Firmware | Serves | Anchor |
 | --- | --- | --- | --- |
 | `libSceHmd2` | 1360 | 13.20, 13.60 | `Not Initialized` @ `0x7c686` |
-| `libSceHmd2` | 1240 | 12.20, 12.40; playback can become choppy after a few seconds | `Not Initialized` @ `0x7c67e` |
+| `libSceHmd2` | 1240 | 12.20, 12.40 | `Not Initialized` @ `0x7c67e` |
 | `libSceHmd2` | 1160 | 11.60 | `Not Initialized` @ `0x136ab2` |
-| `libSceHmd2` | 1000 | 10.00, 10.01, 10.20, 10.40, 10.60 | `Not Initialized` @ `0x136686` |
-| `libSceHmd2` | 900 | 9.00 | `Not Initialized` @ `0x13b4e2` |
+| `libSceHmd2` | 1000 | 10.00, 10.01, 10.40, 10.60 | `Not Initialized` @ `0x136686` |
 | `libSceHmd2` | 840 | 8.40 | `warped depth mip chain R` @ `0x13ae30` |
 | `libSceHmd2` | 761 | 7.20, 7.61 | `Awarped depth mip chain R` @ `0x1306c3` |
 | `libSceHmd2` | 550 | 5.50 | `SceHmd2ImageMutex` @ `0x11685e` |
 | `libSceVrTracker2` | 1360 | 13.20, 13.40, 13.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x1225e5` |
 | `libSceVrTracker2` | 1240 | 12.20, 12.40 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x1232e5` |
 | `libSceVrTracker2` | 1160 | 11.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x11ae8d` |
-| `libSceVrTracker2` | 1000 | 10.00, 10.01, 10.20, 10.40, 10.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x11aa7d` |
-| `libSceVrTracker2` | 900 | 9.00 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x115a3d` |
+| `libSceVrTracker2` | 1000 | 10.00, 10.01, 10.40, 10.60 | `MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT` @ `0x11aa7d` |
 | `libSceVrTracker2` | 840 | 8.40 | `SceVrtMtxDepthMapWork` @ `0x115421` |
 | `libSceVrTracker2` | 761 | 7.20, 7.61 | `SceVrtMtxDepthMapWork` @ `0x116779` |
 | `libSceVrTracker2` | 550 | 5.50 | `SCALEDPOTHOLE-THRESHOLD` @ `0xf8361` |
-| `libSceVrHand` | 1360 | 12.20 and later | `handPose_%02d` @ `0xb84e0` |
+| `libSceVrHand` | 1360 | 13.20, 13.60 | `handPose_%02d` @ `0xb84e0` |
 | `libSceVrHand` | 1240 | 12.20, 12.40 | `handPose_%02d` @ `0xb8600` |
 
-Tested on a console by PS5VR: 13.60 and 12.40. The other tables were checked against that
-firmware's libraries, not run. 9.00 comes from Ghost-VR only; every other added firmware
-agrees between PS5VR and Ghost-VR. 12.40 playback can become choppy after a few seconds.
-libSceVrHand has no table below 12.20 (it takes other parameters there).
+Only the exports C7 calls are listed; PS5VR's tables carry more (eye tracking,
+vibration, the camera opens). Add a name to `tables.json` and regenerate when
+the library needs it — prefer names that every table has, or the entries that
+lack it need a "not in this firmware" path. `tests/hmd2_tables_test.cpp` fails
+if any table is missing one of the names the app resolves, or if two tables of
+one library share an anchor (a duplicate would be shadowed).
 
-Only the exports C7 calls are listed; PS5VR's tables carry more (mirroring, eye
-tracking, vibration, the camera opens). Add a name to `tables.json` and
-regenerate when the library needs it — prefer names that both firmware tables
-have, or the 7.x entry needs a "not in this firmware" path.
+`libSceVrHand` is listed only where its API matches 13.60's (12.20 and later).
+10.x and 11.60 take other Initialize/Start/GetResult parameters; 8.40, 7.x and
+5.50 have no VrHand table in PS5VR either (hand tracking is unavailable there).
+The optional bind stays off on all of them.
 
 7.20 has no table of its own because PS5VR has none: its 761 table was
 generated from 7.61's libraries and documented as identical to 7.20's
 (`PS5VR/app/src/vr_exports.h`, `docs/firmware-support.md`). On a 7.20 console
 the anchor check decides.
 
+## Which table a console uses
+
+There is no firmware-version lookup. `module_table()` in
+`platform/ps5/hmd2/hmd2.cpp` walks every table of the library, newest first,
+and returns the first whose anchor string sits at its address in the loaded
+library's readable segment; `covers` documents PS5VR's checked builds, it is
+not a key. So 10.01 (`kern.sdk_version` `0x10010000`) uses the 1000 table when
+its `libSceHmd2`/`libSceVrTracker2` build is the one PS5VR checked on
+10.00/10.40/10.60 — the anchor is the proof, and the log then says
+`firmware table 10.00`. If the build differs, no table matches and the app
+logs `no export table for this firmware` instead of calling another build's
+offsets. 10.40 has no separate Hmd2/VrTracker2 table: PS5VR's `1040` header
+holds only `libSceSystemService`.
+
 ## Adding a firmware
+
+A firmware PS5VR already ships is a copy job, not a dump: its
+`app/src/vr_exports_<fw>.h` has the rows and the anchor, and the steps below
+become "paste `{name, offset}` for the names this app uses, add `covers`, add
+the anchor `va`, regenerate". That is how every table above was imported
+(13.60 and 7.61 first, then 5.50/8.40/10.00/11.60/12.40 for issue #2).
 
 1. Four decrypted libraries from a console on that firmware (they live in
    `/system/common/lib/` and are encrypted on disk; `ps5-self-pager` output is

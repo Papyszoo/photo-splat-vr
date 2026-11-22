@@ -66,6 +66,11 @@ public:
     bool end_early = false;  // returns success after half of its range
     std::atomic<int> cancelled_requests{0};
     std::atomic<int> in_flight{0};
+    // The order the requests arrived in (their offsets), for the one-at-a-time
+    // case: the segments must start in index order so the .part fills front to
+    // back.
+    std::mutex order_mutex;
+    std::vector<uint64_t> order;
 
     Result<HttpResource> head(const std::string&) override {
         HttpResource resource;
@@ -80,6 +85,10 @@ public:
             std::atomic<int>& counter;
             ~Leave() { --counter; }
         } leave{in_flight};
+        {
+            std::lock_guard<std::mutex> lock(order_mutex);
+            order.push_back(request.offset);
+        }
 
         std::FILE* file = std::fopen(request.destination.string().c_str(), "r+b");
         if (file == nullptr) return Status::error("cannot open the part");
@@ -243,6 +252,62 @@ TEST_CASE("segmented download: all segments run at once and assemble the exact b
     CHECK(read_file(part) == fetcher.payload);
     CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
     CHECK(progress.fraction() == doctest::Approx(1.0f));
+}
+
+TEST_CASE("segmented download: one transfer in flight runs the segments in order") {
+    // The console's discipline (ModelManagerOptions::max_parallel_transfers):
+    // a body read may never overlap another request's create or delete, and the
+    // .part fills front to back because the segments start in index order.
+    splat_test::TempDir temp("segments-one");
+    MemorySegmentFetcher fetcher;
+    fetcher.payload = make_payload(160000);
+    const Path part = temp.path() / "m.bin.part";
+
+    std::atomic<int> peak{0};
+    std::atomic<bool> watching{true};
+    std::thread watcher([&] {
+        while (watching.load()) {
+            int seen = peak.load();
+            const int now = fetcher.in_flight.load();
+            while (now > seen && !peak.compare_exchange_weak(seen, now)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    splat::SegmentedDownload job;
+    job.fetcher = &fetcher;
+    job.url = "memory://file";
+    job.part = part;
+    job.total = fetcher.payload.size();
+    job.segments = splat::plan_segments(0, job.total, 4);
+    job.max_in_flight = 1;
+    splat::Progress progress;
+    job.progress = &progress;
+    // The stall watchdog's byte counter: absolute bytes, resumed included.
+    std::atomic<uint64_t> transferred{0};
+    job.transferred = &transferred;
+    const Status status = splat::download_segmented(job);
+    watching.store(false);
+    watcher.join();
+
+    REQUIRE_MESSAGE(status.ok(), status.message());
+    CHECK(peak.load() == 1);
+    CHECK(read_file(part) == fetcher.payload);
+    CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
+    CHECK(progress.fraction() == doctest::Approx(1.0f));
+    CHECK(transferred.load() == job.total);
+
+    // Started in index order, so the file was written front to back.
+    std::vector<uint64_t> started;
+    {
+        std::lock_guard<std::mutex> lock(fetcher.order_mutex);
+        started = fetcher.order;
+    }
+    const std::vector<DownloadSegment> plan = splat::plan_segments(0, job.total, 4);
+    REQUIRE(started.size() == plan.size());
+    for (std::size_t index = 0; index < plan.size(); ++index) {
+        CHECK(started[index] == plan[index].begin);
+    }
 }
 
 TEST_CASE("segmented download: a failing segment stops the others and keeps the exact resume state") {

@@ -34,13 +34,16 @@
 //      DualSense), VR mode off, buffers unregistered, display, Hmd2, tracker,
 //      then the Vulkan objects.
 //
-// While it runs, the session writes a head-pose and input log to
+// While it runs, the session can write a head-pose and input log to
 // /data/ps5-splat-vr/logs/session-<UTC>.csv (one row per submitted frame: the
 // raw Hmd2 pose the frame was rendered from, the scene-frame yaw/pitch/roll,
 // every pad's buttons, the action bits, the scene's scale and offset, the
 // recentre hold's progress, the scene and the event), so a recorded video can be
-// matched to it; once a second it adds a compact pose line to klog. The table
-// of columns is in docs/console-runbook.md, step 1d.
+// matched to it; once a second it adds a compact pose line to klog. It is off
+// unless viewer.env says POSE_LOG=1: a per-frame /data write on the render
+// thread is a frame-time risk the product does not need
+// (runs/issue-1-crash/sharp-slow-report.md §3.3). The table of columns is in
+// docs/console-runbook.md, step 1d.
 //
 // Input is the DualSense and the two PSVR2 Sense controllers, opened through
 // scePad for the same user the Hmd2 session uses (hmd2::user_id()): an Options
@@ -106,6 +109,7 @@
 #include <time.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <ctime>
 
 #include <algorithm>
@@ -117,6 +121,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gallery/gallery.h"
@@ -141,6 +146,7 @@
 
 #include "convert_gate.h"
 #include "eye_buffers.h"
+#include "firmware_message.h"
 #include "overlay_refresh.h"
 #include "pad_input.h"
 #include "scene_switch.h"
@@ -496,6 +502,11 @@ private:
 // did: <dataDir>/logs/session-<UTC>.csv, flushed once a second. One row
 // per submitted frame plus one for an event that ends the run, so the columns
 // line up with the frames Hmd2 showed (and with the `viewer: vr t=...` lines).
+// It is opt-in: viewer.env's POSE_LOG=1 turns it on (main.cpp setenvs every
+// entry). Off, this costs the frame loop nothing - no open, no row, no flush.
+// On, a row is one stdio write every half second or so, which is why it is not
+// the default: at the page-cache wall each /data call cost tens of ms
+// (runs/issue-1-crash/sharp-slow-report.md §3.3).
 //
 // The pose columns are Hmd2's own values, unconverted: metres, +y up, forward
 // -z, quaternion x,y,z,w. The angle columns are what the renderer used, in the
@@ -519,11 +530,24 @@ void csv_text(FILE* file, const char* text) {
 
 class PoseLog {
 public:
-    // Creates the folder and this run's file. False when /data is not writable
-    // (the log is optional; the session must still run) - the caller says so in
-    // one klog line.
+    // viewer.env's POSE_LOG=1: the CSV is a bench/QA tool, not a product
+    // feature. Off by default so the render thread never writes to /data.
+    static bool requested() {
+        const char* value = std::getenv("POSE_LOG");
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }
+
+    bool disabled_by_config() const { return disabled_by_config_; }
+
+    // Creates the folder and this run's file. False when POSE_LOG is not set,
+    // or /data is not writable (the log is optional; the session must still
+    // run) - the caller says so in one klog line.
     bool open() {
         if (file_ != nullptr) return true;
+        if (!requested()) {
+            disabled_by_config_ = true;
+            return false;
+        }
         if (::mkdir(kPoseLogDir.c_str(), 0777) != 0 && errno != EEXIST) {
             error_ = errno;
             return false;
@@ -621,6 +645,7 @@ private:
     size_t bytes_ = 0;
     int error_ = 0;
     bool capped_ = false;
+    bool disabled_by_config_ = false;  // POSE_LOG was not set: not an error
     char path_[128] = {};
 };
 
@@ -869,6 +894,46 @@ private:
     std::string folder_name_;
 };
 
+// ---- the unsupported-firmware card -----------------------------------------
+// hmd2 names the library whose export table did not match this build (issue #2,
+// firmware 10.01). Instead of a silent return to the home screen, the TV gets
+// one full-screen card drawn with the TV path's own canvas text (UiCanvas, the
+// flat menu's font and theme) and presented on the main VideoOut port, which
+// the default run already has open. It waits for X/O on the DualSense or 120 s;
+// the caller still tears down and returns the unchanged status.
+void show_firmware_message(TvOutput& tv, uint32_t firmware, const char* missing_library) {
+    const FirmwareMessage message = firmware_message(firmware, missing_library);
+    splat::UiCanvas canvas(splat::kTvWidth, splat::kTvHeight);
+    draw_firmware_message(canvas, message);
+    std::string present_error;
+    if (!tv.present_still(canvas.pixels().data(), present_error)) {
+        line("viewer: vr firmware message: the TV refused the card (%s)", present_error.c_str());
+        return;
+    }
+    const std::string version = format_firmware_version(firmware);
+    line("viewer: vr firmware message: shown on the TV (no export table for %s%s%s); X or O, or "
+         "120 s",
+         missing_library, version.empty() ? "" : " on firmware ", version.c_str());
+    // The DualSense is the TV person's pad; no pad here is opened before Hmd2
+    // succeeds, so opening it now is all this path needs (the Sense pair and
+    // the VR session stay out of it).
+    Pad confirm(pad::Device::dualsense, "DualSense", kPadTypeDualsense);
+    const int user = hmd2::user_id();
+    const double deadline = now_ms() + 120000.0;
+    bool pressed = false;
+    while (now_ms() < deadline) {
+        confirm.open(user, now_ms());
+        confirm.take_pressed();   // one poll; Cross and Circle are not action bits
+        if ((confirm.held() & (pad::kCross | pad::kCircle)) != 0) {
+            pressed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    confirm.close();
+    line("viewer: vr firmware message: %s, exiting", pressed ? "X/O pressed" : "120 s elapsed");
+}
+
 }  // namespace
 
 int run_vr(const VrOptions& options) {
@@ -891,6 +956,8 @@ int run_vr(const VrOptions& options) {
         line("viewer: vr log: %s (one row per submitted frame, flushed every second, at most "
              "%zu MiB)",
              pose_log.path(), kPoseLogMaxBytes / (1024u * 1024u));
+    } else if (pose_log.disabled_by_config()) {
+        line("viewer: vr log: off (POSE_LOG=1 in viewer.env enables the per-frame CSV)");
     } else {
         line("viewer: vr log: cannot write %s (errno %d); the session runs without the pose log",
              kPoseLogDir.c_str(), pose_log.error());
@@ -1031,10 +1098,13 @@ int run_vr(const VrOptions& options) {
         const double started = now_ms();
         // The pose log first: the last rows of the run are the interesting ones.
         pose_log.close();
-        // The TV worker reads the renderer's slot buffers: it stops (and the
-        // port closes) before anything of the renderer is freed or leaked.
-        tv_output.stop();
-        tv_up = false;
+        // The TV worker reads the renderer's slot buffers: it stops before
+        // anything of the renderer is freed or leaked, and before the headset
+        // goes down, so no TV flip runs into the VR mode transition. The port
+        // itself closes after hmd2::shutdown() below: closing the main port
+        // while VR mode is still on makes the display change mode twice and
+        // the quit take ~15 s (runs/issue-1-crash/klog-analysis.md section 3).
+        tv_output.stop_worker();
         // The pads first, before the headset's tracker/Hmd2 teardown, which is
         // HLA-PSVR2's order for its Sense controllers (psvr2.c:1593-1613). We
         // have nothing to unregister: the only VrTracker2 handle in this title is
@@ -1053,6 +1123,12 @@ int run_vr(const VrOptions& options) {
             hmd2::shutdown();
             hmd2_up = false;
         }
+        // VR mode is off: the main port closes now, so the display changes mode
+        // once (the 0.5.x quit) instead of twice while VR mode was still on.
+        // The renderer and its TV slots are still alive here; they are freed
+        // below, after the worker is gone and the port is closed.
+        tv_output.stop();
+        tv_up = false;
         if (context && run.gpu_ok) {
             renderer.reset();
             splat::destroy_vulkan_image(*context, target_image);
@@ -1128,6 +1204,32 @@ int run_vr(const VrOptions& options) {
         line("viewer: FAIL hmd2 init at %s (rc 0x%08x) - see the hmd2 lines above",
              hmd_error.step != nullptr && hmd_error.step[0] != '\0' ? hmd_error.step : "unknown",
              static_cast<unsigned>(hmd_error.rc));
+        // A firmware with no export table is the one failure worth a TV card:
+        // the user cannot fix it from the pad and the klog is not visible to
+        // them. Every other failure keeps the plain FAIL path.
+        if (hmd_error.missing_table_library != nullptr) {
+            if (tv_up) {
+                show_firmware_message(tv_output, options.firmware,
+                                      hmd_error.missing_table_library);
+            } else if (!options.tv_output) {
+                // TV_OUTPUT=0: no session port exists, so open one exactly the
+                // way the TV output does (same size, rate and flip handling)
+                // just for the card.
+                TvOutput message_tv;
+                std::string message_error;
+                if (message_tv.start(message_error)) {
+                    show_firmware_message(message_tv, options.firmware,
+                                          hmd_error.missing_table_library);
+                } else {
+                    line("viewer: vr firmware message: the TV port would not open (%s); the "
+                         "hmd2 lines above name the missing table",
+                         message_error.c_str());
+                }
+            } else {
+                line("viewer: vr firmware message: no TV port is open (the main port was "
+                     "refused); the hmd2 lines above name the missing table");
+            }
+        }
         teardown();
         return 6;
     }
@@ -3270,12 +3372,21 @@ int run_vr(const VrOptions& options) {
     // W19: a conversion still running at exit owns the GPU; the panel runtime
     // (and with it the JobService destructor, which joins the worker) is left to
     // the process exit instead of being destroyed under it.
+    bool leak_runtime = false;
     if (ui_runtime != nullptr && ui_runtime->jobs != nullptr &&
         (viewer::jobs_active(*ui_runtime->services.jobs) || ui_runtime->services.jobs->busy())) {
         line("viewer: vr jobs: a conversion is still running at exit; leaving its worker and the "
              "model to the process exit");
-        (void)ui_runtime.release();
+        leak_runtime = true;
     }
+
+    // W21: the same rule for the model chain. The service's own stop has a 2 s
+    // bound; when a download, hash or convert is still inside a fetcher call
+    // after it, the runtime is not destroyed under that thread either.
+    if (ui_runtime != nullptr && !viewer::stop_models_for_exit(*ui_runtime)) {
+        leak_runtime = true;
+    }
+    if (leak_runtime) (void)ui_runtime.release();
 
     teardown();
 

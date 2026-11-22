@@ -60,6 +60,9 @@ struct TransferState {
     HeaderState header;
     Progress* progress = nullptr;
     const std::function<bool()>* cancelled = nullptr;
+    // Hash-while-downloading (FetchRequest::hash): fed after a successful write,
+    // reset when the file has to start over.
+    Sha256* hash = nullptr;
 };
 
 struct TextState {
@@ -135,6 +138,8 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
                 return 0;
             }
             state->offset = 0;
+            // The prefix the caller hashed is no longer in the file.
+            if (state->hash != nullptr) state->hash->reset();
         }
     }
 
@@ -143,6 +148,7 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
         state->write_failed = true;
         return 0;
     }
+    if (state->hash != nullptr) state->hash->update(data, bytes);
     state->written += bytes;
     if (state->written_out != nullptr) {
         state->written_out->store(state->written, std::memory_order_relaxed);
@@ -258,6 +264,8 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     state.cancelled = &request.cancelled;
     state.segment = request.end != 0;
     state.written_out = request.written;
+    // Segment bodies arrive out of order, so the contract says no hash there.
+    state.hash = request.end != 0 ? nullptr : request.hash;
     if (state.segment && request.end <= request.offset) return Status::error("download segment is empty");
     state.file = std::fopen(state.path.c_str(),
                             state.segment ? "r+b" : (request.offset > 0 ? "ab" : "wb"));

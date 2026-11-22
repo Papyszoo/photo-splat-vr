@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -19,6 +20,14 @@ namespace splat {
 // bar back into bytes for its time estimate.
 inline constexpr float kFetchDownloadStart = 0.05f;
 inline constexpr float kFetchDownloadSpan = 0.65f;
+
+// The one stall deadline of the download pipeline: a transfer that moves no
+// byte for this long is aborted (the model service's watchdog calls
+// abort_transfer()). The console's sceHttp call can block without honouring its
+// receive timeout, so a deadline alone is not enough - the abort is what ends
+// it. Shorter deadlines would mistake a slow link for a stall (a 2.8 GB
+// checkpoint at 3 MB/s changes its percent about once per 9 s).
+inline constexpr double kTransferStallSeconds = 60.0;
 
 // C1 state machine, one instance per backend.
 //
@@ -85,15 +94,31 @@ struct ModelManagerOptions {
     std::vector<ModelBackendSpec> specs;
     // Empty: the real converter (convert_checkpoint / convert_depth_anything_v2).
     // A test seam, so the state machine can run without a 2.8 GB checkpoint.
-    using Converter = std::function<Result<ConvertStats>(const ModelBackendSpec& spec,
-                                                         const Path& source, const Path& out,
-                                                         Progress& progress)>;
+    // `source_sha256` is the digest the manager has already checked against the
+    // pin (hash-while-downloading, a resume check or an import), so the
+    // converter never reads the file a second time just to hash it.
+    using Converter = std::function<Result<ConvertStats>(
+        const ModelBackendSpec& spec, const Path& source, const Path& out,
+        const std::string& source_sha256, Progress& progress)>;
     Converter converter;
     // A download with at least this much left to fetch, from a server that offers
     // byte ranges, runs as `segment_count` parallel ranged requests
     // (core/model/segmented_download.h); anything else is one GET. A test seam.
+    // UINT64_MAX turns segmentation off for this manager: every download is one
+    // plain GET (no Range header), and a .segments layout an older build left is
+    // discarded instead of being resumed (the console's setting; see
+    // platform/ps5/viewer/ui_setup.cpp).
     uint64_t segment_min_bytes = kSegmentedMinBytes;
     int segment_count = kSegmentedCount;
+    // How many of those ranged requests may be in flight at once (0: all of
+    // them). The console's sceHttp is only proven with one transfer at a time;
+    // see SegmentedDownload::max_in_flight.
+    int max_parallel_transfers = 0;
+    // One line per phase with its total time and MB/s - download, SHA-256,
+    // conversion and the whole fetch - so the next console klog dates each fix
+    // (runs/issue-1-crash/sharp-fast-report.md). Empty: no lines. The console
+    // wires it to klog in platform/ps5/viewer/ui_setup.cpp.
+    std::function<void(const std::string&)> log;
 };
 
 // Layout under the state directory:
@@ -142,6 +167,22 @@ public:
     Status fetch(const std::string& backend, Progress& progress,
                  std::function<bool()> cancelled = {});
 
+    // The network phase of the fetch() running on another thread, for a stall
+    // watchdog: active from before the HEAD until the last body byte (not during
+    // verify or convert), and the bytes of the file known to be on disk. One
+    // fetch at a time is the caller's contract (ModelService enforces it), so a
+    // single pair of counters describes the live transfer.
+    bool transfer_active() const { return transfer_active_.load(std::memory_order_relaxed); }
+    uint64_t transfer_bytes() const {
+        return transfer_base_.load(std::memory_order_relaxed) +
+               transfer_written_.load(std::memory_order_relaxed);
+    }
+
+    // Stops the transfer fetch() is running now, from another thread. Forwarded
+    // to the fetcher, whose abort() must make a blocked call fail (see
+    // IHttpFetcher::abort); a fetcher that polls `cancelled` needs no override.
+    void abort_transfer(FetchAbort reason);
+
     // Imports an already-downloaded checkpoint: checks the pinned size and
     // SHA-256, then converts. `backend` must own the file. The source file is
     // copied, not moved.
@@ -160,10 +201,14 @@ private:
     Result<ModelRecord> load_record(const ModelBackendSpec& spec);
     Status save_record(const ModelRecord& record);
     Status fail(ModelRecord& record, const std::string& message);
-    Status convert_and_store(const ModelBackendSpec& spec, const Path& source, ModelRecord& record,
+    // `verified_sha256` is the digest this fetch/import already checked against
+    // the pin; the converter uses it instead of hashing the source again.
+    Status convert_and_store(const ModelBackendSpec& spec, const Path& source,
+                             const std::string& verified_sha256, ModelRecord& record,
                              Progress& progress);
     Status import_verified(const ModelBackendSpec& spec, const Path& file, bool move_source,
                            Progress& progress);
+    void log_line(const std::string& text) const;
 
     Path state_dir_;
     IHttpFetcher* fetcher_ = nullptr;
@@ -171,6 +216,12 @@ private:
     ModelManagerOptions::Converter converter_;
     uint64_t segment_min_bytes_ = kSegmentedMinBytes;
     int segment_count_ = kSegmentedCount;
+    int max_parallel_transfers_ = 0;
+    // The live network phase, read by the stall watchdog (see transfer_active).
+    std::atomic<bool> transfer_active_{false};
+    std::atomic<uint64_t> transfer_base_{0};     // the plain GET's resume offset (0 for segments)
+    std::atomic<uint64_t> transfer_written_{0};  // bytes this transfer has written
+    std::function<void(const std::string&)> log_;
 };
 
 }  // namespace splat

@@ -9,15 +9,19 @@
     "'anchor' is the check string: {virtual address in the library, text}. The",
     "app uses a table only if the string sits at that address in the loaded",
     "library's read-only segment, so a table can never be applied to a build it",
-    "was not generated from.",
-    "Source: PS5VR app/src/vr_exports_1360.h and vr_exports_761.h (GPL-3.0,",
-    "Source: PS5VR app/src/vr_exports_*.h (GPL-3.0, see platform/ps5/hmd2/NOTICE);",
-    "9.00 only from Ghost-VR's vr_exports.h (theghostonline, GPL-3.0), which also",
-    "agrees with PS5VR on every other firmware here. 13.60 and 12.40 were run on a",
-    "console by PS5VR; the other tables were checked against that firmware's",
-    "libraries, not run. 7.61 and 7.20 ship the same libraries, so the 761 table",
-    "serves both. VrHand has a table for 12.20 and later only: below that it takes",
-    "other parameters."
+    "was not generated from. There is no firmware-version gate: module_table()",
+    "in hmd2.cpp tries every table's anchor, newest first, and the console uses",
+    "the one whose library build matches. 'covers' lists the firmware PS5VR",
+    "checked that same build on; it documents the aliases, it is not a lookup.",
+    "10.01 (kern.sdk_version 0x10010000) is expected to hit the 1000 anchor, the",
+    "build PS5VR checked on 10.00/10.40/10.60; 10.01 itself has not been run.",
+    "Source: PS5VR app/src/vr_exports_{1360,1240,1160,1000,840,761,550}.h",
+    "(GPL-3.0, see platform/ps5/hmd2/NOTICE). libSceVrHand is listed only where",
+    "its API matches 13.60's (12.20 and later): 10.x and 11.60 take other",
+    "Initialize/Start/GetResult parameters, and 8.40, 7.x and 5.50 have no",
+    "VrHand table in PS5VR either, so the optional bind stays off there and",
+    "logs one line. libSceSystemService is not imported: this app exits with",
+    "sceSystemServiceLoadExec, not PS5VR's sceShellCoreUtilExitApp."
   ],
   "libraries": {
     "libSceHmd2": {
@@ -53,7 +57,7 @@
           }
         },
         "1240": {
-          "covers": "12.20, 12.40; playback can become choppy after a few seconds",
+          "covers": "12.20, 12.40",
           "anchor": {
             "va": 509566,
             "text": "Not Initialized"
@@ -113,7 +117,7 @@
           }
         },
         "1000": {
-          "covers": "10.00, 10.01, 10.20, 10.40, 10.60",
+          "covers": "10.00, 10.01, 10.40, 10.60",
           "anchor": {
             "va": 1271430,
             "text": "Not Initialized"
@@ -140,36 +144,6 @@
             "sceHmd2ReprojectionEnableMirroring": 138096,
             "sceHmd2ReprojectionDisableMirroring": 138224,
             "sceHmd2ReprojectionSetMirroringOption": 138336
-          }
-        },
-        "900": {
-          "covers": "9.00",
-          "anchor": {
-            "va": 1291490,
-            "text": "Not Initialized"
-          },
-          "exports": {
-            "sceHmd2Initialize": 172816,
-            "sceHmd2Terminate": 172960,
-            "sceHmd2Open": 173008,
-            "sceHmd2Close": 173424,
-            "sceHmd2GetDeviceInformation": 174112,
-            "sceHmd2GetFieldOfViewWithoutHandle": 161200,
-            "sceHmd2ReprojectionQueryBufferSizeAlign": 136608,
-            "sceHmd2ReprojectionQueryDisplayBufferSizeAlign": 136736,
-            "sceHmd2ReprojectionInitialize": 136896,
-            "sceHmd2ReprojectionTerminate": 137872,
-            "sceHmd2ReprojectionEnableVrMode": 138144,
-            "sceHmd2ReprojectionDisableVrMode": 138288,
-            "sceHmd2ReprojectionBeginFrame": 138624,
-            "sceHmd2ReprojectionGetPredictedDisplayTime": 138640,
-            "sceHmd2ReprojectionSetParam": 138688,
-            "sceHmd2ReprojectionSetRenderConfig": 138720,
-            "sceHmd2ReprojectionGetMirroringWorkMemorySizeAlign": 138848,
-            "sceHmd2ReprojectionGetMirroringDisplayBufferSizeAlign": 138864,
-            "sceHmd2ReprojectionEnableMirroring": 138880,
-            "sceHmd2ReprojectionDisableMirroring": 139008,
-            "sceHmd2ReprojectionSetMirroringOption": 139120
           }
         },
         "840": {
@@ -312,7 +286,7 @@
           }
         },
         "1000": {
-          "covers": "10.00, 10.01, 10.20, 10.40, 10.60",
+          "covers": "10.00, 10.01, 10.40, 10.60",
           "anchor": {
             "va": 1157757,
             "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
@@ -324,21 +298,6 @@
             "sceVrTracker2RegisterDevice": 4512,
             "sceVrTracker2UnregisterDevice": 5024,
             "sceVrTracker2GetResult": 10368
-          }
-        },
-        "900": {
-          "covers": "9.00",
-          "anchor": {
-            "va": 1137213,
-            "text": "MININLIERS-FOR-MULTICAMSTRICTGRAVITYBOOT"
-          },
-          "exports": {
-            "sceVrTracker2QueryMemory": 224,
-            "sceVrTracker2Initialize": 544,
-            "sceVrTracker2Finalize": 4320,
-            "sceVrTracker2RegisterDevice": 4464,
-            "sceVrTracker2UnregisterDevice": 4992,
-            "sceVrTracker2GetResult": 10352
           }
         },
         "840": {
@@ -391,7 +350,7 @@
     "libSceVrHand": {
       "firmware": {
         "1360": {
-          "covers": "12.20 and later only; 10.x and 11.60 take other parameters",
+          "covers": "13.20, 13.60",
           "anchor": {
             "va": 754912,
             "text": "handPose_%02d"

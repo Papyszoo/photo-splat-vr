@@ -101,6 +101,7 @@
 #include "convert_gate.h"
 #include "convert_session.h"
 #include "eye_buffers.h"
+#include "firmware_version.h"
 #include "ggml-backend.h"
 #include "ggml-vulkan.h"
 #include "ggml_logging.h"
@@ -900,8 +901,8 @@ int main(int, char**) {
     uint32_t sdk = 0;
     size_t sdk_size = sizeof(sdk);
     if (sysctlbyname("kern.sdk_version", &sdk, &sdk_size, nullptr, 0) == 0 && sdk) {
-        line("viewer: firmware %x.%02x (kern.sdk_version 0x%08x)", sdk >> 24, (sdk >> 16) & 0xff,
-             sdk);
+        line("viewer: firmware %s (kern.sdk_version 0x%08x)",
+             viewer::format_firmware_version(sdk).c_str(), sdk);
     } else {
         line("viewer: firmware unknown (kern.sdk_version unavailable)");
     }
@@ -1048,6 +1049,9 @@ int main(int, char**) {
         vr.preload = options.preload;
         vr.mirror = options.mirror;
         vr.tv_output = tv_output;
+        // The firmware the log line above named: the unsupported-firmware
+        // card's title only (vr_mode.cpp); table selection stays anchor-based.
+        vr.firmware = sdk;
         // SECONDS is the session's only cap: 0 (the default, and an explicit
         // SECONDS=0) means no auto-exit at all; the panel's Quit and the quit
         // file still end the session. A dev run caps itself with SECONDS=1800.
@@ -2058,6 +2062,14 @@ int main(int, char**) {
              "to the process exit (the queue re-queues the job next start)");
     }
     convert_gate.abort();
+
+    // W21: the model chain gets the same quit bound as the VR path: stop its
+    // threads (at most 2 s); while one is still inside a fetcher call the panel
+    // is left to the process exit. This path never destroys the runtime anyway -
+    // end_title does not return - so the release only states the policy.
+    if (ui_runtime != nullptr && !viewer::stop_models_for_exit(*ui_runtime)) {
+        (void)ui_runtime.release();
+    }
 
     // ---- teardown ---------------------------------------------------------
     teardown();

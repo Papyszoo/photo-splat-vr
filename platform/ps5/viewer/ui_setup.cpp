@@ -14,11 +14,11 @@
 // from /app0/helper/splat-helper.elf (nothing to install on the console).
 //
 // Memory: converting SHARP (2.6 GiB .pt -> ~1.2 GiB GGUF) must not load the
-// checkpoint. core/model/converter.cpp streams one tensor at a time (64 KiB
-// chunks from miniz through an fp16 serialiser straight into the GGUF writer)
-// and sha256_file() hashes in 1 MiB chunks, so the peak stays a little above
-// the viewer's own footprint; the ru_maxrss lines around the conversion are the
-// measurement that keeps it that way.
+// checkpoint. core/model/converter.cpp streams one tensor at a time (1 MiB
+// chunks straight from the file in zip-offset order, fp16 serialised into the
+// GGUF writer) and sha256_file()/the download hash in 1 MiB chunks, so the peak
+// stays a little above the viewer's own footprint; the ru_maxrss lines around
+// the conversion are the measurement that keeps it that way.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -73,9 +74,11 @@ std::string mib_text(uint64_t kib) {
 // The manager's converter seam (ModelManagerOptions::Converter) with the C1
 // profiles the CLI uses: convert_checkpoint for SHARP's torch zip, the
 // safetensors profile for DA2-Small. Called on the ModelService worker thread
-// once the checkpoint has been verified.
+// once the checkpoint has been verified; `source_sha256` is that verification's
+// digest, so the converter does not read the 2.8 GB file again to hash it.
 Result<ConvertStats> convert_backend(const ModelBackendSpec& spec, const Path& source,
-                                     const Path& out, Progress& progress) {
+                                     const Path& out, const std::string& source_sha256,
+                                     Progress& progress) {
     const uint64_t before = peak_rss_kib();
     const std::string before_text = before == 0 ? std::string("unknown") : mib_text(before);
     line("viewer: models: converting %s, %s -> %s, peak RSS %s before", spec.name.c_str(),
@@ -83,6 +86,10 @@ Result<ConvertStats> convert_backend(const ModelBackendSpec& spec, const Path& s
 
     ConvertOptions options;
     options.backend = spec.name;
+    options.source_sha256 = source_sha256;
+    // The converter's own ~5 s line with MB/s read and written: the half of the
+    // "Preparing" phase the download's net lines could not show.
+    options.log = [](const std::string& text) { line("%s", text.c_str()); };
     Result<ConvertStats> converted =
         spec.name == "da2" ? splat::convert_depth_anything_v2(source, out, options, progress)
                            : splat::convert_checkpoint(source, out, options, progress);
@@ -93,12 +100,13 @@ Result<ConvertStats> convert_backend(const ModelBackendSpec& spec, const Path& s
         const ConvertStats& stats = converted.value();
         const uint64_t grew = after > before ? after - before : 0;
         const std::string grew_text = after == 0 ? std::string("unknown") : mib_text(grew);
-        line("viewer: models: converted %s in %.1f s, %llu tensor(s), %llu bytes, peak RSS %s "
-             "(+%s)",
+        line("viewer: models: converted %s in %.1f s, %llu tensor(s), %llu bytes, %.2f MB/s, peak "
+             "RSS %s (+%s)",
              spec.name.c_str(), stats.seconds,
              static_cast<unsigned long long>(stats.tensor_count),
-             static_cast<unsigned long long>(stats.gguf_bytes), after_text.c_str(),
-             grew_text.c_str());
+             static_cast<unsigned long long>(stats.gguf_bytes),
+             stats.seconds > 0.0 ? static_cast<double>(stats.gguf_bytes) / stats.seconds / 1e6 : 0.0,
+             after_text.c_str(), grew_text.c_str());
     } else {
         line("viewer: models: converting %s failed: %s (peak RSS %s)", spec.name.c_str(),
              converted.message().c_str(), after_text.c_str());
@@ -113,18 +121,61 @@ std::unique_ptr<ModelSetup> build_model_setup(const std::string& state_dir,
     auto setup = std::make_unique<ModelSetup>();
     setup->ui_state = splat::load_ui_state(state_dir);
 
-    if (online) setup->fetcher = std::make_unique<splat::Ps5HttpFetcher>();
+    if (online) {
+        setup->fetcher = std::make_unique<splat::Ps5HttpFetcher>();
+        // The transfer's own phases (connect, send, status, body start, bytes
+        // every ~5 s, end, error code or abort): the klog lines that date a
+        // stall on the next console run (runs/issue-1-crash/sharp-harden-report.md).
+        setup->fetcher->log = [](const std::string& text) { line("%s", text.c_str()); };
+    }
 
     splat::ModelManagerOptions manager_options;
     manager_options.state_dir = state_dir;
     manager_options.fetcher = setup->fetcher.get();
+    // One transfer at a time. Four ranged requests at once (0.6.0's speed-up)
+    // were never proven on hardware; the first real console download wedged with
+    // nothing transferred, and the frame loop was delayed at the same time. That
+    // the four concurrent sceHttp threads caused either is the leading
+    // hypothesis, not a measured fact: the klog has no HEAD-to-body marker and
+    // says nothing of sceHttp's internals (runs/issue-1-crash/sharp-dl-verify.md
+    // section 1.3). What is established is the discipline: sceHttp is only
+    // proven with setup/teardown serialised (ProsperoMgr holds one lock across
+    // each whole transfer), and with one at a time requests run front to back,
+    // one after the other. Segmentation is off below, so on the console that is
+    // the single plain GET. Flip this back to 0 once a gated create-then-read
+    // split has downloaded the checkpoint on the console.
+    manager_options.max_parallel_transfers = 1;
+    // No segments either, so the console asks for the file the one way this
+    // console has ever downloaded it: a plain GET (no Range header, status 200)
+    // of the whole 2.8 GB body in 64 KiB reads at 2-3 MB/s
+    // (runs/v0.2-library/REPORT-060-download.md). Every ranged request the
+    // console has made since asked for a body of 702 MB (four in parallel, then
+    // one) and stopped on its first body read without a byte
+    // (runs/issue-1-crash/console-klog-061.txt, -062.txt and sharp-read-report.md).
+    // A body of 60 MB or less was proven ranged in the bench
+    // (REPORT-060-probe.md) and 2 MiB ranged requests are what ProsperoMgr
+    // streams a game install with, so nothing says a range is wrong in itself;
+    // what is missing is a console run that reads one back. One transfer at a
+    // time also means segments buy no speed here: with `max_parallel_transfers`
+    // 1 they run front to back, which is the same resume position a plain GET
+    // leaves. Set this back to kSegmentedMinBytes when a gated ranged download
+    // has completed on the console (and re-test with DA2-Small, whose four
+    // segments are 25 MB, before SHARP's 702 MB).
+    manager_options.segment_min_bytes = std::numeric_limits<uint64_t>::max();
     // Empty specs: the built-in pinned SHARP and DA2-Small entries.
     manager_options.converter = &convert_backend;
+    // One line per phase with total time and MB/s: download, SHA-256, convert
+    // and the whole fetch (runs/issue-1-crash/sharp-fast-report.md).
+    manager_options.log = [](const std::string& text) { line("%s", text.c_str()); };
     setup->manager = std::make_unique<splat::ModelManager>(std::move(manager_options));
 
     splat::ModelServiceOptions service_options;
     service_options.state_dir = state_dir;
     service_options.legacy_models_dir = legacy_models_dir;
+    // The download's own klog lines (started, about 10 s of progress, stalled,
+    // ended). Without them a console log shows the row's 5% and nothing about
+    // the transfer: runs/issue-1-crash/sharp-dl-report.md section 1.
+    service_options.log = [](const std::string& text) { line("%s", text.c_str()); };
     setup->service = std::make_unique<splat::ModelService>(*setup->manager, setup->ui_state,
                                                            service_options);
 
@@ -146,6 +197,18 @@ std::unique_ptr<ModelSetup> build_model_setup(const std::string& state_dir,
              record.value().message.c_str());
     }
     return setup;
+}
+
+bool stop_models_for_exit(UiRuntime& runtime) {
+    if (runtime.model_setup == nullptr || runtime.model_setup->service == nullptr) return true;
+    splat::ModelService& service = *runtime.model_setup->service;
+    if (service.stop()) return true;
+    std::string what = service.running_text();
+    if (what.empty()) what = "a model thread";
+    line("viewer: models: %s is still running at exit; leaving the panel, the model and the "
+         "network request to the process exit",
+         what.c_str());
+    return false;
 }
 
 bool UiRuntime::start(splat::SplatRenderer& renderer, UiHost::Mode mode,

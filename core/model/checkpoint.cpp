@@ -131,6 +131,8 @@ Result<Checkpoint> open_checkpoint(const Path& path) {
                 std::to_string(expected_bytes) + " for tensor '" + record.name + "'");
         }
         tensor.record = record;
+        tensor.zip_offset = checkpoint.zip.entries()[static_cast<size_t>(entry_index)]
+                                .local_header_offset;
         checkpoint.tensors.push_back(std::move(tensor));
     }
 

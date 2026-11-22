@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,15 @@ struct ConvertOptions {
     // -> fp16). The parity tests consume the fp32 GGUF; the runtime uses the
     // default fp16 one. Applies to both profiles.
     bool keep_fp32 = false;
+    // The SHA-256 of `in` the caller already computed (the manager's
+    // hash-while-downloading, or a verify pass it ran for another reason). Empty:
+    // the converter hashes the file itself. Either way stats.source_sha256 is
+    // the digest that goes into the GGUF metadata and, with verify_sha256, the
+    // one checked against the pin: the file is never trusted unverified.
+    std::string source_sha256;
+    // One line every ~5 s of tensor I/O and one at the end: bytes read, bytes
+    // written and MB/s, so two console runs can be compared. Empty: no lines.
+    std::function<void(const std::string&)> log;
 };
 
 struct ConvertStats {

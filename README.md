@@ -10,58 +10,35 @@ The SHARP backend is an independent reimplementation of the
 written from the paper and the reference code's observable behaviour. No Apple
 code and no model weights are part of this repository.
 
+v0.6.1 fixes the SHARP model download on the console and makes Quit faster.
 v0.6 builds on the library features of v0.5 (photos in the common camera and
 web formats, splat import, rotate left or right on any photo or scene entry, and
 network libraries over SMB and NFS): the photo picker browses folders on every
-source, scenes can be saved straight to a network folder, the TV shows its own
-picture and menu, and the SHARP model downloads about three times faster.
-v0.1 does what the project set out to do: photos are converted on the console
-and the resulting scenes display in VR and on the TV. DA2-Small ships as an
-alternative, with approximate scene size.
+source, scenes can be saved straight to a network folder, and the TV shows its
+own picture and menu. v0.1 does what the project set out to do: photos are
+converted on the console and the resulting scenes display in VR and on the TV.
+DA2-Small ships as an alternative, with approximate scene size.
 
 - Repository: <https://github.com/Papyszoo/photo-splat-vr>
 - Specification: [`docs/spec.md`](docs/spec.md)
 - Decisions: [`docs/PLAN.md`](docs/PLAN.md)
 - Known issues: [`docs/BACKLOG.md`](docs/BACKLOG.md)
 
-## What is new in 0.6
+## What is new in 0.6.1
 
-- **Folders in the photo picker.** Every source (Console, Inbox, USB, network
-  locations) is a folder browser like Finder or Windows Explorer: folders first,
-  then the photos and splat files of the folder you are in. **Cross** opens a
-  folder, **Circle** goes up. **Square** on a folder no longer imports every
-  splat file below it: you pick the files yourself, and **Cross** on a splat
-  file imports it, from any source.
-- **Output folder.** `Settings > Output folder` chooses where new scenes are
-  saved: the console (default) or a folder on a network location, picked by
-  browsing that location's folders (**Square** = "Use this folder"). Scenes go
-  to `<output folder>/<album>/<scene>`, so albums look the same as on the
-  console. Existing scenes stay where they are.
-- **Albums on network scene libraries.** A network scene library lists the
-  folders that hold scenes as albums, and the scenes directly in the folder as
-  Unsorted. An offline share shows its own error.
-- **Offline share, no lost scene.** A scene whose network folder does not
-  answer shows "Waiting for <location>", stays on the console, tries again by
-  itself and is saved when the share is back. **Square** on the row cancels it.
-  A scene is saved under a hidden temporary name and only gets its real name once
-  it is whole, so a share that drops never leaves a half-saved scene.
-- **Faster model download.** The SHARP checkpoint (2.8 GB) downloads over four
-  connections at once, about 3 times faster on the console, and the Models row
-  shows "about N min left". A paused or interrupted download continues where it
-  stopped, and the checkpoint is still verified after it arrives.
-- **The TV has its own picture.** In VR the TV shows the scene without the VR
-  window or HUD and, while the menu is open, the same menu flat on the whole
-  screen. Anyone holding a controller can drive it, and it works before the
-  headset is on. If the console refuses the TV output, the TV mirrors the
-  headset's view as before.
-- **Scene and menu start in front of you.** The headset's tracker starts about
-  90 degrees off and corrects itself a few seconds later; the app now notices
-  and puts the scene and the open menu in front of where you face.
-- **Hold Options to recentre.** Hold **Options** for 1 second to recentre the
-  scene and the open menu, like the PSVR2 standard. A tap on **Options** still
-  opens and closes the menu, now when you let go.
-- **Steadier menu window.** Moving or turning your head no longer skews the
-  contents of the VR menu window.
+- **SHARP downloads on the console.** The 2.8 GB model no longer stops at 5%
+  with heavy lag: it downloads and gets ready in about 40 minutes on a base PS5
+  (firmware 13.60); faster work is planned. A download that stalls now fails
+  after 60 seconds with **Retry**, and **Cancel** and **Quit** always work.
+- **Faster Quit.** VR mode is turned off before the TV output closes, so
+  leaving the app no longer waits on the display.
+- **More firmware support.** PS VR2 support tables for firmware 5.50 to 13.60,
+  from the PS5VR project (Husam Osman, GPL-3.0), including 10.01.
+- **A message when support is missing.** On a firmware without a table, the TV
+  explains how to help add support instead of the app closing silently.
+- The version is 0.6.1 (`contentVersion` `01.006.001`). The 0.6.0 features
+  (folder browser, output folder, network albums, the TV's own picture, hold
+  Options to recentre) are unchanged; see the v0.6.0 release notes.
 
 ## Formats
 

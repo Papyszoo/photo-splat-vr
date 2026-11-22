@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -197,6 +198,9 @@ public:
     uint64_t abort_after = 0;
     int head_calls = 0;
     std::vector<uint64_t> range_offsets;
+    // Plain GETs that were handed a hash (FetchRequest::hash): the manager's
+    // hash-while-downloading path.
+    std::atomic<int> hash_calls{0};
 
     // Parallel download controls.
     bool hide_ranges = false;        // head() says the server offers no byte ranges
@@ -228,6 +232,7 @@ public:
 
     Status download(const FetchRequest& request) override {
         const bool segment = request.end != 0;
+        if (request.hash != nullptr) ++hash_calls;
         const UrlParts parts = parse_url(request.url);
         httplib::Client client(parts.host, parts.port);
         std::error_code error;
@@ -305,6 +310,7 @@ public:
                     aborted = true;
                     return false;
                 }
+                if (request.hash != nullptr && take > 0) request.hash->update(data, take);
                 written += take;
                 if (request.written != nullptr) request.written->store(written);
                 if (request.progress != nullptr && request.total_bytes > 0) {
@@ -378,9 +384,8 @@ Result<ConvertStats> write_fake_gguf(const ModelBackendSpec& spec, const Path& o
 }
 
 ModelManagerOptions::Converter fake_converter() {
-    return [](const ModelBackendSpec& spec, const Path&, const Path& out, Progress& progress) {
-        return write_fake_gguf(spec, out, progress);
-    };
+    return [](const ModelBackendSpec& spec, const Path&, const Path& out, const std::string&,
+              Progress& progress) { return write_fake_gguf(spec, out, progress); };
 }
 
 // A small stand-in for the pinned checkpoint: same backend identity, test URL
@@ -526,6 +531,9 @@ TEST_CASE("model manager: an interrupted download resumes from the .part file") 
     fetcher.abort_after = 0;
     const Status resumed = manager.fetch("sharp", progress);
     REQUIRE_MESSAGE(resumed.ok(), resumed.message());
+    // One SHA-256, not two: the plain GET carries the hasher, and the resume
+    // path feeds it the .part's 1200-byte prefix before the transfer appends.
+    CHECK(fetcher.hash_calls.load() >= 2);
 
     const Result<ModelRecord> ready = manager.status("sharp");
     REQUIRE_MESSAGE(ready.ok(), ready.message());
@@ -882,6 +890,92 @@ TEST_CASE("model manager: a download stopped mid-segment resumes every segment t
     REQUIRE_MESSAGE(ready.ok(), ready.message());
     CHECK(ready.value().state == ModelState::Ready);
     CHECK(ready.value().source_sha256 == sha256_of(payload));
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    CHECK_FALSE(std::filesystem::exists(part));
+    CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
+}
+
+// The console asks for one plain GET (ModelManagerOptions::segment_min_bytes =
+// UINT64_MAX, platform/ps5/viewer/ui_setup.cpp). A .part left by a segmented
+// build cannot be resumed then: its bytes may belong to segments that did not
+// start at 0, so both files go and the download starts clean, with no Range.
+TEST_CASE("model manager: a layout from a segmented build is discarded when segmentation is off") {
+    splat_test::TempDir temp("model-segments-off");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+
+    // Leave the layout and a non-zero prefix behind, as an interrupted 0.6.x
+    // download would.
+    TestFetcher segmented_fetcher;
+    ModelManager segmented(segmented_options(temp.path(), spec, &segmented_fetcher));
+    REQUIRE(segmented.accept_license("sharp", "accepted").ok());
+    segmented_fetcher.stop_after_total = 120000;
+    Progress progress;
+    REQUIRE_FALSE(segmented.fetch("sharp", progress).ok());
+    const Path part = temp.path() / "downloads" / "model.bin.part";
+    REQUIRE(std::filesystem::exists(splat::segments_path(part)));
+
+    TestFetcher fetcher;
+    ModelManagerOptions options = options_for(temp.path(), spec, &fetcher);
+    options.segment_min_bytes = std::numeric_limits<uint64_t>::max();  // the console's switch
+    ModelManager manager(std::move(options));
+    const Status fetched = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(fetched.ok(), fetched.message());
+
+    // One request from byte 0, appended, and no ranged segment request at all.
+    REQUIRE(fetcher.range_offsets.size() == 1);
+    CHECK(fetcher.range_offsets[0] == 0);
+    CHECK(fetcher.segment_ranges.empty());
+    CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
+    CHECK_FALSE(std::filesystem::exists(part));
+    CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
+}
+
+// Fewer bytes left than segment_min_bytes_ means a near-finished download, not
+// "segmentation is off" (that is UINT64_MAX only): the valid layout is resumed
+// segment by segment instead of being discarded for one GET from byte 0.
+TEST_CASE("model manager: a segmented download resumes with less than the threshold left") {
+    splat_test::TempDir temp("model-segments-below-threshold");
+    const std::string payload = make_payload(kSegmentPayload);
+    RangeServer server(payload);
+    const ModelBackendSpec spec = small_spec("sharp", server.url(), payload);
+
+    TestFetcher fetcher;
+    ModelManagerOptions options = segmented_options(temp.path(), spec, &fetcher);
+    options.segment_min_bytes = 150000;  // the whole 200000 segments, the 80000 tail does not
+    ModelManager manager(std::move(options));
+    REQUIRE(manager.accept_license("sharp", "accepted").ok());
+
+    fetcher.stop_after_total = 120000;
+    Progress progress;
+    REQUIRE_FALSE(manager.fetch("sharp", progress).ok());
+
+    const Path part = temp.path() / "downloads" / "model.bin.part";
+    std::vector<splat::DownloadSegment> segments;
+    REQUIRE(splat::read_segments(part, payload.size(), &segments) == splat::SegmentsState::valid);
+    CHECK(splat::segments_done(segments) == 120000);
+
+    // 80000 bytes are left, below the 150000 threshold: every segment resumes
+    // from where it stopped, and no request re-fetches a byte the .part holds.
+    // The exact remainder set is the check, not "no request starts at 0": the
+    // first segment legitimately asks from 0 when it got no byte before the
+    // abort (which segment does depends on the four threads' timing), while a
+    // discarded layout would be one plain GET of the whole file.
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (const splat::DownloadSegment& segment : segments) {
+        if (segment.begin + segment.done >= segment.end) continue;
+        expected.emplace_back(segment.begin + segment.done, segment.end);
+    }
+    fetcher.stop_after_total = 0;
+    fetcher.total_written = 0;
+    fetcher.range_offsets.clear();
+    fetcher.segment_ranges.clear();
+    const Status resumed = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(resumed.ok(), resumed.message());
+    CHECK(requested_bytes(fetcher.segment_ranges) == payload.size() - 120000);
+    CHECK(sorted(fetcher.segment_ranges) == sorted(expected));
+    CHECK(fetcher.range_offsets.size() == expected.size());  // segments only, never a plain GET
     CHECK(read_file(temp.path() / "downloads" / "model.bin") == payload);
     CHECK_FALSE(std::filesystem::exists(part));
     CHECK_FALSE(std::filesystem::exists(splat::segments_path(part)));
