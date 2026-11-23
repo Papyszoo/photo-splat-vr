@@ -495,6 +495,12 @@ void ModelService::download_loop(const std::string& id) {
 }
 
 void ModelService::monitor_loop() {
+    // The one disk cleanup of the worker side, before the first tick: a Ready
+    // SHARP install reclaims a 0.6.1 .pt that the old download-then-convert path
+    // left beside the GGUF, and a hard-killed streaming attempt's
+    // models/sharp.gguf.part goes with it (nothing resumes that file).
+    // Never on the render thread.
+    manager_.reclaim_streamed_sources();
     uint64_t last_bytes = 0;
     auto last_change = std::chrono::steady_clock::now();
     for (;;) {
@@ -679,8 +685,12 @@ Status ModelService::download(const std::string& id) {
         return Status::error("accept the " + spec->license_name + " licence first");
     }
 
-    const uint64_t required =
-        spec->source_bytes + converted_bytes(id) + kFreeSpaceMarginBytes;
+    // The streaming path never stores the checkpoint, so it needs only what it
+    // writes: the GGUF plus the margin. The file path writes the .pt and then
+    // the GGUF, so it needs both. Asking for 4.4 GB here would refuse the very
+    // consoles the streaming path is for (2-4 GB free).
+    const uint64_t source_bytes = manager_.streams_source(id) ? 0 : spec->source_bytes;
+    const uint64_t required = source_bytes + converted_bytes(id) + kFreeSpaceMarginBytes;
     const uint64_t available = free_bytes_(state_dir_);
     if (available != UINT64_MAX && available < required) {
         return Status::error("Downloading " + name + " needs ~" + required_space_text(required) +

@@ -12,6 +12,8 @@
 
 namespace splat {
 
+class GgufWriter;
+
 struct ConvertOptions {
     // Spec rule 2: verify the pinned SHA-256 before converting. Only tests of
     // the fixtures turn this off.
@@ -52,6 +54,18 @@ struct ConvertStats {
 // at inference (docs/research/sharp-reference.md §3 Q1).
 Result<ConvertStats> convert_checkpoint(const Path& in, const Path& out, const ConvertOptions& options,
                                         Progress& progress);
+
+// Registers every metadata value the SHARP GGUF carries. The file converter and
+// the streaming converter both call it, in this order, so their output bytes
+// stay identical (a streaming conversion cannot know the checkpoint's SHA-256
+// before its last byte; see GgufWriter::patch_string).
+void write_sharp_gguf_metadata(GgufWriter& writer, const std::string& backend,
+                               const std::string& source_sha256, const std::string& source_filename,
+                               uint64_t source_bytes, uint32_t source_tensor_count,
+                               uint32_t tensor_count, uint32_t dropped_tensor_count,
+                               const std::vector<std::string>& dropped_tensors,
+                               const std::vector<std::string>& source_tensor_names,
+                               bool keep_fp32);
 
 // True for tensors the converter drops.
 bool is_dead_tensor(const std::string& torch_name);

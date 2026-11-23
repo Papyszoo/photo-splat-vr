@@ -63,6 +63,10 @@ struct TransferState {
     // Hash-while-downloading (FetchRequest::hash): fed after a successful write,
     // reset when the file has to start over.
     Sha256* hash = nullptr;
+    // Stream mode (FetchRequest::sink): the body goes to this sink instead of
+    // the file; `path` may be empty. A false return fails the transfer.
+    const std::function<bool(const void*, size_t)>* sink = nullptr;
+    bool sink_failed = false;
 };
 
 struct TextState {
@@ -131,6 +135,7 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
             return 0;
         }
         if (state->truncate_on_first_write) {
+            // A stream sink never resumes, so this can only be the file path.
             std::fclose(state->file);
             state->file = std::fopen(state->path.c_str(), "wb");
             if (state->file == nullptr) {
@@ -144,7 +149,12 @@ size_t write_callback(char* data, size_t size, size_t count, void* userdata) {
     }
 
     if (bytes == 0) return 0;
-    if (std::fwrite(data, 1, bytes, state->file) != bytes) {
+    if (state->sink != nullptr) {
+        if (!(*state->sink)(data, bytes)) {
+            state->sink_failed = true;
+            return 0;  // abort the transfer
+        }
+    } else if (std::fwrite(data, 1, bytes, state->file) != bytes) {
         state->write_failed = true;
         return 0;
     }
@@ -244,13 +254,23 @@ Result<HttpResource> CurlHttpFetcher::head(const std::string& url) {
 Status CurlHttpFetcher::download(const FetchRequest& request) {
     ensure_curl_global();
     if (request.url.empty()) return Status::error("download needs a URL");
-    if (request.destination.empty()) return Status::error("download needs a destination path");
+    const bool streaming = static_cast<bool>(request.sink);
+    if (!streaming && request.destination.empty()) return Status::error("download needs a destination path");
+    if (streaming && request.end != 0) {
+        return Status::error("a stream sink cannot be used for a download segment");
+    }
+    if (streaming && request.offset != 0) {
+        return Status::error("the streaming transfer cannot resume at byte " +
+                             std::to_string(request.offset));
+    }
 
-    std::error_code directory_error;
-    std::filesystem::create_directories(request.destination.parent_path(), directory_error);
-    if (directory_error) {
-        return Status::error("cannot create " + request.destination.parent_path().string() + ": " +
-                             directory_error.message());
+    if (!streaming) {
+        std::error_code directory_error;
+        std::filesystem::create_directories(request.destination.parent_path(), directory_error);
+        if (directory_error) {
+            return Status::error("cannot create " + request.destination.parent_path().string() + ": " +
+                                 directory_error.message());
+        }
     }
 
     CurlHandle curl;
@@ -266,19 +286,22 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     state.written_out = request.written;
     // Segment bodies arrive out of order, so the contract says no hash there.
     state.hash = request.end != 0 ? nullptr : request.hash;
+    state.sink = streaming ? &request.sink : nullptr;
     if (state.segment && request.end <= request.offset) return Status::error("download segment is empty");
-    state.file = std::fopen(state.path.c_str(),
-                            state.segment ? "r+b" : (request.offset > 0 ? "ab" : "wb"));
-    if (state.file == nullptr) return Status::error("cannot open " + state.path + " for writing");
-    if (state.segment) {
-        // Unbuffered: a byte counted in `written` is in the file, so the resume
-        // state of a parallel download never claims more than the file holds.
-        if (fseeko(state.file, static_cast<off_t>(request.offset), SEEK_SET) != 0) {
-            std::fclose(state.file);
-            state.file = nullptr;
-            return Status::error("cannot seek in " + state.path);
+    if (!streaming) {
+        state.file = std::fopen(state.path.c_str(),
+                                state.segment ? "r+b" : (request.offset > 0 ? "ab" : "wb"));
+        if (state.file == nullptr) return Status::error("cannot open " + state.path + " for writing");
+        if (state.segment) {
+            // Unbuffered: a byte counted in `written` is in the file, so the resume
+            // state of a parallel download never claims more than the file holds.
+            if (fseeko(state.file, static_cast<off_t>(request.offset), SEEK_SET) != 0) {
+                std::fclose(state.file);
+                state.file = nullptr;
+                return Status::error("cannot seek in " + state.path);
+            }
+            std::setvbuf(state.file, nullptr, _IONBF, 0);
         }
-        std::setvbuf(state.file, nullptr, _IONBF, 0);
     }
 
     struct Closer {
@@ -319,6 +342,9 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
     if (state.write_failed) {
         return Status::error("failed while writing " + request.destination.string());
     }
+    if (state.sink_failed) {
+        return Status::error(request.url + ": the stream converter refused the body");
+    }
     if (code == CURLE_ABORTED_BY_CALLBACK) {
         if (request.cancelled && request.cancelled()) return Status::error("download cancelled");
         return Status::error(request.url + ": transfer aborted");
@@ -330,7 +356,7 @@ Status CurlHttpFetcher::download(const FetchRequest& request) {
         return Status::error("HTTP " + std::to_string(state.header.status) + " from " + request.url);
     }
 
-    if (std::fflush(state.file) != 0) {
+    if (!streaming && std::fflush(state.file) != 0) {
         return Status::error("cannot flush " + request.destination.string());
     }
     if (state.segment && state.written != request.end - request.offset) {

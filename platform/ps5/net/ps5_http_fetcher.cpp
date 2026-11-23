@@ -52,6 +52,7 @@ using ps5::RangeDecision;
 using ps5::ResponseHeaders;
 
 using Clock = std::chrono::steady_clock;
+using BodySink = std::function<bool(const void*, size_t)>;
 
 // sceHttpCreateRequestWithURL takes the method as an enum; GET is 0 and HEAD is
 // 2 (the order in Sony's SceHttpMethods). ProsperoMgr and elfldr both send
@@ -434,40 +435,51 @@ Status Ps5HttpFetcher::download(const FetchRequest& request) {
         // One segment of a parallel download: [offset, end) written in place.
         // Bodies arrive out of order, so no hash-while-downloading here.
         if (request.end <= request.offset) return Status::error("download segment is empty");
+        if (request.sink) return Status::error("a stream sink cannot be used for a download segment");
         return download_impl(request.url, request.destination, request.offset,
                              request.end - request.offset, request.total_bytes, request.progress,
-                             request.cancelled, true, request.written, nullptr);
+                             request.cancelled, true, request.written, nullptr, nullptr);
     }
     return download_impl(request.url, request.destination, request.offset, 0, request.total_bytes,
-                         request.progress, request.cancelled, false, request.written, request.hash);
+                         request.progress, request.cancelled, false, request.written, request.hash,
+                         request.sink ? &request.sink : nullptr);
 }
 
 Status Ps5HttpFetcher::download_range(const std::string& url, const Path& destination, uint64_t offset,
                                       uint64_t max_bytes, Progress* progress,
                                       std::function<bool()> cancelled) {
     return download_impl(url, destination, offset, max_bytes, 0, progress, cancelled, false, nullptr,
-                         nullptr);
+                         nullptr, nullptr);
 }
 
 Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destination, uint64_t offset,
                                      uint64_t max_bytes, uint64_t total_bytes, Progress* progress,
                                      const std::function<bool()>& cancelled, bool in_place,
-                                     std::atomic<uint64_t>* written_out, Sha256* hash) {
+                                     std::atomic<uint64_t>* written_out, Sha256* hash,
+                                     const BodySink* sink) {
     if (url.empty()) return Status::error("download needs a URL");
-    if (destination.empty()) return Status::error("download needs a destination path");
+    const bool streaming = sink != nullptr;
+    if (!streaming && destination.empty()) return Status::error("download needs a destination path");
+    if (streaming && offset != 0) {
+        return Status::error("the streaming transfer cannot resume at byte " + std::to_string(offset));
+    }
     // A cancel that arrived before this transfer started must not open a
     // connection at all (and `cancelled` is polled again after the setup lock).
     if (cancelled && cancelled()) return Status::error("download cancelled");
 
-    const Path parent = destination.parent_path();
-    if (!parent.empty()) {
-        std::error_code directory_error;
-        std::filesystem::create_directories(parent, directory_error);
-        if (directory_error) {
-            return Status::error("cannot create " + parent.string() + ": " +
-                                 directory_error.message());
+    if (!streaming) {
+        const Path parent = destination.parent_path();
+        if (!parent.empty()) {
+            std::error_code directory_error;
+            std::filesystem::create_directories(parent, directory_error);
+            if (directory_error) {
+                return Status::error("cannot create " + parent.string() + ": " +
+                                     directory_error.message());
+            }
         }
     }
+    const std::string write_target = streaming ? std::string("the checkpoint stream")
+                                               : destination.string();
 
     std::unique_lock<std::shared_mutex> lock(setup_mutex());
     NetContext& context = shared_context();
@@ -542,22 +554,25 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
         return Status::error(message);
     }
 
-    FilePtr file(std::fopen(destination.string().c_str(),
-                            in_place ? "r+b" : (offset > 0 ? "ab" : "wb")));
-    if (file == nullptr) {
-        const std::string message = "cannot open " + destination.string() + " for writing";
-        if (log) log("model net: request " + std::to_string(request.request) + " failed: " + message);
-        return Status::error(message);
-    }
-    if (in_place) {
-        // Unbuffered: a byte counted in written_out is in the file, so the resume
-        // state never claims more than the file holds.
-        if (fseeko(file.get(), static_cast<off_t>(offset), SEEK_SET) != 0) {
-            const std::string message = "cannot seek in " + destination.string();
+    FilePtr file;
+    if (!streaming) {
+        file.reset(std::fopen(destination.string().c_str(),
+                              in_place ? "r+b" : (offset > 0 ? "ab" : "wb")));
+        if (file == nullptr) {
+            const std::string message = "cannot open " + destination.string() + " for writing";
             if (log) log("model net: request " + std::to_string(request.request) + " failed: " + message);
             return Status::error(message);
         }
-        std::setvbuf(file.get(), nullptr, _IONBF, 0);
+        if (in_place) {
+            // Unbuffered: a byte counted in written_out is in the file, so the resume
+            // state never claims more than the file holds.
+            if (fseeko(file.get(), static_cast<off_t>(offset), SEEK_SET) != 0) {
+                const std::string message = "cannot seek in " + destination.string();
+                if (log) log("model net: request " + std::to_string(request.request) + " failed: " + message);
+                return Status::error(message);
+            }
+            std::setvbuf(file.get(), nullptr, _IONBF, 0);
+        }
     }
 
     uint64_t effective_offset = offset;
@@ -616,12 +631,18 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
     const auto flush_writes = [&]() -> bool {
         if (write_buffer.empty()) return true;
         const size_t bytes = write_buffer.size();
-        if (std::fwrite(write_buffer.data(), 1, bytes, file.get()) != bytes) return false;
+        if (streaming) {
+            // No file: the checkpoint's bytes go straight into the streaming
+            // converter (the GGUF), which is the only /data write of this path.
+            if (!(*sink)(write_buffer.data(), bytes)) return false;
+        } else {
+            if (std::fwrite(write_buffer.data(), 1, bytes, file.get()) != bytes) return false;
+        }
         if (hash != nullptr) hash->update(write_buffer.data(), bytes);
         write_buffer.clear();
         flushed += bytes;
         if (written_out != nullptr) written_out->store(flushed, std::memory_order_relaxed);
-        if (flushed - drop_from >= kCacheBatchBytes) {
+        if (!streaming && flushed - drop_from >= kCacheBatchBytes) {
             // Clean pages are safe to drop; the bytes are on the disk already. A
             // failed flush or fsync fails the transfer exactly like a short
             // write: the resume position must never claim bytes that are not on
@@ -671,13 +692,13 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
         if (read == 0) break;  // clean EOF
         const size_t bytes = static_cast<size_t>(read);
         if (write_buffer.size() + bytes > kWriteChunkBytes && !flush_writes()) {
-            body_status = Status::error("failed while writing " + destination.string());
+            body_status = Status::error("failed while writing " + write_target);
             break;
         }
         write_buffer.insert(write_buffer.end(), chunk.begin(), chunk.begin() + bytes);
         written += bytes;
         if (write_buffer.size() >= kWriteChunkBytes && !flush_writes()) {
-            body_status = Status::error("failed while writing " + destination.string());
+            body_status = Status::error("failed while writing " + write_target);
             break;
         }
 
@@ -711,7 +732,7 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
     // Everything received is written before the transfer is judged: the resume
     // position and the bytes on disk must agree.
     if (body_status.ok() && !flush_writes()) {
-        body_status = Status::error("failed while writing " + destination.string());
+        body_status = Status::error("failed while writing " + write_target);
     }
     // Re-taking the exclusive side here is what keeps the delete below out of
     // every other transfer's read.
@@ -724,12 +745,12 @@ Status Ps5HttpFetcher::download_impl(const std::string& url, const Path& destina
         return body_status;
     }
 
-    if (std::fflush(file.get()) != 0) {
+    if (!streaming && std::fflush(file.get()) != 0) {
         const std::string message = "cannot flush " + destination.string();
         if (log) log("model net: request " + std::to_string(request.request) + " failed: " + message);
         return Status::error(message);
     }
-    if (flushed > drop_from) {
+    if (!streaming && flushed > drop_from) {
         // The tail batch (under 64 MiB): sync it and drop it too, so the whole
         // file is on the disk and none of it is dirty cache. Like the batch
         // syncs, a failure fails the transfer: the file must not be verified and

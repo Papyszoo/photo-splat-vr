@@ -15,13 +15,29 @@ Writes two files next to this script (tests/fixtures/model/):
 Shapes and names follow the real state dict closely, including tensors the
 converter must drop (the two ViT classifier heads and the depth_adjustment
 U-Net) and 1-D tensors that must stay float32.
+
+torch.save writes the data/<key> entries in creation (numeric) order; the
+Apple checkpoint has them in sorted-key order, which is the only order the
+streaming converter can predict from data.pkl alone. The archive is therefore
+rewritten in place after torch.save() (reorder_storage_entries): the same local
+header + payload + descriptor blocks, sorted, with a rebuilt central directory.
+
+    python3 tests/fixtures/model/make_fixture.py --reorder-only
+
+re-applies that reordering and updates the digest in synthetic.json without
+torch.
 """
 import collections
 import hashlib
 import json
 import os
+import struct
+import sys
 
-import torch
+LOCAL_SIG = b"PK\x03\x04"
+CENTRAL_SIG = b"PK\x01\x02"
+END_SIG = b"PK\x05\x06"
+ZIP64_END_SIG = b"PK\x06\x06"
 
 # The script lives beside its output, so it regenerates the fixture in place.
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +87,76 @@ def manifest(state, dropped):
     return tensors
 
 
+def reorder_storage_entries(path):
+    """Sorts the data/<key> entries of a torch.save archive by key, in place.
+
+    Only the local header + payload + descriptor blocks are copied; the central
+    directory is rebuilt with the new offsets. The archive's total size and the
+    blocks themselves do not change, so the records after the central directory
+    (zip64 end + locator + end) are copied verbatim.
+    """
+    data = open(path, "rb").read()
+    end = data.rfind(END_SIG)
+    zip64_end = data.rfind(ZIP64_END_SIG)
+    count = struct.unpack_from("<H", data, end + 10)[0]
+    if zip64_end >= 0:
+        cd_offset = struct.unpack_from("<Q", data, zip64_end + 48)[0]
+    else:
+        cd_offset = struct.unpack_from("<I", data, end + 16)[0]
+
+    entries = []
+    at = cd_offset
+    for _ in range(count):
+        fields = struct.unpack_from("<IHHHHHHIIIHHHHHII", data, at)
+        flags, name_len, extra_len, comment_len = fields[3], fields[10], fields[11], fields[12]
+        record_end = at + 46 + name_len + extra_len + comment_len
+        name = data[at + 46:at + 46 + name_len].decode()
+        local = fields[16]
+        local_name, local_extra = struct.unpack_from("<HH", data, local + 26)
+        payload = fields[8]  # stored entries: compressed size == payload size
+        block_end = local + 30 + local_name + local_extra + payload
+        if flags & 0x8:  # a 16-byte data descriptor follows the payload
+            block_end += 16
+        entries.append({"name": name, "record": data[at:record_end], "block": data[local:block_end]})
+        at = record_end
+
+    keys = [i for i, entry in enumerate(entries) if "/data/" in entry["name"]]
+    if keys:
+        first, last = keys[0], keys[-1]
+        ordered = (entries[:first] +
+                   sorted(entries[first:last + 1], key=lambda entry: entry["name"].rsplit("/", 1)[-1]) +
+                   entries[last + 1:])
+    else:
+        ordered = entries
+
+    out = bytearray()
+    records = bytearray()
+    for entry in ordered:
+        record = bytearray(entry["record"])
+        struct.pack_into("<I", record, 42, len(out))  # relative offset of the local header
+        out += entry["block"]
+        records += record
+    out += records
+    out += data[cd_offset + sum(len(e["record"]) for e in entries):]
+
+    with open(path, "wb") as handle:
+        handle.write(out)
+    return len(out)
+
+
+def update_manifest_digest():
+    size = os.path.getsize(OUT_PT)
+    digest = hashlib.sha256(open(OUT_PT, "rb").read()).hexdigest()
+    with open(OUT_JSON) as handle:
+        document = json.load(handle)
+    document["checkpoint_sha256"] = digest
+    document["checkpoint_bytes"] = size
+    with open(OUT_JSON, "w") as handle:
+        json.dump(document, handle, indent=1)
+        handle.write("\n")
+    return digest, size
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     state = collections.OrderedDict()
@@ -104,6 +190,7 @@ def main():
                or name.endswith("patch_encoder.head.bias")]
 
     torch.save(state, OUT_PT)
+    reorder_storage_entries(OUT_PT)
 
     size = os.path.getsize(OUT_PT)
     digest = hashlib.sha256(open(OUT_PT, "rb").read()).hexdigest()
@@ -130,4 +217,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--reorder-only"]:
+        reorder_storage_entries(OUT_PT)
+        digest, size = update_manifest_digest()
+        print(f"reordered {OUT_PT} ({size} B), sha256 {digest}")
+    else:
+        import torch  # imported here so --reorder-only runs without the venv
+
+        main()

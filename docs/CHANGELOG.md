@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.2
+
+### Added
+
+- A TV-only session. When PS VR2 cannot start - the headset is switched off (Hmd2 device status 2), there is no headset to open, or the firmware has no PSVR2 export table and the card's **X** is answered - the VR session continues on the TV instead of ending on the home screen: no Hmd2, tracker, reprojection or mirror calls, mono 1920x1080 at 60 Hz, the DualSense drives the menu and the scene, and the camera is a seated head pose at the capture point. Starting with the headset on keeps the full VR session. A TV-only session does not look for a headset afterwards; plugging one in needs a restart.
+- The per-second `viewer: tv t=` fps line in that session. `POSE_LOG=1` still gates only the per-frame CSV.
+
+### Changed
+
+- SHARP setup takes about 11 minutes on a base PS5 (firmware 13.60) instead of about 38. The 2.8 GB checkpoint is converted to the GGUF while it downloads (`core/model/stream_converter.cpp`): only the GGUF is written, in 8 MiB synced batches, and the whole stream is hashed against the pinned SHA-256 before the file is marked Ready. The free-space check asks for the converted model plus a 256 MiB margin (about 1.6 GB) instead of the checkpoint and the GGUF. Leftovers from older versions - the `.pt`, its `.part` and `.segments`, a partial GGUF - are removed when the model is already converted or before the next download.
+- The expected start without a usable headset logs `hmd2 init at ...` without "FAIL" (the headset is off, or there is no headset to open); a real init error and the firmware card keep it.
+- The version is 0.6.2 (`contentVersion` `01.006.002`).
+
 ## 0.6.1
 
 ### Fixed

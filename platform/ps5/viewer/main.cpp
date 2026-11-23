@@ -1059,7 +1059,7 @@ int main(int, char**) {
         line("viewer: mode vr (MODE=vr in %s); TV mode is MODE=tv",
              options.env_ok ? kEnvPath.c_str() : "(defaults)");
         const int status = viewer::run_vr(vr);
-        end_title(status, status == 0 ? "vr done" : "vr FAIL");
+        end_title(status, status == 0 ? "session ended" : "session FAIL");
     }
 
     // ---- TV mode ----------------------------------------------------------

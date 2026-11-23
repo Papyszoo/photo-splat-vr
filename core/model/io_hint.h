@@ -3,12 +3,14 @@
 // The SHARP-ready investigation (runs/issue-1-crash/sharp-slow-report.md §2-§4)
 // measured the console buffering ~1.5 GB of a 2.8 GB download as dirty page
 // cache before every write started to cost 15-40 ms, and the frame rate fell
-// with it. The download and the converter therefore write in 64 MiB batches:
-// each batch is flushed and fsync'ed (so the pages are clean and the disk has
-// the bytes), then its range is dropped from the page cache, so the model file
-// does not compete with the VR renderer for memory. The same drop trails the
-// converter's reads of the .pt, which are one forward sweep after the
-// zip-offset ordering change.
+// with it. The download and the converter therefore write in batches: each
+// batch is flushed and fsync'ed (so the pages are clean and the disk has the
+// bytes), then its range is dropped from the page cache, so the model file
+// does not compete with the VR renderer for memory. The download's batch is
+// 64 MiB; the GGUF writer's is 8 MiB (model/gguf_writer.h), because in the
+// streaming path its sync runs inside the network sink and the stall watchdog
+// has to see it as progress. The same drop trails the converter's reads of the
+// .pt, which are one forward sweep after the zip-offset ordering change.
 //
 // POSIX_FADV_DONTNEED is a page-cache hint: dropping clean pages is safe and
 // the data is still on disk. The console's SDK declares posix_fadvise but no

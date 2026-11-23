@@ -13,6 +13,7 @@
 
 #ifdef SPLAT_MODEL_NET_TESTS
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -36,8 +38,10 @@
 #include "httplib/httplib.h"
 
 #include "model/checkpoint.h"
+#include "model/converter.h"
 #include "model/model_manager.h"
 #include "model/segmented_download.h"
+#include "model/sha256.h"
 #include "platform/desktop/curl_http_fetcher.h"
 #include "test_util.h"
 #include "ui/model_service.h"
@@ -388,6 +392,141 @@ splat::ModelBackendSpec stall_spec(const std::string& url) {
     return spec;
 }
 
+// Serves the first `send_bytes` of a real checkpoint body and then holds the
+// connection open, like StallServer but with a body the streaming converter can
+// start on. HEAD announces the complete size, as a real server does.
+class PayloadStallServer {
+public:
+    PayloadStallServer(std::string payload, size_t send_bytes)
+        : payload_(std::move(payload)), send_bytes_(send_bytes) {
+        listener_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_ < 0) throw std::runtime_error("cannot create the payload server socket");
+        int reuse = 1;
+        ::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = 0;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            ::listen(listener_, 4) != 0) {
+            ::close(listener_);
+            throw std::runtime_error("cannot bind the payload server socket");
+        }
+        socklen_t length = sizeof(address);
+        if (::getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+            ::close(listener_);
+            throw std::runtime_error("cannot read the payload server port");
+        }
+        port_ = ntohs(address.sin_port);
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~PayloadStallServer() { stop(); }
+    PayloadStallServer(const PayloadStallServer&) = delete;
+    PayloadStallServer& operator=(const PayloadStallServer&) = delete;
+
+    std::string url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/synthetic.pt";
+    }
+
+private:
+    void stop() {
+        stop_.store(true);
+        if (thread_.joinable()) thread_.join();
+        if (listener_ >= 0) {
+            ::close(listener_);
+            listener_ = -1;
+        }
+    }
+
+    void serve() {
+        while (!stop_.load()) {
+            pollfd waiting{listener_, POLLIN, 0};
+            if (::poll(&waiting, 1, 50) <= 0) continue;
+            const int client = ::accept(listener_, nullptr, nullptr);
+            if (client < 0) continue;
+            timeval receive_timeout{2, 0};
+            ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
+                         sizeof(receive_timeout));
+#if defined(SO_NOSIGPIPE)
+            int on = 1;
+            ::setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
+            handle(client);
+            ::close(client);
+        }
+    }
+
+    void handle(int client) {
+        std::string request;
+        char byte = 0;
+        while (request.size() < 16384 && request.find("\r\n\r\n") == std::string::npos) {
+            if (::recv(client, &byte, 1, 0) <= 0) return;
+            request.push_back(byte);
+            if (stop_.load()) return;
+        }
+        const bool head = request.rfind("HEAD ", 0) == 0;
+        const std::string headers = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                                    std::to_string(payload_.size()) +
+                                    "\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n";
+        if (!send_all(client, headers)) return;
+        if (head) return;
+        const size_t bytes = std::min(send_bytes_, payload_.size());
+        if (bytes > 0 && !send_all(client, payload_.substr(0, bytes))) return;
+        while (!stop_.load()) {
+            pollfd waiting{client, POLLIN, 0};
+            if (::poll(&waiting, 1, 50) > 0) {
+                char scratch[256];
+                if (::recv(client, scratch, sizeof(scratch), 0) <= 0) return;
+            }
+        }
+    }
+
+    static bool send_all(int socket, const std::string& data) {
+        size_t sent = 0;
+        while (sent < data.size()) {
+            const ssize_t count = ::send(socket, data.data() + sent, data.size() - sent, 0);
+            if (count <= 0) return false;
+            sent += static_cast<size_t>(count);
+        }
+        return true;
+    }
+
+    std::string payload_;
+    size_t send_bytes_ = 0;
+    std::atomic<bool> stop_{false};
+    int listener_ = -1;
+    uint16_t port_ = 0;
+    std::thread thread_;
+};
+
+std::string fixture_bytes() {
+    const std::filesystem::path path =
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / "model" / "synthetic.pt";
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("cannot open the synthetic checkpoint fixture");
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+std::string sha256_of(const std::string& bytes) {
+    return splat::Sha256::of_hex(bytes.data(), bytes.size());
+}
+
+// A "sharp" spec for the small fixture: the streaming converter only runs for
+// the sharp profile, and this shape keeps the licence gate and the real 2.8 GB
+// out of the test.
+splat::ModelBackendSpec stream_spec(const std::string& url, const std::string& digest,
+                                    uint64_t bytes) {
+    splat::ModelBackendSpec spec = splat::sharp_model_spec();
+    spec.source_url = url;
+    spec.source_filename = "synthetic.pt";
+    spec.source_bytes = bytes;
+    spec.source_sha256 = digest;
+    spec.license_url.clear();
+    spec.license_name = "test fixture";
+    return spec;
+}
+
 template <typename Predicate>
 bool wait_for(Predicate predicate, double seconds = 10.0) {
     const auto deadline =
@@ -542,6 +681,453 @@ TEST_CASE("model service: bounded stop ends a stalled download before the fixtur
         std::chrono::duration<double>(std::chrono::steady_clock::now() - stop_started).count();
     MESSAGE("stopping and destroying the service took " << seconds << " s");
     CHECK(seconds < 2.0);
+}
+
+// ---- streaming conversion (SHARP, converter fed by the network body) --------
+struct StreamServiceUnderTest {
+    StreamServiceUnderTest(const std::string& url, const std::string& digest, uint64_t bytes,
+                           double stall_seconds)
+        : manager(options(url, digest, bytes)), service(manager, state, service_options(stall_seconds)) {}
+
+    splat::ModelManagerOptions options(const std::string& url, const std::string& digest,
+                                       uint64_t bytes) {
+        splat::ModelManagerOptions value;
+        value.state_dir = temp.path();
+        value.fetcher = &fetcher;
+        value.specs = {stream_spec(url, digest, bytes)};
+        value.convert_while_downloading = true;
+        value.converter = [](const splat::ModelBackendSpec&, const splat::Path&, const splat::Path&,
+                             const std::string&, splat::Progress&) {
+            return splat::Result<splat::ConvertStats>::failure(
+                "the file converter must not run on the streaming path");
+        };
+        return value;
+    }
+
+    splat::ModelServiceOptions service_options(double stall_seconds) {
+        splat::ModelServiceOptions value;
+        value.state_dir = temp.path();
+        value.stall_timeout_seconds = stall_seconds;
+        value.log = [this](const std::string& text) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            lines.push_back(text);
+        };
+        return value;
+    }
+
+    splat_test::TempDir temp{"stream-service"};
+    splat::CurlHttpFetcher fetcher;
+    splat::ModelManager manager;
+    splat::UiState state;
+    std::mutex log_mutex;
+    std::vector<std::string> lines;
+    splat::ModelService service;
+};
+
+TEST_CASE("model manager: SHARP converts while downloading, without a .pt") {
+    const std::string payload = fixture_bytes();
+    RangeServer server(payload, true);
+    splat_test::TempDir temp("stream-full");
+    const splat::Path state_dir = temp.path();
+
+    splat::CurlHttpFetcher fetcher;
+    splat::ModelManagerOptions options;
+    options.state_dir = state_dir;
+    options.fetcher = &fetcher;
+    options.specs = {stream_spec(server.url(), sha256_of(payload), payload.size())};
+    options.convert_while_downloading = true;
+    options.converter = [](const splat::ModelBackendSpec&, const splat::Path&, const splat::Path&,
+                           const std::string&, splat::Progress&) {
+        return splat::Result<splat::ConvertStats>::failure("the file converter must not run");
+    };
+    std::vector<std::string> lines;
+    options.log = [&lines](const std::string& text) { lines.push_back(text); };
+    splat::ModelManager manager(options);
+
+    splat::Progress progress;
+    const splat::Status status = manager.fetch("sharp", progress);
+    REQUIRE_MESSAGE(status.ok(), status.message());
+
+    const splat::Result<splat::ModelRecord> record = manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Ready);
+    CHECK(std::filesystem::exists(record.value().gguf_path));
+    // The streamed file is byte-identical to the file converter's output.
+    const splat::Path fixture =
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / "model" / "synthetic.pt";
+    splat::ConvertOptions file_options;
+    file_options.verify_sha256 = false;
+    file_options.source_sha256 = sha256_of(payload);
+    splat::Progress reference_progress;
+    const splat::Path reference = temp.path() / "reference.gguf";
+    const auto converted =
+        splat::convert_checkpoint(fixture, reference, file_options, reference_progress);
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    CHECK(read_file(record.value().gguf_path) == read_file(reference));
+
+    // No source checkpoint and no resumable part were ever written.
+    CHECK_FALSE(std::filesystem::exists(manager.downloads_dir() / "synthetic.pt"));
+    CHECK_FALSE(std::filesystem::exists(manager.downloads_dir() / "synthetic.pt.part"));
+    CHECK_FALSE(std::filesystem::exists(manager.models_dir() / "sharp.gguf.part"));
+
+    bool saw_stream = false;
+    bool saw_ready = false;
+    for (const std::string& text : lines) {
+        if (text.find("convert while downloading") != std::string::npos) saw_stream = true;
+        if (text.find("ready in") != std::string::npos) saw_ready = true;
+    }
+    CHECK(saw_stream);
+    CHECK(saw_ready);
+}
+
+TEST_CASE("model service: a stalled streaming download removes the partial GGUF") {
+    const std::string payload = fixture_bytes();
+    // The pickle (1,592 bytes) and the start of data/0 arrive, then nothing.
+    PayloadStallServer server(payload, 2600);
+    StreamServiceUnderTest test(server.url(), sha256_of(payload), payload.size(), 1.0);
+    REQUIRE_MESSAGE(test.service.download("sharp").ok(), "start");
+    REQUIRE(wait_for([&] { return row_state(test.service, "sharp", "failed"); }));
+
+    const splat::Result<splat::ModelRecord> record = test.manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Failed);
+    CHECK(record.value().message.find("does not resume") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(test.manager.gguf_path("sharp")));
+    CHECK_FALSE(std::filesystem::exists(test.manager.gguf_path("sharp").string() + ".part"));
+    CHECK_FALSE(std::filesystem::exists(test.manager.downloads_dir() / "synthetic.pt"));
+    CHECK_FALSE(std::filesystem::exists(test.manager.downloads_dir() / "synthetic.pt.part"));
+}
+
+TEST_CASE("model service: cancel removes a streaming download's partial GGUF") {
+    const std::string payload = fixture_bytes();
+    PayloadStallServer server(payload, 2600);
+    // No stall abort (60 s): the cancel is what ends this transfer.
+    StreamServiceUnderTest test(server.url(), sha256_of(payload), payload.size(), 60.0);
+    REQUIRE_MESSAGE(test.service.download("sharp").ok(), "start");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(test.service.downloading());
+    REQUIRE_MESSAGE(test.service.cancel("sharp").ok(), "cancel");
+    REQUIRE(wait_for([&] { return row_state(test.service, "sharp", "failed"); }, 5.0));
+
+    const splat::Result<splat::ModelRecord> record = test.manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Failed);
+    CHECK(record.value().message.find("cancel") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(test.manager.gguf_path("sharp")));
+    CHECK_FALSE(std::filesystem::exists(test.manager.gguf_path("sharp").string() + ".part"));
+}
+
+TEST_CASE("model manager: a streamed checkpoint whose digest mismatches leaves no GGUF") {
+    const std::string payload = fixture_bytes();
+    RangeServer server(payload, true);
+    splat_test::TempDir temp("stream-hash");
+    splat::CurlHttpFetcher fetcher;
+    splat::ModelManagerOptions options;
+    options.state_dir = temp.path();
+    options.fetcher = &fetcher;
+    // A wrong pin: the stream converts, the digest is computed at the end, the
+    // output must be deleted and the row must fail.
+    options.specs = {stream_spec(server.url(), std::string(64, '0'), payload.size())};
+    options.convert_while_downloading = true;
+    splat::ModelManager manager(options);
+
+    splat::Progress progress;
+    const splat::Status status = manager.fetch("sharp", progress);
+    REQUIRE_FALSE(status.ok());
+    CHECK(status.message().find("SHA-256 mismatch") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(manager.gguf_path("sharp")));
+    CHECK_FALSE(std::filesystem::exists(manager.gguf_path("sharp").string() + ".part"));
+    CHECK_FALSE(std::filesystem::exists(manager.downloads_dir() / "synthetic.pt"));
+
+    const splat::Result<splat::ModelRecord> record = manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Failed);
+    CHECK(record.value().message.find("SHA-256 mismatch") != std::string::npos);
+}
+
+// A fetcher that serves an in-memory body through the streaming sink, so a test
+// can control the write cadence exactly (a local HTTP server's timing is the
+// kernel's). `pause` is slept after each accepted chunk: the transfer outlasts
+// the stall deadline while every gap between two chunks is shorter than it,
+// which is what a slow disk under the converter looks like to the watchdog.
+class FakeStreamFetcher final : public splat::IHttpFetcher {
+public:
+    FakeStreamFetcher(std::string body, size_t chunk, double pause)
+        : body_(std::move(body)), chunk_(chunk), pause_(pause) {}
+
+    splat::Result<splat::HttpResource> head(const std::string&) override {
+        splat::HttpResource resource;
+        resource.content_length = body_.size();
+        return splat::Result<splat::HttpResource>::success(resource);
+    }
+
+    splat::Status download(const splat::FetchRequest& request) override {
+        const int attempt = ++downloads;
+        if (fail_first && attempt == 1) return splat::Status::error("injected transfer failure");
+        if (!request.sink) return splat::Status::error("the streaming test needs a sink");
+        size_t at = 0;
+        while (at < body_.size()) {
+            if (request.cancelled && request.cancelled()) {
+                return splat::Status::error("download cancelled");
+            }
+            const size_t size = std::min(chunk_, body_.size() - at);
+            if (!request.sink(body_.data() + at, size)) {
+                return splat::Status::error("the sink refused the body");
+            }
+            at += size;
+            if (request.written != nullptr) {
+                request.written->store(at, std::memory_order_relaxed);
+            }
+            if (pause_ > 0.0) {
+                std::this_thread::sleep_for(std::chrono::duration<double>(pause_));
+            }
+        }
+        return splat::Status::success();
+    }
+
+    splat::Result<std::string> get_text(const std::string&, size_t) override {
+        return splat::Result<std::string>::failure("no licence text in this test");
+    }
+
+    std::atomic<int> downloads{0};
+    bool fail_first = false;
+
+private:
+    std::string body_;
+    size_t chunk_ = 1u << 20;
+    double pause_ = 0.0;
+};
+
+// HEAD and every transfer fail at once: the Models free-space gate is checked
+// before a worker starts, so the transfer itself only has to end quickly.
+class UnreachableFetcher final : public splat::IHttpFetcher {
+public:
+    splat::Result<splat::HttpResource> head(const std::string&) override {
+        return splat::Result<splat::HttpResource>::failure("no network in this test");
+    }
+    splat::Status download(const splat::FetchRequest&) override {
+        return splat::Status::error("no network in this test");
+    }
+    splat::Result<std::string> get_text(const std::string&, size_t) override {
+        return splat::Result<std::string>::failure("no network in this test");
+    }
+};
+
+TEST_CASE("model service: Retry after a failed streaming download starts from zero") {
+    const std::string payload = fixture_bytes();
+    FakeStreamFetcher fetcher(payload, 1u << 20, 0.0);
+    fetcher.fail_first = true;
+    splat_test::TempDir temp("stream-retry");
+
+    splat::ModelManagerOptions options;
+    options.state_dir = temp.path();
+    options.fetcher = &fetcher;
+    options.specs = {stream_spec("http://127.0.0.1/model.bin", sha256_of(payload), payload.size())};
+    options.convert_while_downloading = true;
+    splat::ModelManager manager(options);
+
+    splat::ModelServiceOptions service_options;
+    service_options.state_dir = temp.path();
+    service_options.stall_timeout_seconds = 60.0;
+    splat::UiState state;
+    splat::ModelService service(manager, state, service_options);
+
+    REQUIRE_MESSAGE(service.download("sharp").ok(), "first attempt starts");
+    REQUIRE(wait_for([&] { return row_state(service, "sharp", "failed"); }));
+    const splat::Result<splat::ModelRecord> failed = manager.status("sharp");
+    REQUIRE_MESSAGE(failed.ok(), failed.message());
+    CHECK(failed.value().state == splat::ModelState::Failed);
+    CHECK(failed.value().message.find("does not resume") != std::string::npos);
+    // Nothing of the failed attempt is left for a resume.
+    CHECK_FALSE(std::filesystem::exists(manager.gguf_path("sharp")));
+    CHECK_FALSE(std::filesystem::exists(manager.gguf_path("sharp").string() + ".part"));
+    CHECK_FALSE(std::filesystem::exists(manager.downloads_dir() / "synthetic.pt"));
+
+    // A hard kill mid-stream leaves models/sharp.gguf.part and no Ready record.
+    // The startup pass (ModelService's monitor loop calls this once, on its
+    // worker) deletes it, so a later Delete or launch does not wait for a Retry
+    // that may never come.
+    const splat::Path stale_gguf_part = manager.gguf_path("sharp").string() + ".part";
+    std::filesystem::create_directories(manager.models_dir());
+    write_file(stale_gguf_part, "half a GGUF");
+    CHECK(manager.reclaim_streamed_sources());
+    CHECK_FALSE(std::filesystem::exists(stale_gguf_part));
+
+    // Retry: the same row, from byte 0, and this time the body arrives.
+    REQUIRE_MESSAGE(service.download("sharp").ok(), "Retry starts");
+    REQUIRE(wait_for([&] { return row_state(service, "sharp", "ready"); }, 20.0));
+    const splat::Result<splat::ModelRecord> record = manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Ready);
+    CHECK(fetcher.downloads.load() == 2);
+    CHECK(std::filesystem::file_size(record.value().gguf_path) > 0);
+
+    // The streamed file is the file converter's output, byte for byte.
+    const splat::Path fixture =
+        std::filesystem::path(__FILE__).parent_path() / "fixtures" / "model" / "synthetic.pt";
+    splat::ConvertOptions file_options;
+    file_options.verify_sha256 = false;
+    file_options.source_sha256 = sha256_of(payload);
+    splat::Progress progress;
+    const splat::Path reference = temp.path() / "reference.gguf";
+    const auto converted = splat::convert_checkpoint(fixture, reference, file_options, progress);
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    CHECK(read_file(record.value().gguf_path) == read_file(reference));
+
+    // A .pt left beside a Ready GGUF by 0.6.1 is reclaimed without a download:
+    // the model service's stall watch asks for it once at startup (this call),
+    // and a fetch() on the Ready record does the same.
+    const splat::Path legacy = manager.downloads_dir() / "synthetic.pt";
+    REQUIRE(std::filesystem::create_directories(manager.downloads_dir()));
+    write_file(legacy, "legacy checkpoint bytes");
+    write_file(legacy.string() + ".part", "legacy partial");
+    CHECK(manager.reclaim_streamed_sources());
+    CHECK_FALSE(std::filesystem::exists(legacy));
+    CHECK_FALSE(std::filesystem::exists(legacy.string() + ".part"));
+
+    write_file(legacy, "legacy checkpoint bytes");
+    splat::Progress again;
+    REQUIRE_MESSAGE(manager.fetch("sharp", again).ok(), "fetch on a Ready row");
+    CHECK_FALSE(std::filesystem::exists(legacy));
+    CHECK(std::filesystem::exists(manager.gguf_path("sharp")));
+}
+
+TEST_CASE("model manager: an imported checkpoint is removed after its conversion") {
+    // The inbox/import path runs the file converter, and the streaming backend
+    // must not keep its downloads/ copy afterwards: only the GGUF stays.
+    const std::string payload = fixture_bytes();
+    splat_test::TempDir temp("import-cleanup");
+    splat::CurlHttpFetcher fetcher;  // the import path is offline; never used
+    splat::ModelManagerOptions options;
+    options.state_dir = temp.path();
+    options.fetcher = &fetcher;
+    options.specs = {stream_spec("http://127.0.0.1/model.bin", sha256_of(payload), payload.size())};
+    options.convert_while_downloading = true;
+    options.converter = [](const splat::ModelBackendSpec&, const splat::Path& source,
+                           const splat::Path& out, const std::string& sha,
+                           splat::Progress& progress) {
+        splat::ConvertOptions file_options;
+        file_options.verify_sha256 = false;  // the manager checked the pin already
+        file_options.source_sha256 = sha;
+        return splat::convert_checkpoint(source, out, file_options, progress);
+    };
+    splat::ModelManager manager(options);
+
+    const splat::Path inbox = manager.inbox_dir() / "synthetic.pt";
+    REQUIRE_MESSAGE(std::filesystem::create_directories(manager.inbox_dir()), "inbox");
+    write_file(inbox, payload);
+    splat::Progress progress;
+    const splat::Status status = manager.import_file(inbox, progress);
+    REQUIRE_MESSAGE(status.ok(), status.message());
+
+    const splat::Result<splat::ModelRecord> record = manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Ready);
+    CHECK_FALSE(std::filesystem::exists(manager.downloads_dir() / "synthetic.pt"));
+    CHECK(std::filesystem::exists(manager.gguf_path("sharp")));
+}
+
+TEST_CASE("model service: a slow writer that keeps reporting bytes is not a stall") {
+    // Every gap between two written chunks is 0.4 s, the stall deadline is 1 s,
+    // and the whole write takes ~2 s: longer than the deadline, but never still.
+    const std::string payload = fixture_bytes();
+    FakeStreamFetcher fetcher(payload, 2048, 0.4);
+    splat_test::TempDir temp("stream-slow-writer");
+
+    splat::ModelManagerOptions options;
+    options.state_dir = temp.path();
+    options.fetcher = &fetcher;
+    options.specs = {stream_spec("http://127.0.0.1/model.bin", sha256_of(payload), payload.size())};
+    options.convert_while_downloading = true;
+    splat::ModelManager manager(options);
+
+    splat::ModelServiceOptions service_options;
+    service_options.state_dir = temp.path();
+    service_options.stall_timeout_seconds = 1.0;
+    std::vector<std::string> lines;
+    std::mutex log_mutex;
+    service_options.log = [&lines, &log_mutex](const std::string& text) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        lines.push_back(text);
+    };
+    splat::UiState state;
+    splat::ModelService service(manager, state, service_options);
+
+    REQUIRE_MESSAGE(service.download("sharp").ok(), "start");
+    REQUIRE(wait_for([&] { return row_state(service, "sharp", "ready"); }, 20.0));
+    const splat::Result<splat::ModelRecord> record = manager.status("sharp");
+    REQUIRE_MESSAGE(record.ok(), record.message());
+    CHECK(record.value().state == splat::ModelState::Ready);
+    std::string logged;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        logged = join_lines(lines);
+    }
+    MESSAGE(logged);
+    CHECK(logged.find("moved no byte") == std::string::npos);
+}
+
+TEST_CASE("model service: the free-space gate asks for the GGUF only when streaming") {
+    // The streaming path writes only the GGUF (~1.31 GB + margin); the file path
+    // writes the 2.8 GB .pt first. A console with 2 GiB free must be allowed to
+    // stream SHARP and refused the file download.
+    struct GateService {
+        GateService(bool streaming, uint64_t free_bytes)
+            : manager(options(streaming)), service(manager, state, service_options(free_bytes)) {}
+
+        splat::ModelManagerOptions options(bool streaming) {
+            splat::ModelManagerOptions value;
+            value.state_dir = temp.path();
+            value.fetcher = &fetcher;
+            value.specs = {splat::sharp_model_spec()};
+            value.convert_while_downloading = streaming;
+            return value;
+        }
+
+        splat::ModelServiceOptions service_options(uint64_t free_bytes) {
+            splat::ModelServiceOptions value;
+            value.state_dir = temp.path();
+            value.free_bytes = [free_bytes](const splat::Path&) { return free_bytes; };
+            value.stall_timeout_seconds = 60.0;
+            return value;
+        }
+
+        splat_test::TempDir temp{"free-space"};
+        UnreachableFetcher fetcher;
+        splat::ModelManager manager;
+        splat::UiState state;
+        splat::ModelService service;
+    };
+
+    const uint64_t two_gib = 2ull << 30;
+    const uint64_t one_gib = 1ull << 30;
+
+    {
+        GateService gate(true, two_gib);
+        REQUIRE_MESSAGE(gate.manager.accept_license("sharp", "licence text").ok(), "licence");
+        // The file path would need ~4.4 GB here; the streaming path needs ~1.6.
+        const splat::Status started = gate.service.download("sharp");
+        REQUIRE_MESSAGE(started.ok(), started.message());
+        // It ends on the test fetcher's HEAD failure, not on the gate.
+        REQUIRE(wait_for([&] { return row_state(gate.service, "sharp", "failed"); }));
+        const splat::Result<splat::ModelRecord> record = gate.manager.status("sharp");
+        REQUIRE_MESSAGE(record.ok(), record.message());
+        CHECK(record.value().message.find("cannot reach") != std::string::npos);
+    }
+    {
+        GateService gate(true, one_gib);
+        REQUIRE_MESSAGE(gate.manager.accept_license("sharp", "licence text").ok(), "licence");
+        const splat::Status refused = gate.service.download("sharp");
+        CHECK_FALSE(refused.ok());
+        CHECK(refused.message().find("GB free") != std::string::npos);
+    }
+    {
+        GateService gate(false, two_gib);
+        REQUIRE_MESSAGE(gate.manager.accept_license("sharp", "licence text").ok(), "licence");
+        const splat::Status refused = gate.service.download("sharp");
+        CHECK_FALSE(refused.ok());
+        CHECK(refused.message().find("GB free") != std::string::npos);
+    }
 }
 
 TEST_CASE("model manager: HEAD reports the official SHARP checkpoint size") {

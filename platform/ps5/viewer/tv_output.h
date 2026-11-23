@@ -158,7 +158,7 @@ public:
         stop_worker();
         std::string problems;
         display_.close(&problems);
-        if (!problems.empty()) line("viewer: vr tv output: closing the port: %s", problems.c_str());
+        if (!problems.empty()) line("viewer: tv output: closing the port: %s", problems.c_str());
     }
 
 private:

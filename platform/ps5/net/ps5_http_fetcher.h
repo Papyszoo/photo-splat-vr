@@ -78,7 +78,8 @@ private:
     Status download_impl(const std::string& url, const Path& destination, uint64_t offset,
                          uint64_t max_bytes, uint64_t total_bytes, Progress* progress,
                          const std::function<bool()>& cancelled, bool in_place,
-                         std::atomic<uint64_t>* written_out, Sha256* hash);
+                         std::atomic<uint64_t>* written_out, Sha256* hash,
+                         const std::function<bool(const void*, size_t)>* sink);
 
     // The ids abort() may use. Every entry's own mutex is held across the SDK
     // call that uses its id; the registry list never is (live_requests.h).

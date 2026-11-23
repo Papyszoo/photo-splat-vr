@@ -10,35 +10,39 @@ The SHARP backend is an independent reimplementation of the
 written from the paper and the reference code's observable behaviour. No Apple
 code and no model weights are part of this repository.
 
-v0.6.1 fixes the SHARP model download on the console and makes Quit faster.
-v0.6 builds on the library features of v0.5 (photos in the common camera and
-web formats, splat import, rotate left or right on any photo or scene entry, and
-network libraries over SMB and NFS): the photo picker browses folders on every
-source, scenes can be saved straight to a network folder, and the TV shows its
-own picture and menu. v0.1 does what the project set out to do: photos are
-converted on the console and the resulting scenes display in VR and on the TV.
-DA2-Small ships as an alternative, with approximate scene size.
+v0.6.2 gets SHARP ready about three times faster and starts the same session on
+the TV when there is no PS VR2. v0.6 builds on the library features of v0.5
+(photos in the common camera and web formats, splat import, rotate left or right
+on any photo or scene entry, and network libraries over SMB and NFS): the photo
+picker browses folders on every source, scenes can be saved straight to a
+network folder, and the TV shows its own picture and menu. v0.1 does what the
+project set out to do: photos are converted on the console and the resulting
+scenes display in VR and on the TV. DA2-Small ships as an alternative, with
+approximate scene size.
 
 - Repository: <https://github.com/Papyszoo/photo-splat-vr>
 - Specification: [`docs/spec.md`](docs/spec.md)
 - Decisions: [`docs/PLAN.md`](docs/PLAN.md)
 - Known issues: [`docs/BACKLOG.md`](docs/BACKLOG.md)
 
-## What is new in 0.6.1
+## What is new in 0.6.2
 
-- **SHARP downloads on the console.** The 2.8 GB model no longer stops at 5%
-  with heavy lag: it downloads and gets ready in about 40 minutes on a base PS5
-  (firmware 13.60); faster work is planned. A download that stalls now fails
-  after 60 seconds with **Retry**, and **Cancel** and **Quit** always work.
-- **Faster Quit.** VR mode is turned off before the TV output closes, so
-  leaving the app no longer waits on the display.
-- **More firmware support.** PS VR2 support tables for firmware 5.50 to 13.60,
-  from the PS5VR project (Husam Osman, GPL-3.0), including 10.01.
-- **A message when support is missing.** On a firmware without a table, the TV
-  explains how to help add support instead of the app closing silently.
-- The version is 0.6.1 (`contentVersion` `01.006.001`). The 0.6.0 features
-  (folder browser, output folder, network albums, the TV's own picture, hold
-  Options to recentre) are unchanged; see the v0.6.0 release notes.
+- **SHARP setup in about 11 minutes.** The 2.8 GB checkpoint is converted to the
+  GGUF while it downloads, so it is never stored twice: about 11 minutes on a
+  base PS5 (firmware 13.60) instead of about 38. Free space is needed only for
+  the converted model (about 1.3 GB plus margin), and leftover download files
+  from older versions are removed.
+- **Without PS VR2, the app runs on the TV.** When the headset is turned off,
+  not connected, or the firmware has no PSVR2 support table (the message's
+  **X** continues), the session starts on the TV with the DualSense: browse,
+  folders, photo conversion, model downloads and viewing scenes. Start the app
+  with the headset turned on to use VR.
+- **A clear log when no headset is found.** The expected TV-only start logs
+  `hmd2 init` without "FAIL"; a real init error still logs it.
+- The version is 0.6.2 (`contentVersion` `01.006.002`). The 0.6.1 fixes and the
+  0.6.0 features (folder browser, output folder, network albums, the TV's own
+  picture, hold Options to recentre) are unchanged; see the v0.6.1 release
+  notes.
 
 ## Formats
 
@@ -72,11 +76,12 @@ both. Scenes on a share open where they lie, without a copy on the console.
   development build is **PPSA99202** ("Photo Splat VR Dev"); both can be
   installed at once and each keeps its own data folder (see
   `platform/ps5/title/README.md`).
-- PS VR2 for VR viewing. A DualSense or the two PS VR2 Sense controllers for
-  input. TV mode works without the headset. In VR the TV shows the scene (without
-  the VR window or HUD) and, while the menu is open, the same menu flat on the
-  screen; whoever holds a controller can drive it, and it works before the
-  headset is on.
+- PS VR2 is optional: without a headset the app starts on the TV with the same
+  menu and the same scene, and a connected headset adds VR viewing. A DualSense
+  or the two PS VR2 Sense controllers for input. In VR the TV shows the scene
+  (without the VR window or HUD) and, while the menu is open, the same menu flat
+  on the screen; whoever holds a controller can drive it, and it works before
+  the headset is on.
 - Network access on the console for the model download, and FTP access to the
   console for copying the package and your photos.
 - About 4 GB free under `/data` for the SHARP checkpoint and its converted form;

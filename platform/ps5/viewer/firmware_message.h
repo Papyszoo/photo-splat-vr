@@ -10,6 +10,11 @@
 // libSceVrTracker2 is never checked). They are Sony's: the card asks for them
 // by file name and says not to attach them.
 //
+// The last line is the user's decision of 2026-11-22: X continues on the TV
+// without the headset (the session runs the same menu and scene there), O still
+// exits, and the 120 s timeout continues like X. The rest of the text is
+// unchanged.
+//
 // Header-only over core/ui, so tests/firmware_message_test.cpp draws the exact
 // card the title shows on the console.
 //
@@ -55,7 +60,7 @@ inline FirmwareMessage firmware_message(uint32_t sdk_version, const char* missin
     message.paragraphs.push_back(
         "Do not attach them to the issue. They are Sony system files: share a download link "
         "privately when asked.");
-    message.exit_hint = "Press X or O to exit.";
+    message.exit_hint = "Press X to continue on the TV, O to exit.";
     return message;
 }
 

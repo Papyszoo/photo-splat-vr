@@ -822,8 +822,10 @@ captured with the video is enough to place the CSV's timeline in it.
     tracker has no pose (play-area setup, controllers not tracked). The title
     ends cleanly (exit 1) with VR mode off. Put the headset on and relaunch; the
     wait is bounded on purpose and logs every 5 s.
-  - `FAIL hmd2 init at …`: the VR module/VR mode failures of step 1c, unchanged.
-    `sceHmd2Open -> 0xffffffff` is again "headset off".
+  - `hmd2 init at …` without `FAIL` (0.6.2): the expected start without a usable
+    headset — `PSVR2 is off` (device status 2) or `sceHmd2Open` 0xffffffff (no
+    headset session) — runs the TV-only session. `FAIL hmd2 init at …` stays for
+    a real init error: a module, the tracker or a reprojection call.
   - A picture but wrong eyes (squeezed, or the same view in both): check the
     `per-eye principal point` line, then the three `eye buffer` addresses.
   - The picture looks washed out or too dark: the eye buffer's transfer

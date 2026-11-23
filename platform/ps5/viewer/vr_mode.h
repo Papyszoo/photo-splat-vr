@@ -42,6 +42,17 @@ struct VrOptions {
 // steps and the GPU failures, as the TV path numbers them. All logging is
 // `viewer: ...`.
 //
+// The headset is optional (2026-11-22): when Hmd2 cannot start - no PS VR2, a
+// headset that is off, a firmware whose libSceHmd2/libSceVrTracker2 export
+// tables do not match this build, or any other init failure - the same session
+// continues on the TV alone instead of returning 6 to the home screen
+// (start_mode.h). There is then no eye buffer, no submission and no
+// reprojection, the TV output opened for the session is the only display, the
+// frames are paced by a timer, and the camera is a fixed seated head pose at
+// the capture point; the DualSense drives the menu and the scene exactly as in
+// VR. Only two cases still return 6: no VideoOut port to run on, and the
+// missing-export-table card answered with O (its X and its 120 s continue).
+//
 // No scene anywhere in the gallery is not a failure: the session comes up with
 // an empty view and the panel's folders home, so a fresh install can pick or
 // add a scene. An empty gallery never ends the title. A boot scene that will

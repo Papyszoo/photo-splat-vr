@@ -14,6 +14,8 @@ extern "C" {
 #include "miniz/miniz_zip.h"
 }
 
+#include "model/zip_header.h"
+
 namespace splat {
 namespace {
 
@@ -22,17 +24,6 @@ namespace {
 // console's per-call cost is what the slow conversion was made of
 // (runs/issue-1-crash/sharp-slow-report.md §1.4).
 constexpr size_t kStoredReadBytes = 1u << 20;
-constexpr uint32_t kLocalHeaderSignature = 0x04034b50u;
-constexpr size_t kLocalHeaderBytes = 30;
-
-uint32_t little_u16(const uint8_t* bytes) {
-    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8);
-}
-
-uint32_t little_u32(const uint8_t* bytes) {
-    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
-           (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
-}
 
 // Callback state for mz_zip_reader_extract_to_callback. miniz calls this with
 // monotonically increasing offsets; we forward the chunks to the caller's sink.
@@ -195,31 +186,33 @@ Status ZipArchive::stream_entry(const ZipEntryInfo& entry, const ZipSink& sink) 
 Status ZipArchive::stream_stored(const ZipEntryInfo& entry, const ZipSink& sink) {
     if (impl_->raw == nullptr) return Status::error("zip archive is not open");
 
-    uint8_t header[kLocalHeaderBytes] = {};
+    uint8_t header[kZipLocalHeaderBytes] = {};
     if (::fseeko(impl_->raw, static_cast<off_t>(entry.local_header_offset), SEEK_SET) != 0 ||
         std::fread(header, 1, sizeof(header), impl_->raw) != sizeof(header)) {
         return Status::error("cannot read the local header of " + entry.name + " in " +
                              impl_->path.string());
     }
-    if (little_u32(header) != kLocalHeaderSignature) {
+    if (zip_little_u32(header) != kZipLocalHeaderSignature) {
         return Status::error("zip entry " + entry.name + " has no local header");
     }
-    if ((little_u16(header + 6) & 1u) != 0) {
+    const ZipLocalHeader local = parse_zip_local_header(header);
+    if ((local.flags & kZipFlagEncrypted) != 0) {
         return Status::error("zip entry " + entry.name + " is encrypted");
     }
-    const uint32_t name_len = little_u16(header + 26);
-    const uint32_t extra_len = little_u16(header + 28);
-    if (name_len > 4096) return Status::error("zip entry " + entry.name + " has a corrupt name length");
-    std::string local_name(name_len, '\0');
-    if (name_len > 0 &&
-        std::fread(local_name.data(), 1, name_len, impl_->raw) != name_len) {
+    if (local.name_bytes > 4096) {
+        return Status::error("zip entry " + entry.name + " has a corrupt name length");
+    }
+    std::string local_name(local.name_bytes, '\0');
+    if (local.name_bytes > 0 &&
+        std::fread(local_name.data(), 1, local.name_bytes, impl_->raw) != local.name_bytes) {
         return Status::error("cannot read the local name of " + entry.name);
     }
     if (local_name != entry.name) {
         return Status::error("zip entry " + entry.name + " has the local name '" + local_name + "'");
     }
 
-    const uint64_t data_offset = entry.local_header_offset + kLocalHeaderBytes + name_len + extra_len;
+    const uint64_t data_offset =
+        entry.local_header_offset + kZipLocalHeaderBytes + local.name_bytes + local.extra_bytes;
     if (::fseeko(impl_->raw, static_cast<off_t>(data_offset), SEEK_SET) != 0) {
         return Status::error("cannot seek to the data of " + entry.name);
     }

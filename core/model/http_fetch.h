@@ -33,6 +33,15 @@ struct HttpResource {
 struct FetchRequest {
     std::string url;
     Path destination;
+    // Stream mode: when set, the body is not written to `destination` (which may
+    // then be empty). Every body byte after the `offset` prefix is handed to
+    // this sink, in order, and only counted in `written` after the sink accepted
+    // it. Returning false fails the transfer: the console's stream converter
+    // feeds the GGUF directly and has no partial file to keep.
+    //
+    // A sink belongs to the plain-GET path only; segment mode must leave it
+    // unset (segments would write out of order).
+    std::function<bool(const void* data, size_t size)> sink;
     // Byte offset already present in `destination`. The implementation must ask
     // for `Range: bytes=<offset>-` and append the response. A server that
     // ignores the range (200 instead of 206) is handled by truncating the file

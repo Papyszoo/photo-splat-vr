@@ -34,6 +34,19 @@
 //      DualSense), VR mode off, buffers unregistered, display, Hmd2, tracker,
 //      then the Vulkan objects.
 //
+// Hmd2 is optional (2026-11-22, "If VR is not connected app shouldn't be
+// blocked from starting"): when the init in step 2 fails - no headset, a
+// headset that is off, or a firmware whose export tables do not match this
+// build - the session continues on the TV alone (start_mode.h). There is then
+// no headset FOV, no eye buffers, no copy and no submission or reprojection,
+// and the TV output opened in step 2 is the only display, paced by a timer
+// instead of Hmd2's slots. The camera is a fixed seated head pose at the
+// capture point (identity, 63 mm IPD), so the menu, the sticks, L2/R2, the
+// panel's ViewScene, conversion, models, Quit and the per-second fps line all
+// run the same code as in VR; the scene label, the HUD and the Sense-based
+// grab/pointer are headset things and are not drawn or read. A firmware with no
+// export table keeps its card first and continues on X (firmware_message.h).
+//
 // While it runs, the session can write a head-pose and input log to
 // /data/ps5-splat-vr/logs/session-<UTC>.csv (one row per submitted frame: the
 // raw Hmd2 pose the frame was rendered from, the scene-frame yaw/pitch/roll,
@@ -113,6 +126,7 @@
 #include <ctime>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -150,6 +164,7 @@
 #include "overlay_refresh.h"
 #include "pad_input.h"
 #include "scene_switch.h"
+#include "start_mode.h"
 #include "title_common.h"
 #include "tv_output.h"
 #include "ui_mode.h"
@@ -323,7 +338,7 @@ public:
         if (handle < 0) {
             if (!reported_missing_) {
                 reported_missing_ = true;
-                line("viewer: vr pad: no %s controller for user %d (scePadOpen -> 0x%08x); "
+                line("viewer: pad: no %s controller for user %d (scePadOpen -> 0x%08x); "
                      "retrying every %.0f s, the session runs without it",
                      name_, user, static_cast<uint32_t>(handle), kPadRetryMs / 1000.0);
             }
@@ -341,14 +356,14 @@ public:
         ignored_ |= held_;
         held_ = 0;
         if (device_ == pad::Device::dualsense) {
-            line("viewer: vr pad: %s controller open for user %d (handle %d)", name_, user,
+            line("viewer: pad: %s controller open for user %d (handle %d)", name_, user,
                  handle_);
         } else {
             // The raw word at open is the first answer to "does a Sense pad that
             // was never registered with VrTracker2 deliver buttons at all?"; it
             // is this line's word, so the change log starts from it.
             raw_logged_ = raw_;
-            line("viewer: vr pad: %s controller open for user %d (handle %d, raw buttons 0x%08x)",
+            line("viewer: pad: %s controller open for user %d (handle %d, raw buttons 0x%08x)",
                  name_, user, handle_, raw_);
         }
     }
@@ -448,7 +463,7 @@ private:
                     axes = pad::Axes{};
                 }
                 if (report_changes) {
-                    line("viewer: vr pad: %s controller %s", name_,
+                    line("viewer: pad: %s controller %s", name_,
                          connected ? "connected" : "gone");
                 }
             }
@@ -478,7 +493,7 @@ private:
         if (now < next_raw_log_ms_) return;
         raw_logged_ = buttons;
         next_raw_log_ms_ = now + kPadRawLogMs;
-        line("viewer: vr pad: %s raw buttons 0x%08x", name_, buttons);
+        line("viewer: pad: %s raw buttons 0x%08x", name_, buttons);
     }
 
     pad::Device device_;
@@ -899,20 +914,27 @@ private:
 // firmware 10.01). Instead of a silent return to the home screen, the TV gets
 // one full-screen card drawn with the TV path's own canvas text (UiCanvas, the
 // flat menu's font and theme) and presented on the main VideoOut port, which
-// the default run already has open. It waits for X/O on the DualSense or 120 s;
-// the caller still tears down and returns the unchanged status.
-void show_firmware_message(TvOutput& tv, uint32_t firmware, const char* missing_library) {
+// the default run already has open. It waits for X/O on the DualSense or 120 s
+// and reports the answer: X and the timeout continue on the TV without the
+// headset (start_mode.h), O ends the title as through 0.6.1.
+enum class FirmwareAnswer {
+    not_shown,       // nothing was presented (the TV refused the card)
+    exit_title,      // O: end the title, the home screen
+    continue_on_tv,  // X, or 120 s: the TV-only session
+};
+
+FirmwareAnswer show_firmware_message(TvOutput& tv, uint32_t firmware, const char* missing_library) {
     const FirmwareMessage message = firmware_message(firmware, missing_library);
     splat::UiCanvas canvas(splat::kTvWidth, splat::kTvHeight);
     draw_firmware_message(canvas, message);
     std::string present_error;
     if (!tv.present_still(canvas.pixels().data(), present_error)) {
         line("viewer: vr firmware message: the TV refused the card (%s)", present_error.c_str());
-        return;
+        return FirmwareAnswer::not_shown;
     }
     const std::string version = format_firmware_version(firmware);
-    line("viewer: vr firmware message: shown on the TV (no export table for %s%s%s); X or O, or "
-         "120 s",
+    line("viewer: vr firmware message: shown on the TV (no export table for %s%s%s); X continues "
+         "on the TV, O exits, 120 s continues",
          missing_library, version.empty() ? "" : " on firmware ", version.c_str());
     // The DualSense is the TV person's pad; no pad here is opened before Hmd2
     // succeeds, so opening it now is all this path needs (the Sense pair and
@@ -920,18 +942,30 @@ void show_firmware_message(TvOutput& tv, uint32_t firmware, const char* missing_
     Pad confirm(pad::Device::dualsense, "DualSense", kPadTypeDualsense);
     const int user = hmd2::user_id();
     const double deadline = now_ms() + 120000.0;
-    bool pressed = false;
+    bool cross = false;
+    bool circle = false;
     while (now_ms() < deadline) {
         confirm.open(user, now_ms());
         confirm.take_pressed();   // one poll; Cross and Circle are not action bits
-        if ((confirm.held() & (pad::kCross | pad::kCircle)) != 0) {
-            pressed = true;
+        const uint32_t held = confirm.held();
+        if ((held & pad::kCross) != 0) {
+            cross = true;
+            break;
+        }
+        if ((held & pad::kCircle) != 0) {
+            circle = true;
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     confirm.close();
-    line("viewer: vr firmware message: %s, exiting", pressed ? "X/O pressed" : "120 s elapsed");
+    if (circle) {
+        line("viewer: vr firmware message: O pressed, exiting");
+        return FirmwareAnswer::exit_title;
+    }
+    line("viewer: vr firmware message: %s, continuing on the TV",
+         cross ? "X pressed" : "120 s elapsed");
+    return FirmwareAnswer::continue_on_tv;
 }
 
 }  // namespace
@@ -941,25 +975,24 @@ int run_vr(const VrOptions& options) {
     // A quit file from an earlier stop must not end this run: only one written
     // after the session started counts (the TV path's contract).
     const std::time_t started_wall = std::time(nullptr);
-    line("viewer: vr session (mode vr): eye %ux%u per eye, 60 rendered -> 120 Hz reprojected, %s",
-         kEyeWidth, kEyeHeight,
-         options.cap_seconds > 0 ? "SECONDS cap set" : "no auto-exit (SECONDS absent or 0)");
-    if (options.cap_seconds > 0) {
-        line("viewer: vr cap: %d s from this run's viewer.env SECONDS", options.cap_seconds);
-    }
+    // The session's own banner (eye geometry, rate, cap) is printed after the
+    // start decision: a TV-only session has neither eye buffers nor
+    // reprojection, and must not claim them.
+    const char* const cap_text =
+        options.cap_seconds > 0 ? "SECONDS cap set" : "no auto-exit (SECONDS absent or 0)";
 
     // The head-pose and input log of this run. Optional: a /data that refuses
     // the write must not cost the session (the first title to write there
     // answers whether it can - docs/console-runbook.md, step 1a).
     PoseLog pose_log;
     if (pose_log.open()) {
-        line("viewer: vr log: %s (one row per submitted frame, flushed every second, at most "
+        line("viewer: pose log: %s (one row per submitted frame, flushed every second, at most "
              "%zu MiB)",
              pose_log.path(), kPoseLogMaxBytes / (1024u * 1024u));
     } else if (pose_log.disabled_by_config()) {
-        line("viewer: vr log: off (POSE_LOG=1 in viewer.env enables the per-frame CSV)");
+        line("viewer: pose log: off (POSE_LOG=1 in viewer.env enables the per-frame CSV)");
     } else {
-        line("viewer: vr log: cannot write %s (errno %d); the session runs without the pose log",
+        line("viewer: pose log: cannot write %s (errno %d); the session runs without the pose log",
              kPoseLogDir.c_str(), pose_log.error());
     }
 
@@ -1141,14 +1174,14 @@ int run_vr(const VrOptions& options) {
             // this title allocated is freed or destroyed anywhere - not even by
             // a destructor on the way out. The process ends and the system
             // reclaims it; the log says what was leaked.
-            line("viewer: vr teardown: leaking the renderer, its buffers, the eye buffers and the "
+            line("viewer: teardown: leaking the renderer, its buffers, the eye buffers and the "
                  "device (a GPU wait timed out; nothing may be freed under it)");
             copy_pass.forget();
             eye_buffers.forget();
             if (renderer) renderer.release();
             context.release();
         }
-        line("viewer: vr teardown %.1f ms", now_ms() - started);
+        line("viewer: teardown %.1f ms", now_ms() - started);
     };
 
     std::string error;
@@ -1187,30 +1220,53 @@ int run_vr(const VrOptions& options) {
     // without it the capture is black).
     std::string tv_error;
     if (!options.tv_output) {
-        line("viewer: vr tv output: off (TV_OUTPUT=0 in viewer.env); the TV is the Hmd2 mirror");
+        line("viewer: tv output: off (TV_OUTPUT=0 in viewer.env); the TV is the Hmd2 mirror");
     } else if (tv_output.start(tv_error)) {
         tv_up = true;
-        line("viewer: vr tv output: main VideoOut port open (%ux%u, 30 fps): the TV shows the "
+        line("viewer: tv output: main VideoOut port open (%ux%u, 30 fps): the TV shows the "
              "scene without the VR window or HUD, and the flat menu while it is open",
              splat::kTvWidth, splat::kTvHeight);
     } else {
-        line("viewer: vr tv output: FAIL the main VideoOut port would not open (%s); the Hmd2 "
+        line("viewer: tv output: FAIL the main VideoOut port would not open (%s); the Hmd2 "
              "mirror carries the TV instead",
              tv_error.c_str());
     }
     config.mirror = options.mirror && !tv_up;
+    // Hmd2 is optional (2026-11-22): a failure here - no headset, a headset
+    // that is off, a firmware whose export tables do not match this build -
+    // continues on the TV alone instead of ending the title on the home screen.
+    // The port opened above is the reason this is cheap: the TV already has the
+    // title's own picture and the panel is the same one. `no_vr` is the switch
+    // the rest of the session reads (start_mode.h has the decision table).
+    bool no_vr = false;
     if (!hmd2::init(config)) {
         const hmd2::Error hmd_error = hmd2::error();
-        line("viewer: FAIL hmd2 init at %s (rc 0x%08x) - see the hmd2 lines above",
-             hmd_error.step != nullptr && hmd_error.step[0] != '\0' ? hmd_error.step : "unknown",
-             static_cast<unsigned>(hmd_error.rc));
+        const char *hmd_step =
+            hmd_error.step != nullptr && hmd_error.step[0] != '\0' ? hmd_error.step : "unknown";
+        // A headset that is switched off or not there is the expected start
+        // without VR, not a failure: that line keeps its place (and its "hmd2
+        // init at") but loses "FAIL". Every real init error keeps it; the
+        // choice is hmd2::expected_fallback, pinned by tests/tv_only_test.cpp.
+        if (hmd2::expected_fallback(hmd_error)) {
+            line("viewer: hmd2 init at %s (rc 0x%08x): no usable headset, the session starts on "
+                 "the TV - see the hmd2 lines above",
+                 hmd_step, static_cast<unsigned>(hmd_error.rc));
+        } else {
+            line("viewer: FAIL hmd2 init at %s (rc 0x%08x) - see the hmd2 lines above", hmd_step,
+                 static_cast<unsigned>(hmd_error.rc));
+        }
         // A firmware with no export table is the one failure worth a TV card:
         // the user cannot fix it from the pad and the klog is not visible to
-        // them. Every other failure keeps the plain FAIL path.
-        if (hmd_error.missing_table_library != nullptr) {
+        // them. X (or the 120 s) continues on the TV, O ends the title.
+        const bool firmware_card = hmd_error.missing_table_library != nullptr;
+        bool card_shown = false;
+        bool card_continue = false;
+        if (firmware_card) {
             if (tv_up) {
-                show_firmware_message(tv_output, options.firmware,
-                                      hmd_error.missing_table_library);
+                const FirmwareAnswer answer = show_firmware_message(
+                    tv_output, options.firmware, hmd_error.missing_table_library);
+                card_shown = answer != FirmwareAnswer::not_shown;
+                card_continue = answer == FirmwareAnswer::continue_on_tv;
             } else if (!options.tv_output) {
                 // TV_OUTPUT=0: no session port exists, so open one exactly the
                 // way the TV output does (same size, rate and flip handling)
@@ -1218,8 +1274,10 @@ int run_vr(const VrOptions& options) {
                 TvOutput message_tv;
                 std::string message_error;
                 if (message_tv.start(message_error)) {
-                    show_firmware_message(message_tv, options.firmware,
-                                          hmd_error.missing_table_library);
+                    const FirmwareAnswer answer = show_firmware_message(
+                        message_tv, options.firmware, hmd_error.missing_table_library);
+                    card_shown = answer != FirmwareAnswer::not_shown;
+                    card_continue = answer == FirmwareAnswer::continue_on_tv;
                 } else {
                     line("viewer: vr firmware message: the TV port would not open (%s); the "
                          "hmd2 lines above name the missing table",
@@ -1230,61 +1288,122 @@ int run_vr(const VrOptions& options) {
                      "refused); the hmd2 lines above name the missing table");
             }
         }
-        teardown();
-        return 6;
-    }
-    hmd2_up = true;
-    const hmd2::Fov fov = hmd2::field_of_view();
-    const splat::HeadsetProjection projection =
-        splat::hmd_projection({fov.out, fov.in, fov.top, fov.bottom}, kEyeWidth, kEyeHeight);
-    line("viewer: vr headset: %ux%u per eye, %d buffers, refresh %d Hz output, fov tangents out "
-         "%.3f in %.3f top %.3f bottom %.3f -> fx %.2f fy %.2f cx %.1f cy %.1f, per-eye principal "
-         "point %+.1f / %+.1f px",
-         hmd2::eye_size(), hmd2::eye_height(), hmd2::buffer_count(), hmd2::refresh_hz(),
-         static_cast<double>(fov.out), static_cast<double>(fov.in), static_cast<double>(fov.top),
-         static_cast<double>(fov.bottom), projection.intrinsics.fx, projection.intrinsics.fy,
-         projection.intrinsics.cx, projection.intrinsics.cy, projection.eye_shift[0],
-         projection.eye_shift[1]);
-
-    // The TV mirror, once: what the TV shows and at what size. Hmd2's
-    // compositor produces it next to the flips this loop already submits (no
-    // extra frame, thread or copy on the title's side), so the achieved rate is
-    // the display's own and is logged once with the first second's stats.
-    bool mirror_ok = hmd2::mirroring();
-    if (tv_up) {
-        line("viewer: vr mirror: off (the title drives the TV itself, see vr tv output)");
-    } else if (!options.mirror) {
-        line("viewer: vr mirror: off (MIRROR=0 in viewer.env); the TV keeps the console UI");
-    } else if (!mirror_ok) {
-        line("viewer: vr mirror: unavailable (Hmd2 refused the social screen, return codes above); "
-             "VR continues, the TV keeps the console UI");
+        // A TV-only session needs a port whatever TV_OUTPUT said: without Hmd2
+        // it is the only display there is (the card's own port is closed again
+        // by then). Ask the decision first, with a port assumed: after O, or a
+        // card that never showed, the title ends and must not open - and
+        // immediately tear down - the main port on its way out.
+        if (!tv_up && !options.tv_output &&
+            runs_without_vr({true, firmware_card, card_shown, card_continue})) {
+            std::string retry_error;
+            if (tv_output.start(retry_error)) {
+                tv_up = true;
+                line("viewer: no VR: the TV output is open (%ux%u, 30 fps) although TV_OUTPUT=0: "
+                     "without a headset it is the only display",
+                     splat::kTvWidth, splat::kTvHeight);
+            } else {
+                line("viewer: no VR: the TV output would not open either (%s)",
+                     retry_error.c_str());
+            }
+        }
+        no_vr = runs_without_vr({tv_up, firmware_card, card_shown, card_continue});
+        if (!no_vr) {
+            teardown();
+            return 6;
+        }
+        // Nothing samples them now (Hmd2 was the only reader): give the ~98 MB
+        // of eye buffers back (3 x 3968x2048 RGBA8) before the renderer and the scene slots allocate.
+        eye_buffers.destroy();
+        line("viewer: no VR: %s (rc 0x%08x), so the session runs on the TV: no Hmd2, no "
+             "reprojection and no mirror; the DualSense drives the menu and the scene, and the "
+             "camera is a seated head pose at the capture point",
+             hmd_error.step != nullptr && hmd_error.step[0] != '\0' ? hmd_error.step : "unknown",
+             static_cast<unsigned>(hmd_error.rc));
+        line("viewer: tv session (mode vr without Hmd2): %ux%u mono on the TV at 60 Hz, no eye "
+             "buffers and no reprojection, %s",
+             splat::kTvWidth, splat::kTvHeight, cap_text);
+        if (options.cap_seconds > 0) {
+            line("viewer: tv cap: %d s from this run's viewer.env SECONDS", options.cap_seconds);
+        }
     } else {
-        const size_t mirror_bytes = hmd2::mirror_display_bytes();
-        // The only thing Hmd2 says about the mirror's geometry is the display
-        // buffer's size. Name a resolution only when the size is exactly one
-        // (four bytes per pixel); otherwise log the size and invent nothing.
-        const bool known_1080p = mirror_bytes == 1920ull * 1080ull * 4ull;
-        const bool known_4k = mirror_bytes == 3840ull * 2160ull * 4ull;
-        line("viewer: vr mirror: on (Hmd2 social screen: the headset's view on the TV, so the "
-             "console's recording captures it), display buffer %.1f MiB%s",
-             static_cast<double>(mirror_bytes) / (1024.0 * 1024.0),
-             known_1080p ? " = 1920x1080 at 4 bytes per pixel"
-                         : known_4k ? " = 3840x2160 at 4 bytes per pixel" : "");
+        hmd2_up = true;
+        line("viewer: vr session (mode vr): eye %ux%u per eye, 60 rendered -> 120 Hz reprojected, "
+             "%s",
+             kEyeWidth, kEyeHeight, cap_text);
+        if (options.cap_seconds > 0) {
+            line("viewer: vr cap: %d s from this run's viewer.env SECONDS", options.cap_seconds);
+        }
+    }
+
+    // The headset side only exists with Hmd2 up: its FOV becomes the eye
+    // intrinsics and the mirror is its own. Without it the renderer's 60 degree
+    // fallback is the camera - a VR session's TV picture is the middle ~54
+    // degrees of the left eye, so the two framings match.
+    splat::HeadsetProjection projection;
+    bool mirror_ok = false;
+    if (no_vr) {
+        line("viewer: no VR: the TV camera is the renderer's 60 degree horizontal pinhole at "
+             "%ux%u (the TV picture of a VR session shows about 54 degrees)",
+             splat::kTvWidth, splat::kTvHeight);
+    } else {
+        const hmd2::Fov fov = hmd2::field_of_view();
+        projection =
+            splat::hmd_projection({fov.out, fov.in, fov.top, fov.bottom}, kEyeWidth, kEyeHeight);
+        line("viewer: vr headset: %ux%u per eye, %d buffers, refresh %d Hz output, fov tangents "
+             "out %.3f in %.3f top %.3f bottom %.3f -> fx %.2f fy %.2f cx %.1f cy %.1f, per-eye "
+             "principal point %+.1f / %+.1f px",
+             hmd2::eye_size(), hmd2::eye_height(), hmd2::buffer_count(), hmd2::refresh_hz(),
+             static_cast<double>(fov.out), static_cast<double>(fov.in),
+             static_cast<double>(fov.top), static_cast<double>(fov.bottom),
+             projection.intrinsics.fx, projection.intrinsics.fy, projection.intrinsics.cx,
+             projection.intrinsics.cy, projection.eye_shift[0], projection.eye_shift[1]);
+
+        // The TV mirror, once: what the TV shows and at what size. Hmd2's
+        // compositor produces it next to the flips this loop already submits (no
+        // extra frame, thread or copy on the title's side), so the achieved rate
+        // is the display's own and is logged once with the first second's stats.
+        mirror_ok = hmd2::mirroring();
+        if (tv_up) {
+            line("viewer: vr mirror: off (the title drives the TV itself, see the tv output line)");
+        } else if (!options.mirror) {
+            line("viewer: vr mirror: off (MIRROR=0 in viewer.env); the TV keeps the console UI");
+        } else if (!mirror_ok) {
+            line("viewer: vr mirror: unavailable (Hmd2 refused the social screen, return codes "
+                 "above); VR continues, the TV keeps the console UI");
+        } else {
+            const size_t mirror_bytes = hmd2::mirror_display_bytes();
+            // The only thing Hmd2 says about the mirror's geometry is the display
+            // buffer's size. Name a resolution only when the size is exactly one
+            // (four bytes per pixel); otherwise log the size and invent nothing.
+            const bool known_1080p = mirror_bytes == 1920ull * 1080ull * 4ull;
+            const bool known_4k = mirror_bytes == 3840ull * 2160ull * 4ull;
+            line("viewer: vr mirror: on (Hmd2 social screen: the headset's view on the TV, so the "
+                 "console's recording captures it), display buffer %.1f MiB%s",
+                 static_cast<double>(mirror_bytes) / (1024.0 * 1024.0),
+                 known_1080p ? " = 1920x1080 at 4 bytes per pixel"
+                             : known_4k ? " = 3840x2160 at 4 bytes per pixel" : "");
+        }
     }
 
     // ---- renderer ---------------------------------------------------------
     splat::RendererOptions renderer_options;
     renderer_options.shader_dir = options.shader_dir;
-    renderer_options.eye_width = kEyeWidth;
-    renderer_options.eye_height = kEyeHeight;
-    renderer_options.stereo = true;
+    // With a headset: both eyes at the headset's size, side by side. Without:
+    // one 1920x1080 image, which the TV output presents (the TV capture below is
+    // then a 1:1 copy of it) at the renderer's 60 degree fallback.
+    renderer_options.eye_width = no_vr ? splat::kTvWidth : kEyeWidth;
+    renderer_options.eye_height = no_vr ? splat::kTvHeight : kEyeHeight;
+    renderer_options.stereo = !no_vr;
     // The eye buffer is linear RGBA8 (Hmd2's descriptor is UNORM); an sRGB
     // target keeps the premultiplied blend in linear light and the bytes Hmd2
-    // samples are sRGB-encoded, the same colour path the TV viewer takes.
+    // samples are sRGB-encoded, the same colour path the TV viewer takes. The
+    // same target feeds the TV picture (present() swaps red and blue for it).
     renderer_options.target_format = VK_FORMAT_R8G8B8A8_SRGB;
-    renderer_options.intrinsics = projection.intrinsics;
-    renderer_options.eye_center_shift[0] = projection.eye_shift[0];
-    renderer_options.eye_center_shift[1] = projection.eye_shift[1];
+    if (!no_vr) {
+        renderer_options.intrinsics = projection.intrinsics;
+        renderer_options.eye_center_shift[0] = projection.eye_shift[0];
+        renderer_options.eye_center_shift[1] = projection.eye_shift[1];
+    }
     // Black everywhere the photo is not: the clear colour and the comfort fade's
     // backdrop are one value (splat_renderer.h), so the void around the photo
     // and the fade past the comfort radius are black in both eyes and on the TV
@@ -1316,9 +1435,15 @@ int run_vr(const VrOptions& options) {
         return 6;
     }
     renderer = renderer_result.take();
-    line("viewer: vr renderer: %ux%u stereo (side by side), shaders %s, create %.1f ms",
-         renderer->eye_width(), renderer->eye_height(), options.shader_dir.c_str(),
-         now_ms() - renderer_started);
+    if (no_vr) {
+        line("viewer: no VR renderer: %ux%u mono, shaders %s, create %.1f ms",
+             renderer->eye_width(), renderer->eye_height(), options.shader_dir.c_str(),
+             now_ms() - renderer_started);
+    } else {
+        line("viewer: vr renderer: %ux%u stereo (side by side), shaders %s, create %.1f ms",
+             renderer->eye_width(), renderer->eye_height(), options.shader_dir.c_str(),
+             now_ms() - renderer_started);
+    }
 
     // The TV output gave up (it could not be set up, or the port stopped
     // working): the Hmd2 mirror carries the TV again, as through 0.5.x, and one
@@ -1331,12 +1456,18 @@ int run_vr(const VrOptions& options) {
         tv_output.stop();
         tv_up = false;
         wait_restart = true;
-        const bool mirror_started = options.mirror && hmd2::start_mirror();
-        mirror_ok = hmd2::mirroring();
-        line("viewer: vr tv output: FAIL %s; back to the Hmd2 mirror (%s)", why.c_str(),
-             mirror_started ? "mirror on" : options.mirror
-                                                ? "the mirror would not start either, the TV keeps the console UI"
-                                                : "MIRROR=0, the TV keeps the console UI");
+        // Without Hmd2 there is no mirror to go back to: the session has lost
+        // its only display and ends at the next frame (the loop checks tv_up).
+        const bool mirror_started = !no_vr && options.mirror && hmd2::start_mirror();
+        if (!no_vr) mirror_ok = hmd2::mirroring();
+        line("viewer: %s tv output: FAIL %s; %s", no_vr ? "no VR" : "vr", why.c_str(),
+             no_vr ? "there is no Hmd2 mirror to fall back to, so the session ends"
+                   : mirror_started
+                         ? "back to the Hmd2 mirror (mirror on)"
+                         : options.mirror
+                               ? "back to the Hmd2 mirror (the mirror would not start either, the "
+                                 "TV keeps the console UI)"
+                               : "back to the Hmd2 mirror (MIRROR=0, the TV keeps the console UI)");
     };
     if (tv_up) {
         // The renderer takes the TV picture of every frame it is asked to (a
@@ -1391,23 +1522,33 @@ int run_vr(const VrOptions& options) {
     std::string panel_error;
     if (panel_available) {
         ui_runtime = std::make_unique<viewer::UiRuntime>(viewer::make_ui_runtime(ui_options));
-        // The eye intrinsics are passed for symmetry with the TV path; the VR
-        // quad is the world-fixed anchor (render/hmd_view.h PanelAnchor), which
-        // only uses the pose.
-        if (!ui_runtime->start(*renderer, viewer::UiHost::Mode::Vr, renderer_options.intrinsics)) {
+        // With a headset the panel is the world-fixed window (render/hmd_view.h
+        // PanelAnchor) and the intrinsics only keep the TV path's call shape; on
+        // the TV the panel is the flat, full-screen one of TV mode, which the
+        // TV output draws over every frame (UiHost::tv_quads, unchanged).
+        const viewer::UiHost::Mode host_mode =
+            no_vr ? viewer::UiHost::Mode::Tv : viewer::UiHost::Mode::Vr;
+        if (!ui_runtime->start(*renderer, host_mode, renderer_options.intrinsics)) {
             panel_error = ui_runtime->last_error();
             ui_runtime.reset();
             panel_available = false;
         }
     }
-    // A failed panel must not cost the headset session: the scene still runs,
-    // and the log says why the menu is not there.
+    // A failed panel must not cost the session: the scene still runs, and the
+    // log says why the menu is not there.
     if (ui_runtime != nullptr) {
         ui_runtime->app->set_scene_loaded(boot_has_scene);
     }
     const bool boot_open_panel = ui_options.ui || !boot_has_scene || options.scene.empty();
     viewer::PanelMode panel(panel_available, panel_available && boot_open_panel);
-    if (ui_runtime != nullptr) {
+    if (ui_runtime != nullptr && no_vr) {
+        line("viewer: no VR ui: panel %s (UI %s, %s); Options opens it as in VR and the TV shows "
+             "it flat over the scene; every screen works, and Quit is its last item%s",
+             panel.open() ? "open at boot" : "available",
+             ui_options.ui_given ? (ui_options.ui ? "=1" : "=0") : "not set, VR default",
+             ui_options.ui_fake ? "fake services" : "models, jobs and captures real",
+             boot_has_scene ? "" : "; no scene in the gallery, so the folders home is the session");
+    } else if (ui_runtime != nullptr) {
         line("viewer: vr ui: panel %s (UI %s, %s); an Options tap opens it (Settings once it is "
              "open), Options held 1 s recentres the scene and the window, Cross 1 s recentres the "
              "window while it is open, Quit is its last item%s",
@@ -1416,16 +1557,18 @@ int run_vr(const VrOptions& options) {
              ui_options.ui_fake ? "fake services" : "models, jobs and captures real",
              boot_has_scene ? "" : "; no scene in the gallery, so the folders home is the session");
     } else if (!panel_error.empty()) {
-        line("viewer: vr ui: no panel (%s); the session runs with the scene only",
-             panel_error.c_str());
+        line("viewer: %s ui: no panel (%s); the session runs with the scene only",
+             no_vr ? "no VR" : "vr", panel_error.c_str());
     } else {
-        line("viewer: vr ui: off (UI=0 in viewer.env); the session runs with the scene only");
+        line("viewer: %s ui: off (UI=0 in viewer.env); the session runs with the scene only",
+             no_vr ? "no VR" : "vr");
     }
     if (!boot_has_scene && ui_runtime == nullptr) {
-        // Nothing to show and no menu: the headset stays black until a scene
-        // arrives, but the session is still alive (a pose wait, the quit file
-        // and SECONDS end it). Say so instead of failing.
-        line("viewer: vr no scene and no panel: the headset shows the empty view");
+        // Nothing to show and no menu: the screen stays black until a scene
+        // arrives, but the session is still alive (the quit file and SECONDS end
+        // it). Say so instead of failing.
+        line("viewer: %s no scene and no panel: the screen shows the empty view",
+             no_vr ? "no VR" : "vr");
     }
 
     const VkExtent2D extent = renderer->target_extent();
@@ -1438,7 +1581,10 @@ int run_vr(const VrOptions& options) {
         return 6;
     }
     target_image = image_result.take();
-    if (!copy_pass.create(context->device(), context->queue_family(), context->queue(), error)) {
+    // The copy pass only exists to hand a finished frame to Hmd2's eye buffer;
+    // on the TV the renderer's own TV capture is what the port reads.
+    if (!no_vr &&
+        !copy_pass.create(context->device(), context->queue_family(), context->queue(), error)) {
         line("viewer: FAIL copy pass: %s", error.c_str());
         teardown();
         return 6;
@@ -1581,28 +1727,40 @@ int run_vr(const VrOptions& options) {
             return 7;
         }
         target.initial_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        line("viewer: vr warm-up frame: project %.2f sort %.2f draw %.2f ms (both eyes), %u "
+        line("viewer: %s warm-up frame: project %.2f sort %.2f draw %.2f ms (%s), %u "
              "visible splats",
-             renderer->timings().project_ms, renderer->timings().sort_ms,
-             renderer->timings().draw_ms, renderer->last_visible_count());
+             no_vr ? "tv" : "vr", renderer->timings().project_ms, renderer->timings().sort_ms,
+             renderer->timings().draw_ms, no_vr ? "mono" : "both eyes",
+             renderer->last_visible_count());
     }
 
     // The pads: the DualSense and both Sense controllers, for the user the Hmd2
-    // session was opened for. Missing ones are retried in the loop, slowly.
+    // session was opened for (which the failed init has already resolved: the
+    // user service call is the first thing hmd2::setup does). On the TV there is
+    // no headset, so the Sense pair - VR controllers - is not opened, and the
+    // DualSense is the whole input. Missing ones are retried in the loop, slowly.
     const int user = hmd2::user_id();
     const double pads_started = now_ms();
     dualsense.open(user, pads_started);
-    sense_left.open(user, pads_started);
-    sense_right.open(user, pads_started);
-    line("viewer: vr input: an Options tap opens the menu on release (DualSense or right Sense; "
-         "its Quit item ends the session), hold Options 1 s to recentre the scene and the open "
-         "window, hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
-         "scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene: by default "
-         "Capture zooms about the photo's capture point (Settings > Scale can pick Front or "
-         "Centre), left stick walks "
-         "(forward/back, right/left), right stick rises and turns right; the D-pad and Square have "
-         "no scene action (the viewer has no rotation; turn a scene with L3/R3 on its panel "
-         "entry); Create does nothing, one table for all pads");
+    if (no_vr) {
+        line("viewer: no VR input: the DualSense only (the Sense controllers belong to the "
+             "headset): Options opens the menu and continues in the scene, Cross is the panel's "
+             "Select and a 1 s Cross hold recentres, L1/R1 change scene, L2/R2 scale the scene, "
+             "the left stick walks (forward/back, right/left) and the right stick rises and turns "
+             "right; Quit is the panel's last item");
+    } else {
+        sense_left.open(user, pads_started);
+        sense_right.open(user, pads_started);
+        line("viewer: vr input: an Options tap opens the menu on release (DualSense or right Sense; "
+             "its Quit item ends the session), hold Options 1 s to recentre the scene and the open "
+             "window, hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
+             "scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene: by "
+             "default Capture zooms about the photo's capture point (Settings > Scale can pick "
+             "Front or Centre), left stick walks "
+             "(forward/back, right/left), right stick rises and turns right; the D-pad and Square "
+             "have no scene action (the viewer has no rotation; turn a scene with L3/R3 on its "
+             "panel entry); Create does nothing, one table for all pads");
+    }
 
     // ---- the frame loop ---------------------------------------------------
     // One loop for the whole session, in two phases. Until Hmd2 reports the
@@ -1620,6 +1778,12 @@ int run_vr(const VrOptions& options) {
     // requested scene read on demand (~95 ms), with the last submitted frame
     // still being reprojected by Hmd2. The forward preload must never veto a
     // press (scene_switch.h).
+    //
+    // On the TV there is no headset pose to wait for and nothing to submit: the
+    // scene is placed at the fixed seated pose before the first frame, every
+    // frame is paced by a 60 Hz timer, and the TV output is the display. The
+    // script-free input, the menu routing, the scene switches and the caps below
+    // are the same code.
     bool intrinsics_noted = false;
 
     // The playlist's current folder, for the logs and the pose log. Empty when
@@ -1696,7 +1860,7 @@ int run_vr(const VrOptions& options) {
     // can open the menu before anyone wears the headset. The banner is one plate
     // (the solid texture) and one text mask, placed in TV pixels.
     std::vector<splat::OverlayQuad> tv_banner;
-    if (tv_up && solid_texture != UINT32_MAX) {
+    if (tv_up && !no_vr && solid_texture != UINT32_MAX) {
         constexpr uint32_t kBannerScale = 3;   // font pixels on the 1920x1080 picture
         const splat::TextImage text = splat::rasterise_text(
             {"Waiting for the headset - put it on, or use this menu"}, kBannerScale);
@@ -1717,7 +1881,7 @@ int run_vr(const VrOptions& options) {
             words.texture = texture.value();
             tv_banner = {plate, words};
         } else {
-            line("viewer: vr tv output: no banner text (%s); the TV shows the scene alone while "
+            line("viewer: tv output: no banner text (%s); the TV shows the scene alone while "
                  "it waits for the headset",
                  text.empty() ? "empty text" : texture.message().c_str());
         }
@@ -2102,7 +2266,9 @@ int run_vr(const VrOptions& options) {
     double wait_started = now_ms();
     double next_wait_log = 0.0;
     double placed_at = 0.0;
-    double second_started = 0.0;
+    // The first stats line is due one second after the session starts, even
+    // while the loop is still waiting for the headset.
+    double second_started = session_started;
     double project_second = 0.0;
     double sort_second = 0.0;
     double draw_second = 0.0;
@@ -2227,6 +2393,177 @@ int run_vr(const VrOptions& options) {
         std::snprintf(log_event, sizeof log_event, "%s", "scene");
     };
 
+    // The per-second stats line, called from the frame path and from the wait
+    // for the headset. It is always on: fps is the number the user's runs are
+    // read by, and a run whose headset was off must still print it (0 fps)
+    // instead of looking like the log stopped. On the TV the same line exists
+    // without the Hmd2 fields (there is nothing to reproject, no slot to miss
+    // and no mirror). Only the per-frame CSV stays behind POSE_LOG.
+    auto log_vr_second = [&](double now) {
+        const double seconds = (now - second_started) / 1000.0;
+        const uint64_t frames = counters.frames_this_second;
+        // The TV's own numbers, for both sessions: the rate is the flips the
+        // worker made this second, tile is the CPU tile write per flip, gpu the
+        // TV copy's GPU time per TV frame, drop the frames the worker was behind
+        // for (never a wait of the loop).
+        const viewer::TvOutput::Stats tv_stats = tv_output.stats();
+        const double tv_fps =
+            static_cast<double>(tv_stats.presents - tv_presents_seen) / seconds;
+        const double tv_tile_ms =
+            tv_stats.presents > tv_presents_seen
+                ? (tv_stats.tile_ms_sum - tv_tile_sum_seen) /
+                      static_cast<double>(tv_stats.presents - tv_presents_seen)
+                : 0.0;
+        tv_presents_seen = tv_stats.presents;
+        tv_tile_sum_seen = tv_stats.tile_ms_sum;
+        if (no_vr) {
+            // No Hmd2 to pace, submit to or mirror: fps is this loop's own rate
+            // (the 60 Hz timer), and the TV's rate and tile cost are the only
+            // display numbers there are.
+            line("viewer: tv t=%.0fs fps=%.1f project=%.2f sort=%.2f draw=%.2f copy=%.2f "
+                 "gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx tv=%s tvfps=%.1f tvtile=%.2f ms "
+                 "tvgpu=%.2f ms tvdrop=%llu tverr=%llu slow=%llu/%llu",
+                 (now - (placed ? placed_at : session_started)) / 1000.0, frames / seconds,
+                 frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
+                 frames ? draw_second / frames : 0.0, frames ? counters.copy_second / frames : 0.0,
+                 frames ? (project_second + sort_second + draw_second) / frames : 0.0,
+                 renderer->last_visible_count(), last_fade,
+                 static_cast<double>(headset.hud_scale()), tv_up ? "on" : "off", tv_fps,
+                 tv_tile_ms,
+                 tv_frames_second ? tv_gpu_ms_second / static_cast<double>(tv_frames_second) : 0.0,
+                 static_cast<unsigned long long>(tv_output.dropped()),
+                 static_cast<unsigned long long>(tv_stats.errors),
+                 static_cast<unsigned long long>(counters.slow_frames),
+                 static_cast<unsigned long long>(counters.frames));
+            pose_log.flush();
+            counters.frames_this_second = 0;
+            tv_gpu_ms_second = 0.0;
+            tv_frames_second = 0;
+            counters.copy_second = 0.0;
+            project_second = 0.0;
+            sort_second = 0.0;
+            draw_second = 0.0;
+            second_started = now;
+            return;
+        }
+        const hmd2::FlipInfo flip = hmd2::flip_status();
+        const hmd2::PaceStats pace = hmd2::take_pace();
+        // hmd2 counts the display slots it skipped: the miss count that
+        // matters for "reprojected on time".
+        const int missed_now = hmd2::missed_frames();
+        // The mirror's rate: the images the display showed this second (each
+        // is a fresh mirror frame too). Off and refused both print a word,
+        // not a number, so a 0 can never be mistaken for a mirror.
+        const double mirror_fps =
+            mirror_ok ? static_cast<double>(flip.shown - mirror_shown) / seconds : 0.0;
+        mirror_shown = flip.shown;
+        char mirror_text[24];
+        if (mirror_ok) {
+            std::snprintf(mirror_text, sizeof mirror_text, "%.1ffps", mirror_fps);
+        } else {
+            std::snprintf(mirror_text, sizeof mirror_text, "%s",
+                          options.mirror ? "failed" : "off");
+        }
+        // The TV: `on` is the title's own output (render/tv_view.h picture at
+        // 30 fps through the main VideoOut port), `mirror` the Hmd2 social
+        // screen (also what a failed output falls back to), `none` neither
+        // (MIRROR=0 and no output).
+        const char* tv_text = tv_up ? "on" : (mirror_ok ? "mirror" : "none");
+        line("viewer: vr t=%.0fs fps=%.1f project=%.2f sort=%.2f draw=%.2f (per eye %.2f) "
+             "copy=%.2f gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx ipd=%.1f mm "
+             "slow=%llu/%llu missed=%d shown=%llu repeated=%d queue-full=%d err=%d worn=%d mirror=%s "
+             "tv=%s tvfps=%.1f tvtile=%.2f ms tvgpu=%.2f ms tvdrop=%llu tverr=%llu",
+             (now - (placed ? placed_at : session_started)) / 1000.0, frames / seconds,
+             frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
+             frames ? draw_second / frames : 0.0, frames ? draw_second / frames / 2.0 : 0.0,
+             frames ? counters.copy_second / frames : 0.0,
+             frames ? (project_second + sort_second + draw_second) / frames : 0.0,
+             renderer->last_visible_count(), last_fade,
+             static_cast<double>(headset.hud_scale()), headset.ipd() * 1000.0,
+             static_cast<unsigned long long>(counters.slow_frames),
+             static_cast<unsigned long long>(counters.frames), missed_now,
+             static_cast<unsigned long long>(flip.shown), hmd2::repeated_frames(),
+             hmd2::queue_full_waits(), hmd2::frame_errors(),
+             hmd2::device_state().worn ? 1 : 0, mirror_text, tv_text, tv_fps, tv_tile_ms,
+             tv_frames_second ? tv_gpu_ms_second / static_cast<double>(tv_frames_second) : 0.0,
+             static_cast<unsigned long long>(tv_output.dropped()),
+             static_cast<unsigned long long>(tv_stats.errors));
+        if (mirror_ok && !mirror_logged) {
+            // Logged once, when there is a measurement to give: the mirror
+            // costs the loop nothing itself, so this is the display's rate.
+            mirror_logged = true;
+            line("viewer: vr mirror: %.1f fps achieved over the first %.1f s (Hmd2's compositor, "
+                 "next to the frames this loop already submits)",
+                 mirror_fps, seconds);
+        }
+        if (pace.step_ms > 0.0f && missed_now > 0) {
+            // One line of context, only when the display is skipping slots:
+            // the pace numbers say whether the loop or the display is behind.
+            line("viewer: vr pace nap=%.2f call=%.2f ahead=%.2f step=%.2f ms", pace.nap_ms,
+                 pace.call_ms, pace.ahead_ms, pace.step_ms);
+        }
+        // The compact pose line for a recorded video's one-second grid, and
+        // the CSV's flush: the raw Hmd2 position in cm (tracker axes: +x
+        // right, +y up, forward -z) and the angles the camera used in the
+        // scene's frame, in degrees - the same values as the CSV's row.
+        line("viewer: vr pose pos %.1f %.1f %.1f cm yaw %.1f pitch %.1f roll %.1f deg "
+             "frame=%llu",
+             static_cast<double>(last_raw.head.position[0]) * 100.0,
+             static_cast<double>(last_raw.head.position[1]) * 100.0,
+             static_cast<double>(last_raw.head.position[2]) * 100.0,
+             headset.view_yaw() * kRadToDeg, headset.scene_pitch() * kRadToDeg,
+             headset.scene_roll() * kRadToDeg,
+             static_cast<unsigned long long>(counters.frames));
+        pose_log.flush();
+        counters.frames_this_second = 0;
+        tv_gpu_ms_second = 0.0;
+        tv_frames_second = 0;
+        counters.copy_second = 0.0;
+        project_second = 0.0;
+        sort_second = 0.0;
+        draw_second = 0.0;
+        second_started = now;
+    };
+
+    // The TV session's fixed head pose: identity, at the origin - the pose a
+    // seated user's headset reports when it is put on at the capture point - so
+    // the scene is placed exactly where the photo was taken and the sticks and
+    // triggers move it as in VR. It never changes, so "tracking" cannot be lost.
+    splat::HeadPoses seated_pose;
+    seated_pose.head.tracked = true;
+    // The TV session's frame pacing: Hmd2's slots drive the VR loop, a 60 Hz
+    // deadline drives this one. A frame that overruns restarts the clock instead
+    // of rendering a burst of catch-up frames.
+    double next_tv_frame_ms = 0.0;
+    auto pace_tv_frame = [&]() {
+        constexpr double kFrameMs = 1000.0 / 60.0;
+        const double now = now_ms();
+        next_tv_frame_ms += kFrameMs;
+        if (next_tv_frame_ms <= now) {
+            next_tv_frame_ms = now + kFrameMs;
+            return;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::duration<double, std::milli>(next_tv_frame_ms - now));
+    };
+    if (no_vr) {
+        // No placement wait: the pose is the fixed one, placed through the same
+        // recentre path the headset's first placement and the Cross hold use, so
+        // the scene's stored scale is applied the same way. The cap's clock
+        // starts here, as it starts at the VR placement.
+        headset.update(seated_pose);
+        const double removed_yaw = place_scene_at_head();
+        if (!scenes.empty()) load_view(scenes.current().folder, false);
+        placed = true;
+        placed_at = now_ms();
+        second_started = placed_at;
+        next_tv_frame_ms = placed_at;
+        line("viewer: no VR: the scene is placed at the seating pose (identity, %.0f deg of yaw "
+             "removed, world scale %.2fx, ipd %.1f mm); frames are paced at 60 Hz by a timer and "
+             "the TV output presents them at 30 fps",
+             removed_yaw, static_cast<double>(headset.hud_scale()), headset.ipd() * 1000.0);
+    }
+
     for (;;) {
         const double now_loop = now_ms();
         log_event[0] = '\0';
@@ -2234,16 +2571,19 @@ int run_vr(const VrOptions& options) {
         // auto-exit, so the title never quits to the home screen on its own.
         if (placed && options.cap_seconds > 0 &&
             (now_loop - placed_at) / 1000.0 >= static_cast<double>(options.cap_seconds)) {
-            line("viewer: vr session cap reached (%.0f s of %d s)", (now_loop - placed_at) / 1000.0,
-                 options.cap_seconds);
+            line("viewer: %s session cap reached (%.0f s of %d s)", no_vr ? "tv" : "vr",
+                 (now_loop - placed_at) / 1000.0, options.cap_seconds);
             log_pose("cap");
             break;
         }
         // Input: edge-triggered, once per frame, from every pad that is there.
-        // A missing pad is retried here at kPadRetryMs, not every frame.
+        // A missing pad is retried here at kPadRetryMs, not every frame. The
+        // Sense pair is not opened at all on the TV (it belongs to the headset).
         dualsense.open(user, now_loop);
-        sense_left.open(user, now_loop);
-        sense_right.open(user, now_loop);
+        if (!no_vr) {
+            sense_left.open(user, now_loop);
+            sense_right.open(user, now_loop);
+        }
         // W26: the grab reads both hands every frame, so each Sense pad is
         // registered with VrTracker2 as soon as it is open - W25 registered the
         // right one only while the panel was up, which a grab behind a closed
@@ -2299,7 +2639,8 @@ int run_vr(const VrOptions& options) {
             struct stat quit_status {};
             if (::stat(kQuitPath.c_str(), &quit_status) == 0 &&
                 quit_status.st_mtime + 1 >= started_wall) {
-                line("viewer: vr quit requested (%s); ending", kQuitPath.c_str());
+                line("viewer: %s quit requested (%s); ending", no_vr ? "tv" : "vr",
+                     kQuitPath.c_str());
                 log_pose("quit");
                 break;
             }
@@ -2701,34 +3042,47 @@ int run_vr(const VrOptions& options) {
             recentre_hold.update(false, (now_loop - session_started) / 1000.0);
         }
 
-        if (!hmd2::wait_slot()) {
-            reason = "FAIL hmd2 stopped";
-            status = 8;
-            break;
-        }
-        if (!hmd2::begin_frame()) {
-            if (++begin_failures > 120) {
-                line("viewer: FAIL 120 frames without BeginFrame (0x%08x)",
-                     static_cast<unsigned>(hmd2::error().rc));
-                reason = "FAIL no BeginFrame";
+        // The frame's head pose. VR: Hmd2's slot paces the loop and its
+        // predicted pose is the frame's; on the TV: a 60 Hz deadline paces it and
+        // the fixed seating pose is the frame's (no slot, no BeginFrame, nothing
+        // to submit).
+        hmd2::EyeBuffer eye{};
+        hmd2::Poses poses{};
+        splat::HeadPoses tracked = seated_pose;
+        bool wait_frame = false;
+        double waited = 0.0;
+        splat::PlacementWait::Step settle;
+        if (no_vr) {
+            pace_tv_frame();
+            eye.index = -1;
+        } else {
+            if (!hmd2::wait_slot()) {
+                reason = "FAIL hmd2 stopped";
                 status = 8;
                 break;
             }
-            continue;
+            if (!hmd2::begin_frame()) {
+                if (++begin_failures > 120) {
+                    line("viewer: FAIL 120 frames without BeginFrame (0x%08x)",
+                         static_cast<unsigned>(hmd2::error().rc));
+                    reason = "FAIL no BeginFrame";
+                    status = 8;
+                    break;
+                }
+                continue;
+            }
+            begin_failures = 0;
+            eye = hmd2::acquire();
+            poses = hmd2::predicted_poses();
+            tracked = to_head_poses(poses);
         }
-        begin_failures = 0;
-        const hmd2::EyeBuffer eye = hmd2::acquire();
-        const hmd2::Poses poses = hmd2::predicted_poses();
-        const splat::HeadPoses tracked = to_head_poses(poses);
         // The pose this frame is rendered from - and the one hmd2::submit()
         // hands Hmd2 as the render pose (same sample, same display time).
         last_raw = tracked;
 
         // A frame of the wait for the headset that still runs the menu and renders
-        // the TV (0.6.0, only with the TV output up).
-        bool wait_frame = false;
-        double waited = 0.0;
-        splat::PlacementWait::Step settle;
+        // the TV (0.6.0, only with the TV output up). The TV session is placed
+        // before its first frame, so it never waits here.
         if (!placed) {
             // Still waiting for the headset. The eye buffer is untouched (zero)
             // and the flip keeps Hmd2's queue and the predicted pose moving.
@@ -2760,6 +3114,11 @@ int run_vr(const VrOptions& options) {
                          worn ? 1 : 0, poses.head.tracked ? 1 : 0, settle.stable_seconds, waited,
                          kPoseWaitLimitSeconds, splat::kPlaceStableSeconds);
                 }
+                // The per-second stats line keeps running while no frame is
+                // rendered: a run whose headset was never worn still shows
+                // fps=0, instead of a log that looks stopped.
+                const double wait_now = now_ms();
+                if (wait_now - second_started >= 1000.0) log_vr_second(wait_now);
                 // Nobody at the TV: the old wait, next slot. With the TV up the
                 // frame goes on without a head: the menu runs, and the TV gets
                 // the scene at the capture pose plus the flat menu and a banner.
@@ -2797,7 +3156,10 @@ int run_vr(const VrOptions& options) {
                                                            : "from the 63 mm default");
         }
 
-        if (wait_frame) {
+        if (no_vr) {
+            // The seating pose never moves: nothing to follow, no tracker jump
+            // to watch and no pose to lose.
+        } else if (wait_frame) {
             // No head yet: nothing to follow, no tracker jump to watch.
         } else if (poses.head.tracked) {
             headset.update(tracked);
@@ -2854,6 +3216,12 @@ int run_vr(const VrOptions& options) {
         // pointer mode ignores it (panel closed -> off).
         const bool r2_down =
             (held_buttons & pad::kR2) != 0 || sense_right.axes().r2 > kPointerClickTrigger;
+        // Without a headset there is no right Sense pad to point with: the
+        // DualSense's R2 must not arm the pointer mode on the TV, where it is
+        // only the scene's scale trigger (and the scene controls are suspended
+        // while the panel is open). No Sense pad is opened there, so no ray and
+        // no click exists anyway.
+        const bool pointer_r2 = !no_vr && r2_down;
         if (ui_runtime != nullptr) {
             viewer::UiHost& ui_host = *ui_runtime->host;
             if (ui_host.visible() != route.panel_visible) ui_host.set_visible(route.panel_visible);
@@ -2865,7 +3233,9 @@ int run_vr(const VrOptions& options) {
             // ray below tests this same quad, so the two never disagree.
             if (window_recentre) {
                 ui_host.recenter_panel(view.midpoint);
-                if (ui_host.visible()) {
+                // No window on the TV: the panel is the flat one, so there is
+                // nothing to put back in front of the user.
+                if (ui_host.visible() && !no_vr) {
                     line("viewer: vr panel recentred with the scene (window %.1f m ahead)",
                          static_cast<double>(splat::kPanelDistanceMetres));
                 }
@@ -2878,7 +3248,7 @@ int run_vr(const VrOptions& options) {
             // is not the scene's scale trigger here: with the panel up the
             // scene controls are suspended (route.scene_controls).
             const splat::PointerMode::Step pointer = pointer_mode.update(
-                ui_host.visible(), route.ui_pressed, route.ui_held, r2_down);
+                ui_host.visible(), route.ui_pressed, route.ui_held, pointer_r2);
             if (pointer.turned_on) line("viewer: pointer on (R2); the ray is armed");
             if (pointer.turned_off) {
                 line("viewer: pointer off (joystick); focus stays where the stick moved it");
@@ -2908,7 +3278,7 @@ int run_vr(const VrOptions& options) {
                     input.held &= ~splat::Select;
                 }
                 if (cross.tap) input.pressed |= splat::Select;
-                if (cross.hold) {
+                if (cross.hold && !no_vr) {
                     ui_host.recenter_panel(view.midpoint);
                     line("viewer: vr panel recentred: Cross held %.1f s (window %.1f m ahead)",
                          pad::kRecentreHoldSeconds, static_cast<double>(splat::kPanelDistanceMetres));
@@ -3150,13 +3520,17 @@ int run_vr(const VrOptions& options) {
         // when it is (update_overlay appends UiHost::quads()).
         // The scale press's peripheral vignette eases in and out with the press
         // (the dolly term is optic flow; a faint tunnel makes it easier to read).
-        const float vignette_target =
-            (scale_gesture || now_loop < scale_marker_until) ? kScaleVignetteStrength : 0.0f;
-        const float vignette_alpha =
-            1.0f - static_cast<float>(std::exp(-input_seconds / 0.12));
-        scale_vignette += (vignette_target - scale_vignette) * vignette_alpha;
-        renderer->set_scale_vignette(scale_vignette);
-        update_overlay(view, now_loop);
+        // Both are headset things: on the TV the picture is taken before the
+        // overlay and there is no optic flow to soften, so neither is drawn.
+        if (!no_vr) {
+            const float vignette_target =
+                (scale_gesture || now_loop < scale_marker_until) ? kScaleVignetteStrength : 0.0f;
+            const float vignette_alpha =
+                1.0f - static_cast<float>(std::exp(-input_seconds / 0.12));
+            scale_vignette += (vignette_target - scale_vignette) * vignette_alpha;
+            renderer->set_scale_vignette(scale_vignette);
+            update_overlay(view, now_loop);
+        }
         update_tv_quads(!placed);
         // Display > Blending chooses the attachment: sRGB (linear-light blend,
         // the default) or its UNORM counterpart (gamma-space blend like Spark).
@@ -3178,6 +3552,21 @@ int run_vr(const VrOptions& options) {
                     if (next_tv_ms < now_loop) next_tv_ms = now_loop + 1000.0 / 30.0;
                 }
             }
+        }
+        // On the TV the output IS the display: a port that failed leaves nothing
+        // to present on (there is no Hmd2 mirror), so the session ends instead of
+        // running blind.
+        if (no_vr && !tv_up) {
+            const std::string why = tv_output.failure();
+            if (!why.empty()) {
+                line("viewer: no VR: the TV output stopped (%s); ending the session", why.c_str());
+            } else {
+                line("viewer: no VR: the TV output is gone (it never opened, or its picture could "
+                     "not be set up); ending the session");
+            }
+            status = 8;
+            reason = "FAIL the TV output stopped";
+            break;
         }
         // Waiting for the headset a frame exists only for the TV: with no TV
         // picture due there is nothing to render (the eye buffer stays black).
@@ -3213,129 +3602,48 @@ int run_vr(const VrOptions& options) {
         counters.draw_sum += timings.draw_ms;
 
         // The GPU copy into the eye buffer Hmd2 will scan out, then the flip.
-        // Bounded: a timeout means a wedged GPU and nothing may be freed.
-        const double copy_started = now_ms();
-        if (!copy_pass.copy(frame_target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            eye_buffers.buffer(eye.index), extent, kCopyTimeoutNs, error)) {
-            line("viewer: FAIL eye buffer copy: %s", error.c_str());
-            run.gpu_ok = false;
-            status = 8;
-            reason = "FAIL eye buffer copy";
-            break;
+        // Bounded: a timeout means a wedged GPU and nothing may be freed. The TV
+        // session has neither: its frame is already on its way to the port.
+        double copy_ms = 0.0;
+        if (!no_vr) {
+            const double copy_started = now_ms();
+            if (!copy_pass.copy(frame_target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                eye_buffers.buffer(eye.index), extent, kCopyTimeoutNs, error)) {
+                line("viewer: FAIL eye buffer copy: %s", error.c_str());
+                run.gpu_ok = false;
+                status = 8;
+                reason = "FAIL eye buffer copy";
+                break;
+            }
+            copy_ms = now_ms() - copy_started;
+            counters.copy_sum += copy_ms;
+            counters.copy_second += copy_ms;
+            if (!hmd2::submit()) counters.submit_errors++;
         }
-        const double copy_ms = now_ms() - copy_started;
-        counters.copy_sum += copy_ms;
-        counters.copy_second += copy_ms;
-        if (!hmd2::submit()) counters.submit_errors++;
         const double work_ms = now_ms() - frame_started;
         counters.work_max = std::max(counters.work_max, work_ms);
         if (work_ms > kFramePeriodMs) counters.slow_frames++;
         counters.frames++;
         counters.frames_this_second++;
         // The row for this submitted frame, with the event that happened before
-        // it (recentre, scene switch) when there was one.
-        log_pose(log_event);
+        // it (recentre, scene switch) when there was one. The TV session has no
+        // per-frame pose to log (POSE_LOG is a tracker log); the events still go
+        // to the klog.
+        if (!no_vr) log_pose(log_event);
         if (counters.frames == 1) {
-            line("viewer: vr first frame in %.1f ms from the session start (%u visible splats, "
-                 "eye buffer %d, %.1f ms of work)",
-                 now_ms() - session_started, renderer->last_visible_count(), eye.index, work_ms);
+            if (no_vr) {
+                line("viewer: no VR first frame in %.1f ms from the session start (%u visible "
+                     "splats, %.1f ms of work)",
+                     now_ms() - session_started, renderer->last_visible_count(), work_ms);
+            } else {
+                line("viewer: vr first frame in %.1f ms from the session start (%u visible splats, "
+                     "eye buffer %d, %.1f ms of work)",
+                     now_ms() - session_started, renderer->last_visible_count(), eye.index, work_ms);
+            }
         }
 
         const double now = now_ms();
-        if (now - second_started >= 1000.0) {
-            const double seconds = (now - second_started) / 1000.0;
-            const uint64_t frames = counters.frames_this_second;
-            const hmd2::FlipInfo flip = hmd2::flip_status();
-            const hmd2::PaceStats pace = hmd2::take_pace();
-            // hmd2 counts the display slots it skipped: the miss count that
-            // matters for "reprojected on time".
-            const int missed_now = hmd2::missed_frames();
-            // The mirror's rate: the images the display showed this second (each
-            // is a fresh mirror frame too). Off and refused both print a word,
-            // not a number, so a 0 can never be mistaken for a mirror.
-            const double mirror_fps =
-                mirror_ok ? static_cast<double>(flip.shown - mirror_shown) / seconds : 0.0;
-            mirror_shown = flip.shown;
-            char mirror_text[24];
-            if (mirror_ok) {
-                std::snprintf(mirror_text, sizeof mirror_text, "%.1ffps", mirror_fps);
-            } else {
-                std::snprintf(mirror_text, sizeof mirror_text, "%s",
-                              options.mirror ? "failed" : "off");
-            }
-            // The TV: `on` is the title's own output (render/tv_view.h picture at
-            // 30 fps through the main VideoOut port), `mirror` the Hmd2 social
-            // screen (also what a failed output falls back to), `none` neither
-            // (MIRROR=0 and no output). The rate is the flips the worker made
-            // this second; tile is the CPU tile write per flip, gpu the TV copy's
-            // GPU time per TV frame, drop the frames skipped because the worker
-            // was behind (never a wait of the loop).
-            const viewer::TvOutput::Stats tv_stats = tv_output.stats();
-            const double tv_fps =
-                static_cast<double>(tv_stats.presents - tv_presents_seen) / seconds;
-            const double tv_tile_ms =
-                tv_stats.presents > tv_presents_seen
-                    ? (tv_stats.tile_ms_sum - tv_tile_sum_seen) /
-                          static_cast<double>(tv_stats.presents - tv_presents_seen)
-                    : 0.0;
-            tv_presents_seen = tv_stats.presents;
-            tv_tile_sum_seen = tv_stats.tile_ms_sum;
-            const char* tv_text = tv_up ? "on" : (mirror_ok ? "mirror" : "none");
-            line("viewer: vr t=%.0fs fps=%.1f project=%.2f sort=%.2f draw=%.2f (per eye %.2f) "
-                 "copy=%.2f gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx ipd=%.1f mm "
-                 "slow=%llu/%llu missed=%d shown=%llu repeated=%d queue-full=%d err=%d worn=%d mirror=%s "
-                 "tv=%s tvfps=%.1f tvtile=%.2f ms tvgpu=%.2f ms tvdrop=%llu tverr=%llu",
-                 (now - placed_at) / 1000.0, frames / seconds,
-                 frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
-                 frames ? draw_second / frames : 0.0, frames ? draw_second / frames / 2.0 : 0.0,
-                 frames ? counters.copy_second / frames : 0.0,
-                 frames ? (project_second + sort_second + draw_second) / frames : 0.0,
-                 renderer->last_visible_count(), last_fade,
-                 static_cast<double>(headset.hud_scale()), headset.ipd() * 1000.0,
-                 static_cast<unsigned long long>(counters.slow_frames),
-                 static_cast<unsigned long long>(counters.frames), missed_now,
-                 static_cast<unsigned long long>(flip.shown), hmd2::repeated_frames(),
-                 hmd2::queue_full_waits(), hmd2::frame_errors(),
-                 hmd2::device_state().worn ? 1 : 0, mirror_text, tv_text, tv_fps, tv_tile_ms,
-                 tv_frames_second ? tv_gpu_ms_second / static_cast<double>(tv_frames_second) : 0.0,
-                 static_cast<unsigned long long>(tv_output.dropped()),
-                 static_cast<unsigned long long>(tv_stats.errors));
-            if (mirror_ok && !mirror_logged) {
-                // Logged once, when there is a measurement to give: the mirror
-                // costs the loop nothing itself, so this is the display's rate.
-                mirror_logged = true;
-                line("viewer: vr mirror: %.1f fps achieved over the first %.1f s (Hmd2's compositor, "
-                     "next to the frames this loop already submits)",
-                     mirror_fps, seconds);
-            }
-            if (pace.step_ms > 0.0f && missed_now > 0) {
-                // One line of context, only when the display is skipping slots:
-                // the pace numbers say whether the loop or the display is behind.
-                line("viewer: vr pace nap=%.2f call=%.2f ahead=%.2f step=%.2f ms", pace.nap_ms,
-                     pace.call_ms, pace.ahead_ms, pace.step_ms);
-            }
-            // The compact pose line for a recorded video's one-second grid, and
-            // the CSV's flush: the raw Hmd2 position in cm (tracker axes: +x
-            // right, +y up, forward -z) and the angles the camera used in the
-            // scene's frame, in degrees - the same values as the CSV's row.
-            line("viewer: vr pose pos %.1f %.1f %.1f cm yaw %.1f pitch %.1f roll %.1f deg "
-                 "frame=%llu",
-                 static_cast<double>(last_raw.head.position[0]) * 100.0,
-                 static_cast<double>(last_raw.head.position[1]) * 100.0,
-                 static_cast<double>(last_raw.head.position[2]) * 100.0,
-                 headset.view_yaw() * kRadToDeg, headset.scene_pitch() * kRadToDeg,
-                 headset.scene_roll() * kRadToDeg,
-                 static_cast<unsigned long long>(counters.frames));
-            pose_log.flush();
-            counters.frames_this_second = 0;
-            tv_gpu_ms_second = 0.0;
-            tv_frames_second = 0;
-            counters.copy_second = 0.0;
-            project_second = 0.0;
-            sort_second = 0.0;
-            draw_second = 0.0;
-            second_started = now;
-        }
+        if (now - second_started >= 1000.0) log_vr_second(now);
     }
 
     // v0.2 RC: an imported scene's scale that no save point caught up with is
@@ -3350,7 +3658,26 @@ int run_vr(const VrOptions& options) {
     const int final_repeated = hmd2::repeated_frames();
     const int final_queue_full = hmd2::queue_full_waits();
     const int final_submitted = hmd2::frames_submitted();
-    if (counters.frames > 0) {
+    if (no_vr) {
+        const viewer::TvOutput::Stats tv_stats = tv_output.stats();
+        line("viewer: tv totals: %llu frames in %.1f s (%.1f fps), GPU %.2f ms/frame "
+             "(project %.2f sort %.2f draw %.2f), TV presents %llu (tile %.2f ms max), dropped %llu,"
+             " errors %llu, slow %llu/%llu",
+             static_cast<unsigned long long>(counters.frames), run_s,
+             counters.frames / (run_s > 0.0 ? run_s : 1.0),
+             counters.frames > 0
+                 ? (counters.draw_sum + counters.project_sum + counters.sort_sum) /
+                       static_cast<double>(counters.frames)
+                 : 0.0,
+             counters.frames > 0 ? counters.project_sum / counters.frames : 0.0,
+             counters.frames > 0 ? counters.sort_sum / counters.frames : 0.0,
+             counters.frames > 0 ? counters.draw_sum / counters.frames : 0.0,
+             static_cast<unsigned long long>(tv_stats.presents), tv_stats.tile_ms_max,
+             static_cast<unsigned long long>(tv_output.dropped()),
+             static_cast<unsigned long long>(tv_stats.errors),
+             static_cast<unsigned long long>(counters.slow_frames),
+             static_cast<unsigned long long>(counters.frames));
+    } else if (counters.frames > 0) {
         line("viewer: vr totals: %llu frames in %.1f s (%.1f fps), GPU %.2f ms/frame "
              "(project %.2f sort %.2f draw %.2f, per eye %.2f), copy %.2f ms/frame, "
              "slow %llu/%llu, submitted=%d shown=%llu missed=%d repeated=%d queue-full=%d err=%d",
@@ -3392,20 +3719,39 @@ int run_vr(const VrOptions& options) {
 
     // PASS is the app's own verdict: it rendered, Hmd2 took every frame, and no
     // display slot was skipped for long enough to matter. The picture itself is
-    // the human check, as in vr_hello.
-    const bool pass = status == 0 && run.gpu_ok && counters.frames > 120 &&
-                      final_errors == 0 && counters.submit_errors == 0;
+    // the human check, as in vr_hello. On the TV there is no Hmd2 to take the
+    // frames: at least one rendered frame is the verdict, so the panel's Quit
+    // is a clean exit whenever the user reaches it - the panel boots open, so a
+    // quit can come inside the first two seconds.
+    const bool pass = status == 0 && run.gpu_ok &&
+                      (no_vr ? counters.frames > 0 : counters.frames > 120) &&
+                      (no_vr || (final_errors == 0 && counters.submit_errors == 0));
     if (!pass) {
         if (status == 0) {
             status = 1;
-            reason = counters.frames <= 120 ? "too few frames (under 2 s of VR)"
-                                            : "Hmd2 reported frame errors";
+            // The TV verdict only fails on an empty run; VR keeps its 2 s gate.
+            reason = no_vr ? (counters.frames == 0 ? "no frame was rendered on the TV"
+                                                  : "the TV session did not render cleanly")
+                           : (counters.frames <= 120 ? "too few frames (under 2 s of VR)"
+                                                     : "Hmd2 reported frame errors");
         }
-        line("viewer: vr FAIL %llu frames, %.1f fps, gpu_ok=%d err=%d submit-errors=%llu %s",
-             static_cast<unsigned long long>(counters.frames), counters.frames / (run_s > 0.0 ? run_s : 1.0),
-             run.gpu_ok ? 1 : 0, final_errors,
-             static_cast<unsigned long long>(counters.submit_errors), reason);
+        if (no_vr) {
+            line("viewer: no VR FAIL %llu frames, %.1f fps, gpu_ok=%d %s",
+                 static_cast<unsigned long long>(counters.frames),
+                 counters.frames / (run_s > 0.0 ? run_s : 1.0), run.gpu_ok ? 1 : 0, reason);
+        } else {
+            line("viewer: vr FAIL %llu frames, %.1f fps, gpu_ok=%d err=%d submit-errors=%llu %s",
+                 static_cast<unsigned long long>(counters.frames),
+                 counters.frames / (run_s > 0.0 ? run_s : 1.0), run.gpu_ok ? 1 : 0, final_errors,
+                 static_cast<unsigned long long>(counters.submit_errors), reason);
+        }
         return status;
+    }
+    if (no_vr) {
+        line("viewer: no VR PASS %llu frames, %.1f fps on the TV, worst frame %.1f ms",
+             static_cast<unsigned long long>(counters.frames),
+             counters.frames / (run_s > 0.0 ? run_s : 1.0), counters.work_max);
+        return 0;
     }
     line("viewer: vr PASS %llu frames, %.1f fps, %d submitted, shown %llu, missed %d, worst "
          "frame %.1f ms",

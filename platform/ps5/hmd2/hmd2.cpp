@@ -1031,6 +1031,19 @@ bool setup(const Config &config) {
     s.device.worn = info[20] != 0;
     s.device.lens_mm = info[21];
 
+    // A headset that is plugged in but switched off answers status 2 and never
+    // tracks (console-klog-066: status 0 = on, status 2 = off). Bringing the
+    // tracker, reprojection and VR mode up for it only parks the viewer in its
+    // 300 s "waiting for the headset" pose wait with nothing to show, so init
+    // stops here and the viewer runs the same session on the TV (start_mode.h).
+    // Nothing has gone to the tracker or reprojection yet: teardown() closes
+    // the Hmd2 handle and terminates Hmd2, once, under their own flags.
+    if (!headset_on(s.device.status)) {
+        s.error = {"PSVR2 is off", static_cast<int32_t>(s.device.status), nullptr};
+        logf("hmd2: PSVR2 is off (device status %u): running on the TV", s.device.status);
+        return abort_setup();
+    }
+
     // Tracker, profile 0 (the only profile open to apps).
     uint32_t query[8] = {0x20, 0};
     uint32_t answer[8] = {0};

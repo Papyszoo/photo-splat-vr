@@ -166,8 +166,9 @@ bool dtype_from_storage_global(const std::string& global, StorageDtype* dtype) {
 // ---- the VM -----------------------------------------------------------------
 class Vm {
 public:
-    Vm(const std::vector<uint8_t>& pickle, std::string origin)
-        : data_(pickle.data()), size_(pickle.size()), origin_(std::move(origin)) {}
+    Vm(const std::vector<uint8_t>& pickle, std::string origin, size_t* consumed)
+        : data_(pickle.data()), size_(pickle.size()), origin_(std::move(origin)),
+          consumed_(consumed) {}
 
     Result<PickleState> run() {
         while (pos_ < size_) {
@@ -178,6 +179,7 @@ public:
             return Result<PickleState>::failure(origin_ + ": pickle ended without STOP at byte " +
                                                 std::to_string(pos_));
         }
+        if (consumed_ != nullptr) *consumed_ = pos_;
         if (state_.tensors.empty()) {
             return Result<PickleState>::failure(origin_ +
                                                 ": pickle contains no tensor records");
@@ -592,6 +594,7 @@ private:
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
     size_t pos_ = 0;
+    size_t* consumed_ = nullptr;
     std::string origin_;
     std::string error_;
     bool stopped_ = false;
@@ -640,8 +643,8 @@ size_t storage_itemsize(StorageDtype dtype) {
 }
 
 Result<PickleState> unpickle_state_dict(const std::vector<uint8_t>& pickle,
-                                       const std::string& origin) {
-    Vm vm(pickle, origin);
+                                       const std::string& origin, size_t* consumed) {
+    Vm vm(pickle, origin, consumed);
     return vm.run();
 }
 

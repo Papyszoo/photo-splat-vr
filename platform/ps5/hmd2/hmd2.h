@@ -38,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace hmd2 {
 
@@ -124,6 +125,18 @@ struct DeviceState {
     uint32_t lens_mm;  // lens-to-eye distance Hmd2 reports
 };
 
+// Whether the device status word means the headset is on and usable. Measured
+// on hardware (console klogs, runs/issue-1-crash): status 0 is a headset that is
+// on (worn 0 or 1, and sessions get tracked); status 2 is a headset that is
+// plugged in but switched off (worn 0, never tracked). Only 0 counts as on:
+// init() stops for anything else before reprojection and VR mode, so the
+// viewer's TV-only session takes over instead of waiting for a pose that never
+// comes (vr_mode.cpp, start_mode.h).
+//
+// Pure and header-only, so tests/tv_only_test.cpp pins the table without the
+// SDK.
+inline bool headset_on(uint32_t status) { return status == 0; }
+
 // Where init() got to when it failed: the failing call and its return code.
 struct Error {
     const char *step;  // "" when nothing failed
@@ -134,6 +147,20 @@ struct Error {
     // viewer shows its "not supported on this firmware" card when this is set.
     const char *missing_table_library;
 };
+
+// The init failures that are the expected way to start without a usable
+// headset, so the viewer's klog line says so without "FAIL" (vr_mode.cpp):
+//  - "PSVR2 is off": the headset is connected but switched off, the measured
+//    device status 2 (init() stops right after GetDeviceInformation);
+//  - "sceHmd2Open" with 0xffffffff: no headset session to open at all (the
+//    return the console gives with no headset, docs/console-runbook.md).
+// Every other failure - a module load, a missing export table, the tracker or
+// reprojection - is a real init error and keeps "FAIL".
+inline bool expected_fallback(const Error &error) {
+    if (error.step == nullptr) return false;
+    if (std::strcmp(error.step, "PSVR2 is off") == 0) return true;
+    return std::strcmp(error.step, "sceHmd2Open") == 0 && error.rc == -1;
+}
 
 // Per-frame averages of the pacing since the last take_pace(), in
 // milliseconds. nap: slept before the frame; call: BeginFrame itself; ahead:

@@ -9,8 +9,10 @@
 #include <vector>
 
 #include "common/half.h"
+#include "model/file_util.h"
 #include "model/gguf_writer.h"
 #include "model/sha256.h"
+#include "model/text_format.h"
 #include <nlohmann/json.hpp>
 
 namespace splat {
@@ -18,15 +20,8 @@ namespace {
 
 constexpr size_t kChunkBytes = 1u << 20;  // floats converted per read
 
-std::string basename_of(const Path& path) { return path.filename().string(); }
-
 bool starts_with(const std::string& text, const std::string& prefix) {
     return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
-}
-
-bool ends_with(const std::string& text, const std::string& suffix) {
-    return text.size() >= suffix.size() &&
-           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 std::string lowercase(std::string text) {

@@ -50,7 +50,10 @@ TEST_CASE("the firmware card is the user's text") {
     CHECK(message.paragraphs[2] ==
           "Do not attach them to the issue. They are Sony system files: share a download link "
           "privately when asked.");
-    CHECK(message.exit_hint == "Press X or O to exit.");
+    // 2026-11-22: X continues on the TV without a headset (the session runs the
+    // same menu and scene there), O still exits; the rest of the card is
+    // unchanged above. The 120 s timeout continues like X (vr_mode.cpp).
+    CHECK(message.exit_hint == "Press X to continue on the TV, O to exit.");
 }
 
 TEST_CASE("the firmware card always lists both library files") {

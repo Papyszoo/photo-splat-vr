@@ -108,16 +108,18 @@ void GgufWriter::set_strings(const std::string& key, const std::vector<std::stri
 }
 
 Status GgufWriter::open_file(const Path& path) {
-    file_ = std::fopen(path.string().c_str(), "wb");
+    // Read+write: patch_string() rewrites one metadata value in place after the
+    // stream's digest is known. A plain converter never reads the file.
+    file_ = std::fopen(path.string().c_str(), "w+b");
     if (file_ == nullptr) return Status::error("cannot open " + path.string() + " for writing");
-    // One write per MiB, plus the 64 MiB fsync/drop batches in write_raw().
+    // One write per MiB, plus the kGgufSyncBatchBytes fsync batches in write_raw().
     stream_buffer_.assign(1u << 20, 0);
     if (std::setvbuf(file_, stream_buffer_.data(), _IOFBF, stream_buffer_.size()) != 0) {
         std::fclose(file_);
         file_ = nullptr;
         return Status::error("cannot buffer " + path.string());
     }
-    unsynced_bytes_ = 0;
+    synced_bytes_ = 0;
     return Status::success();
 }
 
@@ -138,21 +140,161 @@ Status GgufWriter::write_header() {
     return Status::success();
 }
 
+namespace {
+
+// The value sizes of the GGUF scalar types patch_string() has to walk over
+// (third_party/ggml/include/gguf.h). Strings and arrays are handled in code.
+uint64_t gguf_scalar_size(uint32_t type) {
+    switch (type) {
+        case 0:  // UINT8
+        case 1:  // INT8
+        case 7:  // BOOL
+            return 1;
+        case 2:  // UINT16
+        case 3:  // INT16
+            return 2;
+        case 4:  // UINT32
+        case 5:  // INT32
+        case 6:  // FLOAT32
+            return 4;
+        case 10:  // UINT64
+        case 11:  // INT64
+        case 12:  // FLOAT64
+            return 8;
+        default:
+            return 0;  // STRING/ARRAY: not a plain scalar
+    }
+}
+
+uint64_t read_le(const std::vector<uint8_t>& bytes, size_t offset, size_t width) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < width; ++i) value |= static_cast<uint64_t>(bytes[offset + i]) << (8 * i);
+    return value;
+}
+
+}  // namespace
+
+Status GgufWriter::patch_string(const std::string& key, const std::string& value) {
+    if (file_ == nullptr) return Status::error("GGUF writer is not open");
+    if (!header_written_) return Status::error("the GGUF header has not been written yet");
+
+    // The header (metadata + tensor table + padding) is small (157 KB for
+    // SHARP), so it can be read back to find the exact value offset.
+    if (std::fflush(file_) != 0) return Status::error("cannot flush the GGUF header");
+    std::vector<uint8_t> header(static_cast<size_t>(data_offset_));
+    if (std::fseek(file_, 0, SEEK_SET) != 0 ||
+        std::fread(header.data(), 1, header.size(), file_) != header.size()) {
+        return Status::error("cannot read the GGUF header back");
+    }
+
+    const auto restore_end = [this]() -> bool {
+        return std::fseek(file_, 0, SEEK_END) == 0 &&
+               std::ftell(file_) == static_cast<long>(bytes_written_);
+    };
+
+    if (header.size() < 24 || std::memcmp(header.data(), "GGUF", 4) != 0) {
+        restore_end();
+        return Status::error("the GGUF header has no GGUF magic");
+    }
+    size_t at = 8;  // magic (4) + version (4)
+    const uint64_t kv_count = read_le(header, at, 8);
+    at += 16;  // tensor count + kv count
+
+    for (uint64_t index = 0; index < kv_count; ++index) {
+        if (at + 8 > header.size()) break;
+        const uint64_t key_bytes = read_le(header, at, 8);
+        at += 8;
+        if (key_bytes > header.size() - at) break;
+        const std::string entry_key(reinterpret_cast<const char*>(header.data() + at),
+                                    static_cast<size_t>(key_bytes));
+        at += static_cast<size_t>(key_bytes);
+        if (at + 4 > header.size()) break;
+        const uint32_t type = static_cast<uint32_t>(read_le(header, at, 4));
+        at += 4;
+
+        if (type == 8) {  // GGUF_TYPE_STRING
+            if (at + 8 > header.size()) break;
+            const uint64_t length = read_le(header, at, 8);
+            at += 8;
+            if (length > header.size() - at) break;
+            if (entry_key == key) {
+                if (length != value.size()) {
+                    restore_end();
+                    return Status::error("metadata '" + key + "' is " + std::to_string(length) +
+                                         " bytes, the replacement is " +
+                                         std::to_string(value.size()) +
+                                         "; only an in-place replacement is supported");
+                }
+                if (std::fseek(file_, static_cast<long>(at), SEEK_SET) != 0 ||
+                    std::fwrite(value.data(), 1, value.size(), file_) != value.size() ||
+                    std::fflush(file_) != 0) {
+                    restore_end();
+                    return Status::error("cannot patch the metadata '" + key + "'");
+                }
+                // The digest is written after the data batches were synced, so
+                // it must be synced too: a power cut after Ready would otherwise
+                // leave the 64-'0' placeholder and a later verify_gguf would
+                // refuse the file.
+                if (!splat::sync_and_drop(::fileno(file_), 0, data_offset_)) {
+                    restore_end();
+                    return Status::error("cannot sync the patched GGUF header to the disk");
+                }
+                synced_bytes_ = bytes_written_;
+                if (!restore_end()) return Status::error("cannot return to the GGUF's data section");
+                return Status::success();
+            }
+            at += static_cast<size_t>(length);
+            continue;
+        }
+        if (type == 9) {  // GGUF_TYPE_ARRAY
+            if (at + 12 > header.size()) break;
+            const uint32_t element_type = static_cast<uint32_t>(read_le(header, at, 4));
+            const uint64_t count = read_le(header, at + 4, 8);
+            at += 12;
+            if (element_type == 8) {
+                for (uint64_t i = 0; i < count; ++i) {
+                    if (at + 8 > header.size()) {
+                        at = header.size() + 1;
+                        break;
+                    }
+                    const uint64_t length = read_le(header, at, 8);
+                    at += 8;
+                    if (length > header.size() - at) {
+                        at = header.size() + 1;
+                        break;
+                    }
+                    at += static_cast<size_t>(length);
+                }
+                if (at > header.size()) break;
+                continue;
+            }
+            const uint64_t element_size = gguf_scalar_size(element_type);
+            if (element_size == 0 || count > (header.size() - at) / element_size) break;
+            at += static_cast<size_t>(count * element_size);
+            continue;
+        }
+        const uint64_t size = gguf_scalar_size(type);
+        if (size == 0 || size > header.size() - at) break;
+        at += static_cast<size_t>(size);
+    }
+
+    restore_end();
+    return Status::error("the GGUF header has no string metadata '" + key + "'");
+}
+
 Status GgufWriter::write_raw(const void* data, size_t size) {
     if (size == 0) return Status::success();
     if (std::fwrite(data, 1, size, file_) != size) return Status::error("short write to the GGUF file");
     bytes_written_ += size;
-    unsynced_bytes_ += size;
-    if (unsynced_bytes_ >= kCacheBatchBytes) {
-        // Bound the dirty pages of a 1.3 GB output: sync each 64 MiB batch and
-        // drop it from the page cache (io_hint.h). A failed flush or fsync is a
-        // failed conversion, like a short write: the bytes are not on the disk.
+    if (bytes_written_ - synced_bytes_ >= kGgufSyncBatchBytes) {
+        // Bound the dirty pages of a 1.3 GB output: sync each batch and drop it
+        // from the page cache (io_hint.h). A failed flush or fsync is a failed
+        // conversion, like a short write: the bytes are not on the disk.
         if (std::fflush(file_) != 0) return Status::error("cannot flush the GGUF file");
-        if (!splat::sync_and_drop(::fileno(file_), bytes_written_ - unsynced_bytes_,
-                                  unsynced_bytes_)) {
+        if (!splat::sync_and_drop(::fileno(file_), synced_bytes_, bytes_written_ - synced_bytes_)) {
             return Status::error("cannot sync the GGUF file to the disk");
         }
-        unsynced_bytes_ = 0;
+        synced_bytes_ = bytes_written_;
     }
     return Status::success();
 }
@@ -232,12 +374,13 @@ Status GgufWriter::finish() {
     }
     const bool flushed = std::fflush(file_) == 0;
     bool synced = true;
-    if (flushed && unsynced_bytes_ > 0) {
-        // The tail batch: put it on the disk and drop it as well. A failed fsync
-        // fails the conversion, as a failed write does.
-        synced = splat::sync_and_drop(::fileno(file_), bytes_written_ - unsynced_bytes_,
-                                      unsynced_bytes_);
-        unsynced_bytes_ = 0;
+    if (flushed && bytes_written_ > synced_bytes_) {
+        // The bytes written since the last batch: put them on the disk and drop
+        // them as well. A failed fsync fails the conversion, as a failed write
+        // does. When patch_string() already synced the file this is a no-op.
+        synced =
+            splat::sync_and_drop(::fileno(file_), synced_bytes_, bytes_written_ - synced_bytes_);
+        synced_bytes_ = bytes_written_;
     }
     close();
     if (!flushed) return Status::error("cannot flush the GGUF file");
@@ -262,7 +405,7 @@ void GgufWriter::close() {
     tensor_open_ = false;
     tensor_bytes_ = 0;
     next_tensor_ = 0;
-    unsynced_bytes_ = 0;
+    synced_bytes_ = 0;
 }
 
 size_t GgufWriter::tensor_count() const { return tensors_.size(); }

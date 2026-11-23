@@ -95,7 +95,7 @@ TITLE_HEADERS    := videoout.h title_common.h vk_common.h eye_buffers.h pad_inpu
 # -I$(REPO): the fetcher is included by its repo path
 # (platform/ps5/net/ps5_http_fetcher.h), the same include root the bench title
 # uses.
-TITLE_CPPFLAGS   := -DPS5_TITLE -DSPLAT_HAVE_VULKAN=1 -DSPLAT_VERSION=\"0.6.1\" \
+TITLE_CPPFLAGS   := -DPS5_TITLE -DSPLAT_HAVE_VULKAN=1 -DSPLAT_VERSION=\"0.6.2\" \
                     -I$(REPO) -I$(REPO)/core -I$(REPO)/third_party -I$(REPO)/third_party/json \
                     -I$(RADV_PS5)/include -I$(GLUE) -I$(REPO)/third_party/ggml/include
 TITLE_CXXFLAGS   := $(CXXFLAGS) -ffunction-sections -fdata-sections

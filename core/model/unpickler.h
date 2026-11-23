@@ -40,7 +40,13 @@ struct PickleState {
 // the SHARP checkpoint uses are implemented. Any other opcode or global is an
 // error, so there is no arbitrary code path (spec C1, "minimal unpickler").
 // `origin` is used in error messages only.
-Result<PickleState> unpickle_state_dict(const std::vector<uint8_t>& pickle, const std::string& origin);
+//
+// `consumed` (may be null) receives the pickle's exact length in bytes: the
+// offset just past its STOP opcode. A streaming caller hands the buffer a
+// prefix at a time, so the trailing bytes of a body chunk must not be mistaken
+// for part of the pickle (core/model/stream_converter.cpp).
+Result<PickleState> unpickle_state_dict(const std::vector<uint8_t>& pickle, const std::string& origin,
+                                       size_t* consumed = nullptr);
 
 // Size in bytes of one tensor element for its storage dtype, or 0 if unknown.
 size_t storage_itemsize(StorageDtype dtype);

@@ -12,6 +12,7 @@
 #include "model/converter.h"
 #include "model/http_fetch.h"
 #include "model/segmented_download.h"
+#include "model/stream_converter.h"
 
 namespace splat {
 
@@ -114,6 +115,13 @@ struct ModelManagerOptions {
     // them). The console's sceHttp is only proven with one transfer at a time;
     // see SegmentedDownload::max_in_flight.
     int max_parallel_transfers = 0;
+    // Convert a torch.save checkpoint from the network bytes instead of storing
+    // it: the console's /data write path is the bottleneck, and the streaming
+    // path writes only the GGUF (core/model/stream_converter.h). Only SHARP's
+    // torch zip is a checkpoint this converter reads; every other backend keeps
+    // the download-then-convert path. A streaming download never resumes: an
+    // interruption removes the partial GGUF and Retry starts over.
+    bool convert_while_downloading = false;
     // One line per phase with its total time and MB/s - download, SHA-256,
     // conversion and the whole fetch - so the next console klog dates each fix
     // (runs/issue-1-crash/sharp-fast-report.md). Empty: no lines. The console
@@ -183,6 +191,19 @@ public:
     // IHttpFetcher::abort); a fetcher that polls `cancelled` needs no override.
     void abort_transfer(FetchAbort reason);
 
+    // True when fetch() would convert this backend from the network body and
+    // never store the source checkpoint (core/model/stream_converter.h). The
+    // Models free-space gate needs it: only the GGUF is written then.
+    bool streams_source(const std::string& backend) const;
+
+    // Reclaims the streaming backend's leftovers on a worker (the model
+    // service's stall watch at startup), never the render thread: a partial
+    // models/<name>.gguf.part from an attempt that was killed mid-write (no
+    // resume exists for it), and the source checkpoint a 0.6.1 install left
+    // behind once its GGUF is Ready (the streaming path never reads it again).
+    // Returns true when a file was removed.
+    bool reclaim_streamed_sources();
+
     // Imports an already-downloaded checkpoint: checks the pinned size and
     // SHA-256, then converts. `backend` must own the file. The source file is
     // copied, not moved.
@@ -206,6 +227,20 @@ private:
     Status convert_and_store(const ModelBackendSpec& spec, const Path& source,
                              const std::string& verified_sha256, ModelRecord& record,
                              Progress& progress);
+    // The convert-while-downloading path: one plain GET whose body feeds the
+    // StreamConverter, the digest checked against the pin at the end, the GGUF
+    // verified and renamed. No .pt (or .part) is written.
+    Status fetch_streaming(const ModelBackendSpec& spec, ModelRecord& record, Progress& progress,
+                           const std::function<bool()>& cancelled);
+    // verify_gguf on a finished conversion, rename it into place and record
+    // Ready: the last three steps of both the file path and the streaming path.
+    Status store_converted(const ModelBackendSpec& spec, const Path& temporary,
+                           ModelRecord& record, Progress& progress);
+    // The streaming path never needs the source checkpoint again: a .pt (and its
+    // .part/.segments) that an older run or the inbox left behind is removed
+    // once the model has been converted, so /data keeps only the GGUF. Returns
+    // true when something was removed. Only the streaming backend is affected.
+    bool drop_source_after_streaming(const ModelBackendSpec& spec, const Path& source);
     Status import_verified(const ModelBackendSpec& spec, const Path& file, bool move_source,
                            Progress& progress);
     void log_line(const std::string& text) const;
@@ -217,6 +252,7 @@ private:
     uint64_t segment_min_bytes_ = kSegmentedMinBytes;
     int segment_count_ = kSegmentedCount;
     int max_parallel_transfers_ = 0;
+    bool convert_while_downloading_ = false;
     // The live network phase, read by the stall watchdog (see transfer_active).
     std::atomic<bool> transfer_active_{false};
     std::atomic<uint64_t> transfer_base_{0};     // the plain GET's resume offset (0 for segments)

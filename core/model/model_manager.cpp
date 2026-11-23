@@ -16,33 +16,17 @@
 
 #include "model/checkpoint.h"
 #include "model/da2_profile.h"
+#include "model/file_util.h"
 #include "model/license.h"
 #include "model/sha256.h"
+#include "model/stream_converter.h"
+#include "model/text_format.h"
 
 namespace splat {
 namespace {
 
 constexpr uint32_t kStateFormatVersion = 1;
 constexpr uint64_t kMaxStateBytes = 1u << 20;
-
-std::string seconds_text(double seconds) {
-    char text[32];
-    std::snprintf(text, sizeof(text), "%.1f", seconds);
-    return text;
-}
-
-std::string megabyte_text(uint64_t bytes) {
-    char text[32];
-    std::snprintf(text, sizeof(text), "%.1f MB", static_cast<double>(bytes) / 1e6);
-    return text;
-}
-
-std::string rate_text(uint64_t bytes, double seconds) {
-    char text[32];
-    if (seconds <= 0.0) return "? MB/s";
-    std::snprintf(text, sizeof(text), "%.2f MB/s", static_cast<double>(bytes) / seconds / 1e6);
-    return text;
-}
 
 // Marks the model manager's network phase active for its lifetime; the model
 // service's stall watchdog reads the flag (and the byte counters) from another
@@ -72,11 +56,6 @@ uint64_t size_or_zero(const Path& path) {
     std::error_code error;
     const uintmax_t size = std::filesystem::file_size(path, error);
     return error ? 0 : static_cast<uint64_t>(size);
-}
-
-void remove_if_present(const Path& path) {
-    std::error_code error;
-    std::filesystem::remove(path, error);
 }
 
 Status ensure_directory(const Path& path) {
@@ -241,6 +220,7 @@ ModelManager::ModelManager(ModelManagerOptions options)
       segment_min_bytes_(options.segment_min_bytes),
       segment_count_(options.segment_count),
       max_parallel_transfers_(options.max_parallel_transfers),
+      convert_while_downloading_(options.convert_while_downloading),
       log_(std::move(options.log)) {
     if (specs_.empty()) {
         specs_.push_back(sharp_model_spec());
@@ -257,6 +237,47 @@ const ModelBackendSpec* ModelManager::backend(const std::string& name) const {
 
 void ModelManager::abort_transfer(FetchAbort reason) {
     if (fetcher_ != nullptr) fetcher_->abort(reason);
+}
+
+bool ModelManager::streams_source(const std::string& backend_name) const {
+    // One SHARP rule: the streaming converter reads SHARP's torch zip, and only
+    // this option (with a fetcher to stream from) turns it on.
+    return convert_while_downloading_ && fetcher_ != nullptr && backend_name == "sharp";
+}
+
+bool ModelManager::reclaim_streamed_sources() {
+    bool dropped = false;
+    for (const ModelBackendSpec& spec : specs_) {
+        if (!streams_source(spec.name)) continue;
+        // A streaming attempt that was killed mid-write (Quit's 2 s bound
+        // expired and the process leaked its worker) leaves
+        // models/<name>.gguf.part. There is no resume for it and nothing lists
+        // it, so the startup pass deletes it here on the worker - not only at
+        // the next stream start (fetch()), which may never come.
+        if (!transfer_active_.load(std::memory_order_relaxed)) {
+            const Path stale_gguf_part = gguf_path(spec.name).string() + part_suffix();
+            if (path_exists(stale_gguf_part)) {
+                remove_if_present(stale_gguf_part);
+                log_line("model fetch: " + spec.name +
+                         " removed a partial GGUF left by an earlier run: " +
+                         stale_gguf_part.string());
+                dropped = true;
+            }
+        }
+        const Path source = downloads_dir() / spec.source_filename;
+        const Path part = source.string() + part_suffix();
+        // The common case has nothing left behind: do not read the record (and a
+        // Ready GGUF's header) just to find that out.
+        if (!path_exists(source) && !path_exists(part) && !path_exists(segments_path(part))) {
+            continue;
+        }
+        // Only a Ready GGUF makes the source disposable; an un-converted .pt is
+        // still the file path's input and must stay.
+        const Result<ModelRecord> record = load_record(spec);
+        if (!record.ok() || record.value().state != ModelState::Ready) continue;
+        if (drop_source_after_streaming(spec, source)) dropped = true;
+    }
+    return dropped;
 }
 
 void ModelManager::log_line(const std::string& text) const {
@@ -564,12 +585,18 @@ Status ModelManager::convert_and_store(const ModelBackendSpec& spec, const Path&
              seconds_text(convert_seconds) + " s (" + rate_text(converted_bytes, convert_seconds) +
              ", " + std::to_string(converted.value().tensor_count) + " tensors)");
 
+    return store_converted(spec, temporary, record, progress);
+}
+
+Status ModelManager::store_converted(const ModelBackendSpec& spec, const Path& temporary,
+                                     ModelRecord& record, Progress& progress) {
     const Status check = verify_gguf(spec.name, temporary);
     if (!check.ok()) {
         remove_if_present(temporary);
         return fail(record, "the converted file failed the metadata check: " + check.message());
     }
 
+    const Path output = gguf_path(spec.name);
     std::error_code error;
     std::filesystem::rename(temporary, output, error);
     if (error) {
@@ -581,10 +608,140 @@ Status ModelManager::convert_and_store(const ModelBackendSpec& spec, const Path&
     record.message.clear();
     record.gguf_path = output;
     record.updated_at = current_timestamp_utc();
-    saved = save_record(record);
+    const Status saved = save_record(record);
     if (!saved.ok()) return saved;
     progress.report(1.0f, "ready");
     return Status::success();
+}
+
+bool ModelManager::drop_source_after_streaming(const ModelBackendSpec& spec, const Path& source) {
+    if (!convert_while_downloading_ || spec.name != "sharp") return false;
+    const Path part = source.string() + part_suffix();
+    const bool present = path_exists(source) || path_exists(part) || path_exists(segments_path(part));
+    if (!present) return false;
+    remove_if_present(source);
+    remove_part_files(part);
+    log_line("model fetch: " + spec.name + " removed " + source.filename().string() +
+             " (the streaming path keeps only the GGUF)");
+    return true;
+}
+
+Status ModelManager::fetch_streaming(const ModelBackendSpec& spec, ModelRecord& record,
+                                     Progress& progress, const std::function<bool()>& cancelled) {
+    // The pinned size first: the body is converted as it arrives, so a server
+    // that is about to send something else must be refused before the header
+    // (and the first tensors) are written.
+    const Result<HttpResource> head = fetcher_->head(spec.source_url);
+    if (!head.ok()) {
+        return fail(record, "cannot reach " + spec.source_url + ": " + head.message());
+    }
+    if (head.value().content_length != spec.source_bytes) {
+        return fail(record, spec.source_url + " reports " +
+                                std::to_string(head.value().content_length) +
+                                " bytes, the pinned checkpoint is " +
+                                std::to_string(spec.source_bytes) + " bytes");
+    }
+
+    // One plain GET, no Range: the streaming converter needs the checkpoint
+    // from byte 0 and cannot resume. The byte counter is what the stall
+    // watchdog reads; the sink advances it once per converted chunk.
+    transfer_written_.store(0, std::memory_order_relaxed);
+    transfer_base_.store(0, std::memory_order_relaxed);
+    ActiveFlag network_phase(transfer_active_);
+
+    record.state = ModelState::Downloading;
+    record.message.clear();
+    record.source_path.clear();
+    record.downloaded_bytes = 0;
+    record.updated_at = current_timestamp_utc();
+    Status saved = save_record(record);
+    if (!saved.ok()) return saved;
+    progress.report(kFetchDownloadStart, "downloading and converting");
+
+    const Path output = gguf_path(spec.name);
+    const Path temporary = output.string() + part_suffix();
+    remove_if_present(temporary);
+
+    StreamConvertOptions stream_options;
+    stream_options.backend = spec.name;
+    stream_options.source_filename = spec.source_filename;
+    stream_options.source_bytes = spec.source_bytes;
+    stream_options.log = log_;
+    StreamConverter converter(temporary, std::move(stream_options));
+    std::string sink_error;
+
+    Progress download_progress([&progress](float fraction, const std::string& stage) {
+        progress.report(kFetchDownloadStart + kFetchDownloadSpan * fraction, stage);
+    });
+    FetchRequest request;
+    request.url = spec.source_url;
+    // No destination: the fetcher must not write the .pt. The sink is the only
+    // consumer of the body.
+    request.total_bytes = spec.source_bytes;
+    request.progress = &download_progress;
+    request.cancelled = cancelled;
+    request.written = &transfer_written_;
+    request.sink = [&converter, &sink_error](const void* data, size_t size) {
+        const Status fed = converter.feed(data, size);
+        if (!fed.ok()) {
+            sink_error = fed.message();
+            return false;
+        }
+        return true;
+    };
+
+    const auto download_started = std::chrono::steady_clock::now();
+    const Status downloaded = fetcher_->download(request);
+    const double download_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - download_started).count();
+    if (!downloaded.ok()) {
+        converter.abort();
+        remove_if_present(temporary);
+        record.downloaded_bytes = 0;
+        // The streaming path keeps no bytes to resume from: a Retry downloads
+        // the checkpoint again from byte 0.
+        return fail(record, "download failed (the streaming path does not resume): " +
+                                (sink_error.empty() ? downloaded.message() : sink_error));
+    }
+    log_line("model fetch: " + spec.name + " download: " + megabyte_text(spec.source_bytes) +
+             " in " + seconds_text(download_seconds) + " s (" +
+             rate_text(spec.source_bytes, download_seconds) + "), converted while downloading");
+
+    Result<ConvertStats> converted = converter.finish();
+    if (!converted.ok()) {
+        converter.abort();
+        remove_if_present(temporary);
+        return fail(record, "streaming conversion failed: " + converted.message());
+    }
+    const ConvertStats& stats = converted.value();
+    log_line("model fetch: " + spec.name + " convert while downloading: " +
+             megabyte_text(stats.source_bytes) + " -> " + megabyte_text(stats.gguf_bytes) + " in " +
+             seconds_text(stats.seconds) + " s (" +
+             rate_text(stats.source_bytes + stats.gguf_bytes, stats.seconds) + ", " +
+             std::to_string(stats.tensor_count) + " tensors)");
+
+    if (stats.source_sha256 != spec.source_sha256) {
+        remove_if_present(temporary);
+        return fail(record, "SHA-256 mismatch: streamed " + stats.source_sha256 +
+                                ", expected the pinned " + spec.source_sha256 +
+                                "; the partial GGUF was removed");
+    }
+
+    record.state = ModelState::Converting;
+    record.message.clear();
+    record.source_sha256 = spec.source_sha256;
+    record.source_bytes = spec.source_bytes;
+    record.downloaded_bytes = 0;  // no .pt exists; nothing is resumable
+    record.converter_version = spec.converter_version;
+    record.updated_at = current_timestamp_utc();
+    saved = save_record(record);
+    if (!saved.ok()) {
+        remove_if_present(temporary);
+        return saved;
+    }
+
+    progress.report(0.70f, "verifying");
+    return store_converted(spec, temporary, record, progress);
 }
 
 Status ModelManager::import_verified(const ModelBackendSpec& spec, const Path& file, bool move_source,
@@ -644,7 +801,14 @@ Status ModelManager::import_verified(const ModelBackendSpec& spec, const Path& f
                                     "; refusing to convert it");
         }
     }
-    return convert_and_store(spec, destination, verified_sha256, record, progress);
+    const Status converted =
+        convert_and_store(spec, destination, verified_sha256, record, progress);
+    if (converted.ok()) {
+        // The same rule as the download path: the streaming backend keeps only
+        // the GGUF, so the copy in downloads/ is removed once it is converted.
+        drop_source_after_streaming(spec, destination);
+    }
+    return converted;
 }
 
 Status ModelManager::import(const std::string& name, const Path& file, Progress& progress) {
@@ -706,6 +870,11 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
     if (!loaded.ok()) return Status::error(loaded.message());
     ModelRecord record = loaded.take();
     if (record.state == ModelState::Ready) {
+        // A Ready install reclaims a 0.6.1 .pt (and its .part) the first time
+        // fetch() runs after the upgrade: the streaming path never needs the
+        // checkpoint again. fetch() only runs on a worker, never the render
+        // thread.
+        drop_source_after_streaming(*spec, downloads_dir() / spec->source_filename);
         progress.report(1.0f, "ready");
         return Status::success();
     }
@@ -731,11 +900,20 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
     // A source left by an earlier run is reused when it still matches the pin;
     // otherwise it is deleted so the download starts clean.
     const Path source = downloads_dir() / spec->source_filename;
+    const Path part = source.string() + part_suffix();
     if (path_exists(source)) {
         if (size_or_zero(source) == spec->source_bytes) {
             const Result<std::string> digest = sha256_file(source);
             if (digest.ok() && digest.value() == spec->source_sha256) {
-                return finish(convert_and_store(*spec, source, digest.value(), record, progress));
+                const Status converted =
+                    convert_and_store(*spec, source, digest.value(), record, progress);
+                if (converted.ok()) {
+                    // The streaming path never needs the checkpoint again: a
+                    // legacy 0.6.x .pt is converted once and then removed, so
+                    // /data keeps only the GGUF (product: the .pt is not kept).
+                    drop_source_after_streaming(*spec, source);
+                }
+                return finish(converted);
             }
         }
         remove_if_present(source);
@@ -749,7 +927,16 @@ Status ModelManager::fetch(const std::string& name, Progress& progress,
         return import_verified(*spec, inbox_file, true, progress);
     }
 
-    const Path part = source.string() + part_suffix();
+    // Convert while downloading (console, SHARP): the body is the GGUF's input,
+    // no .pt is written. There is no resume for this shape: a leftover .part
+    // and a partial GGUF from an interrupted attempt are removed, and Retry
+    // starts from byte 0.
+    if (convert_while_downloading_ && spec->name == "sharp" && fetcher_ != nullptr) {
+        remove_part_files(part);
+        remove_if_present(gguf_path(spec->name).string() + part_suffix());
+        return finish(fetch_streaming(*spec, record, progress, cancelled));
+    }
+
     // A parallel download leaves <part>.segments beside the .part, and the .part
     // is then sparse: its size says nothing about what is in it. A plain
     // sequential download is just the .part, whose size is its resume offset.

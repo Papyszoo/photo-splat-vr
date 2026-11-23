@@ -162,6 +162,13 @@ std::unique_ptr<ModelSetup> build_model_setup(const std::string& state_dir,
     // has completed on the console (and re-test with DA2-Small, whose four
     // segments are 25 MB, before SHARP's 702 MB).
     manager_options.segment_min_bytes = std::numeric_limits<uint64_t>::max();
+    // Convert SHARP while it downloads: the checkpoint's bytes go straight into
+    // the GGUF (core/model/stream_converter.h), so /data sees 1.31 GB instead of
+    // the 2.81 GB .pt plus the GGUF. The console's write path is the measured
+    // bottleneck (runs/issue-1-crash/sharp-slow-report.md). A streaming attempt
+    // that fails does not resume: Retry starts at byte 0. DA2-Small is a
+    // safetensors file, so it keeps the download-then-convert path.
+    manager_options.convert_while_downloading = true;
     // Empty specs: the built-in pinned SHARP and DA2-Small entries.
     manager_options.converter = &convert_backend;
     // One line per phase with total time and MB/s: download, SHA-256, convert

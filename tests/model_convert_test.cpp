@@ -1,13 +1,17 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -24,7 +28,11 @@ extern "C" {
 #include "common/half.h"
 #include "model/checkpoint.h"
 #include "model/converter.h"
+#include "model/gguf_writer.h"
 #include "model/sha256.h"
+#include "model/stream_converter.h"
+#include "model/zip_archive.h"
+#include "model/zip_header.h"
 #include "test_util.h"
 
 namespace {
@@ -827,4 +835,353 @@ TEST_CASE("the real SHARP checkpoint converts and matches the PyTorch manifest")
     }
 
     check_gguf_matches(gguf, manifest, manifest.source, splat::kSharpCheckpointSha256);
+}
+
+// ---- streaming conversion ---------------------------------------------------
+// The streaming converter only reads the pinned checkpoint's entry order:
+// data.pkl first, then the metadata entries, then data/<key> sorted as strings.
+// The fixture is generated that way (make_fixture.py); this helper rewrites it
+// with the numeric order a different torch.save writes, so the refusal can be
+// tested. mz_zip_writer writes the local header's sizes, so the copy has no data
+// descriptors - the converter refuses it on the first mismatching entry, long
+// before a descriptor would be read.
+Status write_numeric_storage_order(const Path& source, const Path& destination) {
+    splat::ZipArchive reader;
+    Status status = reader.open(source);
+    if (!status.ok()) return status;
+
+    std::vector<const splat::ZipEntryInfo*> entries;
+    for (const splat::ZipEntryInfo& entry : reader.entries()) entries.push_back(&entry);
+    std::vector<std::string> names;
+    size_t first_data = entries.size();
+    size_t last_data = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i]->name.find("/data/") == std::string::npos) continue;
+        if (first_data == entries.size()) first_data = i;
+        last_data = i;
+    }
+    if (first_data == entries.size()) return Status::error("the fixture has no storage entries");
+    for (size_t i = 0; i < first_data; ++i) names.push_back(entries[i]->name);
+    std::vector<std::string> storages;
+    for (size_t i = first_data; i <= last_data; ++i) storages.push_back(entries[i]->name);
+    std::sort(storages.begin(), storages.end(), [](const std::string& a, const std::string& b) {
+        return std::stoul(a.substr(a.rfind('/') + 1)) < std::stoul(b.substr(b.rfind('/') + 1));
+    });
+    names.insert(names.end(), storages.begin(), storages.end());
+    for (size_t i = last_data + 1; i < entries.size(); ++i) names.push_back(entries[i]->name);
+
+    mz_zip_archive archive{};
+    std::memset(&archive, 0, sizeof(archive));
+    if (!mz_zip_writer_init_file(&archive, destination.string().c_str(), 0)) {
+        return Status::error("cannot create " + destination.string());
+    }
+    for (const std::string& name : names) {
+        const auto bytes = reader.read_entry(name, 1u << 20);
+        if (!bytes.ok()) {
+            mz_zip_writer_end(&archive);
+            return Status::error(bytes.message());
+        }
+        if (!mz_zip_writer_add_mem(&archive, name.c_str(), bytes.value().data(),
+                                   bytes.value().size(), MZ_NO_COMPRESSION)) {
+            mz_zip_writer_end(&archive);
+            return Status::error("cannot add " + name);
+        }
+    }
+    if (!mz_zip_writer_finalize_archive(&archive)) {
+        mz_zip_writer_end(&archive);
+        return Status::error("cannot finalise " + destination.string());
+    }
+    mz_zip_writer_end(&archive);
+    return Status::success();
+}
+
+// Feeds `in` through the streaming converter with chunk sizes from `next_chunk`
+// and writes the GGUF to `out`. Returns the stats or the failure message.
+splat::Result<ConvertStats> stream_checkpoint_file(const Path& in, const Path& out,
+                                                   const splat::StreamConvertOptions& options,
+                                                   const std::function<size_t()>& next_chunk) {
+    splat::StreamConverter converter(out, options);
+    std::FILE* file = std::fopen(in.string().c_str(), "rb");
+    REQUIRE_MESSAGE(file != nullptr, "cannot open " << in);
+    std::vector<uint8_t> buffer(4u << 20);
+    for (;;) {
+        size_t want = next_chunk();
+        if (want == 0 || want > buffer.size()) want = buffer.size();
+        const size_t got = std::fread(buffer.data(), 1, want, file);
+        if (got == 0) break;
+        const Status fed = converter.feed(buffer.data(), got);
+        if (!fed.ok()) {
+            std::fclose(file);
+            converter.abort();
+            return splat::Result<ConvertStats>::failure(fed.message());
+        }
+    }
+    std::fclose(file);
+    return converter.finish();
+}
+
+TEST_CASE("the streaming converter reproduces the file converter's GGUF") {
+    const Path checkpoint = fixture_path("synthetic.pt");
+    const Manifest manifest = load_manifest(fixture_path("synthetic.json"));
+    splat_test::TempDir temp("stream-fixture");
+
+    // The 0.6.1 file converter's output (the fixture is not the pinned
+    // checkpoint, so the pin is the manifest's digest).
+    ConvertOptions file_options;
+    file_options.verify_sha256 = false;
+    file_options.source_sha256 = manifest.sha256;
+    Progress progress;
+    const Path reference = temp.path() / "reference.gguf";
+    const auto converted =
+        splat::convert_checkpoint(checkpoint, reference, file_options, progress);
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    const auto reference_digest = splat::sha256_file(reference);
+    REQUIRE_MESSAGE(reference_digest.ok(), reference_digest.message());
+
+    // The fixture's storages are data/0 ... data/12: the streaming converter
+    // plans sorted storage keys (the pinned checkpoint's order), so the same
+    // bytes must produce the same GGUF.
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = std::filesystem::file_size(checkpoint);
+
+    const size_t fixed[] = {1, 2, 7, 4096, 1u << 20};
+    for (const size_t chunk : fixed) {
+        INFO("fixed chunk size " << chunk);
+        const Path out = temp.path() / ("fixed-" + std::to_string(chunk) + ".gguf");
+        const auto streamed = stream_checkpoint_file(checkpoint, out, options, [chunk] { return chunk; });
+        REQUIRE_MESSAGE(streamed.ok(), streamed.message());
+        CHECK(streamed.value().source_sha256 == manifest.sha256);
+        CHECK(streamed.value().tensor_count == manifest.converted_count);
+        CHECK(streamed.value().dropped_count == manifest.dropped_count);
+        CHECK(streamed.value().source_bytes == std::filesystem::file_size(checkpoint));
+        const auto digest = splat::sha256_file(out);
+        REQUIRE_MESSAGE(digest.ok(), digest.message());
+        CHECK(digest.value() == reference_digest.value());
+    }
+
+    // Random sizes over the whole 1 B .. 4 MiB range, fixed seed so a failure
+    // reproduces.
+    std::mt19937 random(0x5eed1234u);
+    std::uniform_int_distribution<size_t> sizes(1, 4u << 20);
+    const Path out = temp.path() / "random.gguf";
+    const auto streamed = stream_checkpoint_file(checkpoint, out, options,
+                                                 [&random, &sizes] { return sizes(random); });
+    REQUIRE_MESSAGE(streamed.ok(), streamed.message());
+    const auto digest = splat::sha256_file(out);
+    REQUIRE_MESSAGE(digest.ok(), digest.message());
+    CHECK(digest.value() == reference_digest.value());
+}
+
+TEST_CASE("the streaming converter refuses an entry order it cannot predict") {
+    // The fixture's storages are sorted (data/0, data/1, data/10, ...). A
+    // torch.save that writes them in numeric order (data/0, data/1, data/2,
+    // ...) must stop at the first entry that disagrees instead of writing a
+    // different GGUF.
+    const Path checkpoint = fixture_path("synthetic.pt");
+    splat_test::TempDir temp("stream-order");
+    const Path numeric = temp.path() / "numeric-order.pt";
+    const Status written = write_numeric_storage_order(checkpoint, numeric);
+    REQUIRE_MESSAGE(written.ok(), written.message());
+
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = std::filesystem::file_size(numeric);
+    const Path out = temp.path() / "wrong-order.gguf";
+    const auto streamed = stream_checkpoint_file(numeric, out, options, [] { return 4096; });
+    REQUIRE_FALSE(streamed.ok());
+    MESSAGE(streamed.message());
+    CHECK(streamed.message().find("entry order") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(out));
+}
+
+TEST_CASE("the streaming converter checks every storage entry's CRC, the last one too") {
+    const Path checkpoint = fixture_path("synthetic.pt");
+    splat_test::TempDir temp("stream-crc");
+
+    // The last data/<key> entry in the archive: its descriptor follows the
+    // payload, and it used to switch to the tail before that descriptor was
+    // read (verifier finding: the last entry's CRC was never checked).
+    splat::ZipArchive archive;
+    REQUIRE_MESSAGE(archive.open(checkpoint).ok(), "open fixture");
+    const splat::ZipEntryInfo* last = nullptr;
+    for (const splat::ZipEntryInfo& entry : archive.entries()) {
+        if (entry.name.find("/data/") == std::string::npos) continue;
+        if (last == nullptr || entry.local_header_offset > last->local_header_offset) last = &entry;
+    }
+    REQUIRE(last != nullptr);
+
+    std::string bytes;
+    {
+        std::ifstream in(checkpoint, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const size_t header_at = static_cast<size_t>(last->local_header_offset);
+    REQUIRE(header_at + 30 <= bytes.size());
+    const uint8_t* header = reinterpret_cast<const uint8_t*>(bytes.data() + header_at);
+    const splat::ZipLocalHeader local = splat::parse_zip_local_header(header);
+    const size_t payload_at = header_at + 30 + local.name_bytes + local.extra_bytes;
+    // The local header's sizes are 0 (flags bit 3); the central directory's are
+    // the real ones.
+    REQUIRE(last->uncompressed_bytes > 1);
+    REQUIRE(payload_at + last->uncompressed_bytes <= bytes.size());
+    bytes[payload_at + last->uncompressed_bytes / 2] =
+        static_cast<char>(bytes[payload_at + last->uncompressed_bytes / 2] ^ 0x01);
+
+    const Path damaged = temp.path() / "damaged-last.pt";
+    {
+        std::ofstream out(damaged, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = bytes.size();
+    const Path out = temp.path() / "damaged-last.gguf";
+    const auto streamed = stream_checkpoint_file(damaged, out, options, [] { return 512; });
+    REQUIRE_FALSE(streamed.ok());
+    MESSAGE(streamed.message());
+    CHECK(streamed.message().find("CRC") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(out));
+}
+
+TEST_CASE("the streaming converter checks every entry's CRC") {
+    const Path checkpoint = fixture_path("synthetic.pt");
+    splat_test::TempDir temp("stream-crc");
+    const Path damaged = temp.path() / "damaged.pt";
+    std::string bytes;
+    {
+        std::ifstream in(checkpoint, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    REQUIRE(bytes.size() > 2200);
+    bytes[2200] = static_cast<char>(bytes[2200] ^ 0x01);  // inside data/0's payload
+    {
+        std::ofstream out(damaged, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = bytes.size();
+    const Path out = temp.path() / "damaged.gguf";
+    const auto streamed = stream_checkpoint_file(damaged, out, options, [] { return 512; });
+    REQUIRE_FALSE(streamed.ok());
+    MESSAGE(streamed.message());
+    CHECK(streamed.message().find("CRC") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(out));
+}
+
+TEST_CASE("the streaming converter requires the zip end record") {
+    const Path checkpoint = fixture_path("synthetic.pt");
+    splat_test::TempDir temp("stream-tail");
+    std::string bytes;
+    {
+        std::ifstream in(checkpoint, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    // The end record is the last 22 bytes (the fixture has no comment). Damage
+    // its signature: every storage arrived and the length still matches, so only
+    // the tail check can refuse this stream.
+    REQUIRE(bytes.size() > 22);
+    bytes[bytes.size() - 22] = 'X';
+
+    const Path damaged = temp.path() / "no-end.pt";
+    {
+        std::ofstream out(damaged, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = bytes.size();
+    const Path out = temp.path() / "no-end.gguf";
+    const auto streamed = stream_checkpoint_file(damaged, out, options, [] { return 512; });
+    REQUIRE_FALSE(streamed.ok());
+    MESSAGE(streamed.message());
+    CHECK(streamed.message().find("zip end record") != std::string::npos);
+    CHECK_FALSE(std::filesystem::exists(out));
+}
+
+TEST_CASE("the GGUF writer's sync batch stays inside the stall deadline") {
+    // In the streaming path the writer's fsync runs inside the fetcher's sink
+    // call, where the stall watchdog sees no byte until it returns. At the
+    // console's measured /data rate (1-2 MB/s) one batch must stay far below the
+    // 60 s deadline, and it still has to bound the dirty pages.
+    CHECK(splat::kGgufSyncBatchBytes <= 16ull * 1024 * 1024);
+    CHECK(splat::kGgufSyncBatchBytes >= 4ull * 1024 * 1024);
+}
+
+TEST_CASE("the real SHARP checkpoint streams to the file converter's GGUF") {
+    const Path checkpoint = real_checkpoint_path();
+    if (!std::filesystem::exists(checkpoint)) {
+        MESSAGE("skipping: no checkpoint at " << checkpoint);
+        return;
+    }
+    const char* enabled = std::getenv("SPLAT_STREAM_TESTS");
+    if (enabled == nullptr || std::string(enabled) != "1") {
+        MESSAGE("skipping the 2.8 GB streaming run: set SPLAT_STREAM_TESTS=1");
+        return;
+    }
+    splat_test::TempDir temp("stream-real");
+
+    // The reference is a fresh 0.6.1 file conversion of the same file (the
+    // shipped weights/*.gguf is 0.6.0's pickle-order output and cannot be used).
+    ConvertOptions file_options;
+    file_options.verify_sha256 = false;
+    Progress progress;
+    const Path reference = temp.path() / "reference.gguf";
+    const auto reference_started = std::chrono::steady_clock::now();
+    const auto converted =
+        splat::convert_checkpoint(checkpoint, reference, file_options, progress);
+    REQUIRE_MESSAGE(converted.ok(), converted.message());
+    const double reference_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - reference_started).count();
+    const auto reference_digest = splat::sha256_file(reference);
+    REQUIRE_MESSAGE(reference_digest.ok(), reference_digest.message());
+
+    // Random 1 B .. 4 MiB chunks with a fixed seed; the first few are tiny, so
+    // the headers and the pickle cross a byte at a time too.
+    splat::StreamConvertOptions options;
+    options.source_filename = checkpoint.filename().string();
+    options.source_bytes = std::filesystem::file_size(checkpoint);
+    std::vector<std::string> lines;
+    options.log = [&lines](const std::string& text) { lines.push_back(text); };
+
+    std::mt19937 random(20261122u);
+    std::uniform_int_distribution<size_t> sizes(1, 4u << 20);
+    size_t calls = 0;
+    const Path out = temp.path() / "streamed.gguf";
+    const auto stream_started = std::chrono::steady_clock::now();
+    const auto streamed = stream_checkpoint_file(checkpoint, out, options, [&] {
+        ++calls;
+        if (calls == 1) return size_t{1};
+        if (calls == 2) return size_t{3};
+        if (calls == 3) return size_t{17};
+        return sizes(random);
+    });
+    const double stream_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - stream_started).count();
+    REQUIRE_MESSAGE(streamed.ok(), streamed.message());
+    const auto digest = splat::sha256_file(out);
+    REQUIRE_MESSAGE(digest.ok(), digest.message());
+
+    MESSAGE("file converter " << reference_seconds << " s, streaming " << stream_seconds
+                               << " s, " << std::filesystem::file_size(out) << " bytes, "
+                               << lines.size() << " stream log line(s)");
+    CHECK(digest.value() == reference_digest.value());
+    CHECK(streamed.value().source_sha256 == splat::kSharpCheckpointSha256);
+    CHECK(streamed.value().tensor_count == splat::kSharpCheckpointTensorCount - 160);
+    CHECK_FALSE(lines.empty());
+    CHECK(lines.front().find("data.pkl read") != std::string::npos);
+    std::string last_rate;
+    for (const std::string& text : lines) {
+        if (text.find(" in, ") != std::string::npos && text.find(" out)") != std::string::npos) {
+            last_rate = text;
+        }
+    }
+    MESSAGE("last rate line: " << last_rate);
+    CHECK_FALSE(last_rate.empty());  // the ~5 s MB/s line (this run lasts >5 s)
+    CHECK(lines.back().find(std::string("sha256 ") + splat::kSharpCheckpointSha256) !=
+          std::string::npos);
 }

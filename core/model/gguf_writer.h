@@ -13,6 +13,14 @@ struct gguf_context;
 
 namespace splat {
 
+// The writer syncs (and drops) every this many bytes. Smaller than the
+// download's 64 MiB batch (model/io_hint.h) on purpose: in the streaming path
+// the writer's sync runs inside the network fetcher's sink call, where the
+// stall watchdog sees no byte until it returns, and the console's /data writes
+// run at 1-2 MB/s. An 8 MiB sync is ~4-8 s there, far below the 60 s deadline,
+// so bounding one batch's dirty pages also bounds one invisible stall.
+inline constexpr uint64_t kGgufSyncBatchBytes = 8ull << 20;
+
 struct GgufTensorDesc {
     std::string name;             // GGUF tensor name, at most 63 bytes (ggml limit)
     std::vector<int64_t> shape;   // torch order, outermost dimension first
@@ -44,6 +52,15 @@ public:
     void set_u32(const std::string& key, uint32_t value);
     void set_u64(const std::string& key, uint64_t value);
     void set_strings(const std::string& key, const std::vector<std::string>& values);
+
+    // Replaces the value of a string metadata entry that is already on disk,
+    // in place. The streaming converter needs this for the checkpoint digest:
+    // the header must be written before the first tensor arrives, but the
+    // digest is only known after the last byte. The new value must have the
+    // same length as the old one (a SHA-256 stays 64 hex characters). Only
+    // valid after write_header() and before finish(); the data section and
+    // bytes_written() are not moved.
+    Status patch_string(const std::string& key, const std::string& value);
 
     // Writes header, metadata, tensor info and the alignment padding that
     // precedes the data section.
@@ -81,7 +98,7 @@ private:
     // 32 KiB converter chunk (the console's write cost is per call,
     // runs/issue-1-crash/sharp-slow-report.md §1.4/§2.6).
     std::vector<char> stream_buffer_;
-    uint64_t unsynced_bytes_ = 0;  // written since the last fsync + page-cache drop
+    uint64_t synced_bytes_ = 0;  // bytes up to this offset are fsynced
     bool header_written_ = false;
     size_t next_tensor_ = 0;
     uint64_t tensor_bytes_ = 0;  // bytes appended for the current tensor
