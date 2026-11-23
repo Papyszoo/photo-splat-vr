@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -69,6 +70,8 @@ public:
         stop_ = false;
         failed_ = false;
         running_ = true;
+        skip_first_black_ = false;
+        queue_ = std::make_unique<splat::TvSlotQueue>(kSlots);
         worker_ = std::thread([this] { run(); });
         return true;
     }
@@ -83,10 +86,10 @@ public:
     std::string failure() const { return failure_; }
 
     // Render loop side (render/tv_slots.h).
-    int acquire() { return running() ? queue_.acquire() : -1; }
-    void publish(int slot) { queue_.publish(slot); }
-    void cancel(int slot) { queue_.cancel(slot); }
-    uint64_t dropped() const { return queue_.refused() + queue_.replaced(); }
+    int acquire() { return running() ? queue_->acquire() : -1; }
+    void publish(int slot) { queue_->publish(slot); }
+    void cancel(int slot) { queue_->cancel(slot); }
+    uint64_t dropped() const { return queue_->refused() + queue_->replaced(); }
 
     Stats stats() const {
         Stats stats;
@@ -148,9 +151,27 @@ public:
     // Safe to call twice and without start().
     void stop_worker() {
         stop_ = true;
-        queue_.close();
+        queue_->close();
         if (worker_.joinable()) worker_.join();
         running_ = false;
+    }
+
+    // Starts the worker again after stop_worker() left the port open (0.7: the
+    // TV-only session pauses it while its renderer is replaced by the VR one,
+    // so the worker never reads a slot buffer that is being freed). The port is
+    // not reopened and the last presented frame stays on the TV meanwhile. False
+    // for a port that never opened or one that failed; safe while running.
+    bool resume_worker() {
+        if (worker_.joinable()) return true;
+        if (failed_ || display_.handle() < 0) return false;
+        queue_ = std::make_unique<splat::TvSlotQueue>(kSlots);
+        stop_ = false;
+        running_ = true;
+        // The screen already carries the session's last frame: do not flash it
+        // black again, the next published TV frame follows at once.
+        skip_first_black_ = true;
+        worker_ = std::thread([this] { run(); });
+        return true;
     }
 
     // Joins the worker and gives the port back; safe to call twice and on any path.
@@ -165,7 +186,7 @@ private:
     void run() {
         std::string error;
         double tile_ms = 0.0;
-        {
+        if (!skip_first_black_) {
             // The TV is ours from now: black until the first real picture.
             std::vector<uint32_t> black(static_cast<size_t>(splat::kTvWidth) * splat::kTvHeight,
                                         0xff000000u);
@@ -174,6 +195,7 @@ private:
                 return;
             }
         }
+        skip_first_black_ = false;
         int errors_in_a_row = 0;
         int unconfirmed_in_a_row = 0;
         uint64_t unconfirmed_seen = display_.unconfirmed_flips();
@@ -198,7 +220,7 @@ private:
                 still_wake_.notify_all();
                 continue;
             }
-            const int slot = queue_.take(std::chrono::milliseconds(100));
+            const int slot = queue_->take(std::chrono::milliseconds(100));
             if (slot < 0) continue;
             const uint8_t* pixels = pixels_ ? pixels_(slot) : nullptr;
             bool ok = false;
@@ -208,7 +230,7 @@ private:
             } else {
                 error = "no pixels for the slot";
             }
-            queue_.release(slot);
+            queue_->release(slot);
             if (ok) {
                 errors_in_a_row = 0;
                 ++presents_;
@@ -242,12 +264,16 @@ private:
     }
 
     splat::ps5::VideoOutDisplay display_;
-    splat::TvSlotQueue queue_{kSlots};
+    std::unique_ptr<splat::TvSlotQueue> queue_ = std::make_unique<splat::TvSlotQueue>(kSlots);
     std::function<const uint8_t*(int)> pixels_;
     std::thread worker_;
     std::atomic<bool> stop_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> failed_{false};
+    // resume_worker() restarts the loop after a pause: the screen still shows
+    // the last frame, so the fresh black frame a first start wants would only
+    // flash the TV during the 0.7 VR switch.
+    bool skip_first_black_ = false;
     std::string failure_;   // written before failed_ is set, read after it is seen
     // The still handoff (present_still): the worker takes the pointer, presents
     // it once and marks it done. Only the start-up failure path uses it, before

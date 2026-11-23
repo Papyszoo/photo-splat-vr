@@ -74,7 +74,8 @@ Small's time, same capture-pose PSNR); Small is the one kept.
   opposite way); on yaw/pitch the scene moves a little with the head; no
   3D/parallax feeling. Edges blink when the head moves (aliasing).
 - Wanted: manipulate the scene - grab with the Sense controllers (move/rotate,
-  two hands scale); the DualSense uses sticks/triggers. A UI: the scene
+  two hands scale; since 0.7 there is no grab, L1/R1 switch scenes); the
+  DualSense uses sticks/triggers. A UI: the scene
   description (name + model) below the scene; DualSense and Sense controller
   models with tooltips about the controls; a button that hides the tooltips, and
   while they are hidden that button stays highlighted on the controller model.
@@ -114,9 +115,10 @@ Small's time, same capture-pose PSNR); Small is the one kept.
   them) + USB.
 - Folder names: the PS5 system keyboard if it works in VR, our own panel
   keyboard as fallback; new folders get a date name.
-- Also queued: Sense grab (move/rotate, two-hand scale), DualSense and Sense
-  controller models with control tooltips and a hide-tooltips button that stays
-  highlighted while tooltips are off.
+- Also queued: DualSense and Sense controller models with control tooltips and a
+  hide-tooltips button that stays highlighted while tooltips are off. The Sense
+  grab (move/rotate, two-hand scale) is not queued any more: since 0.7 there is
+  no grab; L1/R1 switch scenes.
 - Approvals (2026-10-27): HDR .jxr captures show as unsupported (switch
   screenshots to SDR); Options opens the menu, Quit is an optional menu item
   (the app also closes like any PS5 game); new console folders
@@ -214,7 +216,8 @@ Small's time, same capture-pose PSNR); Small is the one kept.
   scene that is open or already being turned is refused, and the renames are
   ordered scene.psplat → original.jpg → thumb.jpg → meta.json so an interrupted
   scene still opens.
-- The viewer has no rotation to change or save: the three-axis grab tilt, the
+- The viewer has no rotation to change or save: the three-axis tilt (then a grab
+  gesture; since 0.7 there is no grab, and L1/R1 switch scenes), the
   D-pad/Square 90 degree steps and the reset are gone, as is
   `"view"."rotation"` (an old key still loads, ignored, and the next save drops
   it). Left/right turning (`turn_scene`, `turn_viewer`), moving, scaling and an

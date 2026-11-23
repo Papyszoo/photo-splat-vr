@@ -1,5 +1,7 @@
 // The VR viewer's input: one button/trigger/stick table, shared by the
-// DualSense and the two PSVR2 Sense controllers.
+// DualSense, the two PSVR2 Sense controllers and (0.7) the PS5 Media Remote.
+// The remote's reader maps its D-pad, Enter, Back and Options onto these same
+// button meanings (remote_input.h), so it never needs a table of its own.
 //
 // Both devices deliver the buttons as a 32-bit word in the same PS5 layout
 // (ScePadData's first word, and scePadVrControllerReadState's state at +0x00;
@@ -15,13 +17,10 @@
 //   Cross, held for kRecentreHoldSeconds                 -> recentre the scene
 //                                                          (panel closed) or the
 //                                                          panel window (panel open)
-//   L1 / R1                                             -> previous / next scene (on
-//                                                          a Sense: a tap steps, a
-//                                                          hold grabs - W26)
+//   L1 / R1                                             -> previous / next scene
 //   L2 / R2 (analogue)                                  -> shrink / grow the scene
 //   left stick                                          -> walk (forward/back, right/left)
 //   right stick up/down, left/right                     -> rise/sink, turn right/left
-//   L1 (left Sense) / R1 (right Sense), held            -> grab (W26)
 //
 // The sticks move the *viewer*: the left stick walks into the scene (the scene
 // comes towards you), the right stick up rises and right turns you to your
@@ -97,18 +96,11 @@ constexpr uint32_t kRecentre = 1u << 2;
 constexpr uint32_t kPrevScene = 1u << 3;
 constexpr uint32_t kNextScene = 1u << 4;
 
-// The Sense controller's grip, the button the grab holds (W26): L1 on the left
-// controller and R1 on the right. HLA-PSVR2 has the bits at psvr2.c:386-389 and
-// maps both onto PSVR2_BTN_GRIP at psvr2.c:530 (a Sense state carries L1 0x400
-// on the left pad and R1 0x800 on the right, psvr2.c:519-522). A press starts the
-// grab at once; a release inside the tap window with the hand still is a tap
-// instead and steps the scene (left = previous, right = next, the DualSense
-// L1/R1 mapping), so the viewer reads these bits only from the Sense pads and
-// drops the plain kPrevScene/kNextScene action bits from them. On a Sense
-// controller the panel's ViewScene is still there. The DualSense's L1/R1 stay
-// the immediate scene keys.
-constexpr uint32_t kGripLeft = kL1;
-constexpr uint32_t kGripRight = kR1;
+// The Sense controller's grip is its L1/R1, and it means exactly what the
+// DualSense's does: the previous/next scene. The console probe showed that a
+// held grip and a tap are the same button, so there is no hold/tap split (W26's
+// grab was removed on 2026-11-23, DECISIONS.md: the user preferred L1/R1 to
+// switch scenes and nothing else).
 
 // How long Cross must be held to recentre (HLA-PSVR2's menu hold is the same
 // second, psvr2.c:426-443).

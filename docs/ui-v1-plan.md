@@ -11,9 +11,10 @@ In-app, on the console and the desktop build: download models, browse photos
 (inbox, PS5 screenshots, USB), convert with the chosen model, browse scenes by
 album (album = folder under `scenes/`), organise them, view them. The same panel
 UI shows in the PSVR2 headset (world-locked quad) and on the TV (1:1 full
-frame). Also queued: Sense grab (move/rotate/two-hand scale in place),
-DualSense/Sense controller pictures with tooltips and a hide-tooltips button that
-stays highlighted while off.
+frame). Also queued: DualSense/Sense controller pictures with tooltips and a
+hide-tooltips button that stays highlighted while off. The Sense grab
+(move/rotate/two-hand scale) is not queued any more: since 0.7 there is no grab;
+L1/R1 switch scenes.
 
 Non-goals: jxrlib/HDR captures, DA3/MoGe offers (hidden until pinned), ImGui,
 LAN-page album editing, cloud anything.
@@ -210,7 +211,7 @@ The numbers are kept because code comments refer to them.
 | 23 | captures/USB wiring | platform/ps5, core/ui |
 | 24 | console captures test | tests only |
 | 25 | Sense pointer | pad_input, vr_mode |
-| 26 | Sense grab (logic + wiring) | core/render/grab, vr_mode |
+| 26 | Sense grab (removed in 0.7: no grab, L1/R1 switch scenes) | core/render/grab, vr_mode |
 | 27 | controller pictures + tooltips | core/ui/screens, vr_mode |
 | 28 | final console tour | tests only |
 
@@ -230,8 +231,8 @@ buttons at timestamps, `shot` lines write PNGs of the TV frame, `quit` ends the
 title with `PASS`. `ui-test.sh` wraps install/launch/klog/pull. Each script is
 kept in `platform/ps5/scripts/ui-tests/*.txt` together with the expected klog
 lines; the shots go to `runs/ui_v1/shots/<run>/`. VR-only code (panel quad
-placement, pointer ray, grab) is verified by host unit tests with scripted
-poses and by hand in the headset.
+placement, pointer ray; since 0.7 there is no grab, and L1/R1 switch scenes) is
+verified by host unit tests with scripted poses and by hand in the headset.
 
 Safe-by-default console rules for every console run: only the title's `/data/homebrew/<TITLE_ID>` (dev `PPSA99202`) and
 its data folder `/data/ps5-splat-vr` are touched (agents never run or touch the release install `PPSA99770` / `/data/photo-splat-vr`); `viewer.env` is saved first and restored by

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+
+- PS VR2 hot-plug in both directions. A session that started on the TV adopts a headset turned on afterwards: a probe thread calls `hmd2::headset_ready()` every 2 s (Initialize/Open/status/Close/Terminate, no VR mode) and the render thread rebuilds the renderer and targets for the new mode and runs the same waiting-for-the-headset placement a VR start does; the scene, menu, downloads and conversion jobs keep running (`platform/ps5/viewer/hotplug.h`). A headset turned off during VR (the open session's device status is no longer 0, read every 2 s) tears VR down and continues on the TV, and the watch restarts so turning it on again switches back. A firmware with no PSVR2 export table gets no probe and no switch: the card it showed at start already answered the question, and the headset would fail the same way.
+- PS5 Media Remote input. The remote is the scePad remote type 16 for system user 0xff (`platform/ps5/viewer/remote_input.h`): the D-pad and Options arrive in the button word, Enter is key 0x0d and Back 0x0f. It maps onto the same table as the DualSense: D-pad focus in panels, Enter = Cross, Back = Circle, Options = Options; in a scene D-pad left/right step to the previous/next scene and a 1 s Enter hold recentres. Play/pause, rewind and fast-forward do not reach a title, so they have no action.
+
+### Changed
+
+- The Sense controller grab is removed. L1/R1 and a grip press are one scene key on every device, so L1/R1 only switch scenes; `core/render/grab.*` and `tests/grab_test.cpp` are gone. The viewer keeps L2/R2 scaling and the R2 pointer in panels.
+- The version is 0.7.0 (`contentVersion` `01.007.000`).
+
 ## 0.6.2
 
 ### Added

@@ -10,10 +10,12 @@ The SHARP backend is an independent reimplementation of the
 written from the paper and the reference code's observable behaviour. No Apple
 code and no model weights are part of this repository.
 
-v0.6.2 gets SHARP ready about three times faster and starts the same session on
-the TV when there is no PS VR2. v0.6 builds on the library features of v0.5
-(photos in the common camera and web formats, splat import, rotate left or right
-on any photo or scene entry, and network libraries over SMB and NFS): the photo
+v0.7.0 adds PS5 Media Remote support and switches between VR and the TV when
+PS VR2 is turned on or off during a session. v0.6.2 gets SHARP ready about three
+times faster and starts the same session on the TV when there is no PS VR2. v0.6
+builds on the library features of v0.5 (photos in the common camera and web
+formats, splat import, rotate left or right on any photo or scene entry, and
+network libraries over SMB and NFS): the photo
 picker browses folders on every source, scenes can be saved straight to a
 network folder, and the TV shows its own picture and menu. v0.1 does what the
 project set out to do: photos are converted on the console and the resulting
@@ -25,24 +27,24 @@ approximate scene size.
 - Decisions: [`docs/PLAN.md`](docs/PLAN.md)
 - Known issues: [`docs/BACKLOG.md`](docs/BACKLOG.md)
 
-## What is new in 0.6.2
+## What is new in 0.7.0
 
-- **SHARP setup in about 11 minutes.** The 2.8 GB checkpoint is converted to the
-  GGUF while it downloads, so it is never stored twice: about 11 minutes on a
-  base PS5 (firmware 13.60) instead of about 38. Free space is needed only for
-  the converted model (about 1.3 GB plus margin), and leftover download files
-  from older versions are removed.
-- **Without PS VR2, the app runs on the TV.** When the headset is turned off,
-  not connected, or the firmware has no PSVR2 support table (the message's
-  **X** continues), the session starts on the TV with the DualSense: browse,
-  folders, photo conversion, model downloads and viewing scenes. Start the app
-  with the headset turned on to use VR.
-- **A clear log when no headset is found.** The expected TV-only start logs
-  `hmd2 init` without "FAIL"; a real init error still logs it.
-- The version is 0.6.2 (`contentVersion` `01.006.002`). The 0.6.1 fixes and the
-  0.6.0 features (folder browser, output folder, network albums, the TV's own
-  picture, hold Options to recentre) are unchanged; see the v0.6.1 release
-  notes.
+- **PS VR2 on or off during a session.** Turning the headset on while the app
+  runs on the TV switches the session to VR; turning it off during VR switches
+  back to the TV. The scene and the open menu stay where they were, and
+  downloads and conversions keep running; no restart is needed.
+- **PS5 Media Remote support.** In a menu the **D-pad** moves the focus,
+  **Enter** selects, **Back** goes back and **Options** opens the menu. In a
+  scene, D-pad left/right step to the previous/next scene, holding **Enter** for
+  about a second recentres, and **Options** opens the menu. The remote's media
+  keys (play/pause, rewind, fast-forward) are not passed to apps by the system,
+  so they do nothing here.
+- **The grab is gone.** **L1/R1** only switch scenes now on every controller;
+  scaling stays on **L2/R2**.
+- The version is 0.7.0 (`contentVersion` `01.007.000`). The 0.6.2 changes and
+  earlier features (SHARP setup in about 11 minutes, a TV session without
+  PS VR2, folder browser, output folder, network albums, the TV's own picture)
+  are unchanged; see the v0.6.2 release notes.
 
 ## Formats
 
@@ -174,7 +176,7 @@ Photos can come from five sources, all inside the app:
 Open or create a folder in **Scenes**, press **+** in the folder, pick photos,
 then choose a model. Each photo becomes a scene tile with its own progress. A
 finished scene opens in the headset (or on the TV) and stays world-locked; move
-with the sticks, or grab it with a Sense controller. Press **L3/R3** on a photo
+with the sticks. Press **L3/R3** on a photo
 before converting, or on a finished scene, to turn it 90 degrees about the
 viewing axis; the turned version replaces the old one.
 
@@ -189,11 +191,10 @@ R1, Options, Cross/Circle, R3.
 | Menu / back to scene (tap, on release) | **Options** | right: **Options** |
 | Recentre the scene and the open menu window (hold 1 s) | **Options** | right: **Options** |
 | Recentre (hold 1 s; the window while the menu is open) | **Cross** | right: **Cross** |
-| Previous / next scene | **L1** / **R1** | left **L1** tap / right **R1** tap (a hold grabs) |
+| Previous / next scene | **L1** / **R1** | left **L1** / right **R1** |
 | Walk (forward/back, strafe) | **left stick** | left controller's **stick** |
 | Rise/sink, turn right/left | **right stick** | right controller's **stick** |
 | Shrink / grow the scene | **L2** / **R2** | left **L2** / right **R2** |
-| Grab (move/turn the scene) | — | **L1 hold** (left) / **R1 hold** (right); both grips scale between the hands |
 | Rotate a photo or scene entry | **L3** / **R3** | left **L3** / right **R3** |
 | Toggle control tooltips | **Triangle** | **Triangle** |
 | Quit | **Settings → Quit** | **Settings → Quit** |
@@ -203,6 +204,13 @@ In the panel UI: d-pad or left stick moves the focus, **Cross** selects,
 cancel), **L1/R1** page through tabs, and **L3/R3** turn the focused photo or
 scene entry. With the Sense controllers, point with the right controller and
 press **R2** to click.
+
+The **PS5 Media Remote** maps onto the same table. In a menu the **D-pad** moves
+the focus, **Enter** selects, **Back** goes back and **Options** opens or closes
+the menu. With a scene open, **D-pad left/right** step to the previous/next
+scene, holding **Enter** for about a second recentres, and **Options** opens the
+menu. The remote's play/pause, rewind and fast-forward keys are not passed to
+apps by the system, so they have no action.
 
 Settings holds comfort options (move speed, turn speed, scale pivot, edge
 softness, blending), the **Thumbnail size** slider, and the Models, Conversions,

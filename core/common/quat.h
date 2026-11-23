@@ -2,9 +2,8 @@
 // use: (w, x, y, z). The renderer's covariance is R S S^T R^T
 // (core/render/project_math.h), so a world rotation composes on the left:
 // R(qz * q) = R(qz) R(q). Keeping the Hamilton product in one documented place
-// is what makes that order checkable; the component order of the display
-// transform's helpers (core/render/grab.cpp, (x, y, z, w)) is a different one and
-// stays there.
+// is what makes that order checkable; CameraPose's display transform uses the
+// same order.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once

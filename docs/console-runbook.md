@@ -409,10 +409,8 @@ step 1c's display path with a real scene in place of the pattern. The scene is
 placed in front of the user once the headset is worn and the tracker's pose has
 held for half a second, and stays world-locked there: the head moves through
 it, the scene does not follow the head. Input is the DualSense **or** the two
-PSVR2 Sense controllers, with one mapping on both (the one exception: a Sense
-L1/R1 is a hold-vs-tap button, W26 - hold it to grab, tap it to step; the
-DualSense's L1/R1 always step); **L1/R1 on the DualSense** and **a tap of a
-Sense L1/R1** step through the scenes pushed
+PSVR2 Sense controllers, with one mapping on both: **L1/R1 on the DualSense**
+and the **Sense grips** step through the scenes pushed
 under `/data/ps5-splat-vr/scenes/` (sorted by folder name, wrapping) and a
 switch keeps the world placement, scale and offset. **L2/R2** change the scene's
 size in place: **Capture** (the default) scales about the photo's capture point.
@@ -421,26 +419,22 @@ movement count more (the miniature effect). Settings → Comfort → **Scale** a
 offers Centre (visible 3D centre fixed) and Front (nearest edge fixed), which
 change the picture at rest. The viewer does not move. The **left stick walks**
 (forward/back, right/left), the **right stick rises and turns**
-(up/down, right/left), **holding Cross for one second**
-recentres, and **holding a Sense grip** moves and turns the scene with that hand
-(both grips: scale in place between the hands). The **D-pad has no rotation
-action** and **Square is not a reset**: the viewer has no rotation to change or
-save (DECISIONS.md, "Change 2026-11-05"). A scene is turned left or right by 90
-degrees on its entry in the panel (L3/R3), which rewrites the scene's own files.
-The
-background is black: the
-clear colour and the comfort fade's backdrop are both black, and so is the TV
-picture's. There is no auto-exit by default (`SECONDS=0`); a dev
-run can set a cap, and the quit-watch file or Options → Quit ends the session.
+(up/down, right/left) and **holding Cross for one second** recentres. The
+**D-pad has no rotation action** and **Square is not a reset**: the viewer has
+no rotation to change or save (DECISIONS.md, "Change 2026-11-05"). A scene is
+turned left or right by 90 degrees on its entry in the panel (L3/R3), which
+rewrites the scene's own files. The background is black: the clear colour and
+the comfort fade's backdrop are both black, and so is the TV picture's. There
+is no auto-exit by default (`SECONDS=0`); a dev run can set a cap, and the
+quit-watch file or Options → Quit ends the session.
 
 | Action | DualSense | Sense controllers |
 | --- | --- | --- |
 | Menu (tap, on release) | **Options** | right: **Options** |
 | Recentre the scene and the open window (hold 1 s) | **Options** | right: **Options** |
 | Recentre (hold 1 s; the scene, or the window while the menu is open) | **Cross** | right: **Cross** |
-| Previous scene | **L1** | left: **L1 tap** (a hold is the grab) |
-| Next scene | **R1** | right: **R1 tap** (a hold is the grab) |
-| Grab (hold): the scene follows that hand; both grips also scale it about the point between them (W26) | — | left: **L1 hold**, right: **R1 hold** - a tap instead steps the scene |
+| Previous scene | **L1** | left: **L1** (its grip) |
+| Next scene | **R1** | right: **R1** (its grip) |
 | Grow / shrink (default **Capture**: scale about the photo's capture point; smaller scene = bigger head-motion effect; Settings → Scale also offers Centre/Front) | **L2** shrink / **R2** grow (analogue, doubles every 1.5 s at full) | left: **L2** / right: **R2** (analogue) |
 | Walk (**you** move: forward/back, right/left) | **left stick** (2.5 m/s default at full, quadratic; Settings) | left controller's **stick** |
 | Rise / sink (**you** move: up/down) | **right stick** up/down (same move-speed curve) | right controller's **stick** up/down |
@@ -455,12 +449,15 @@ and no drag),
 R2 again clicks what it points at, and any d-pad/left-stick direction turns the ring off
 again. Every panel open starts on the joystick.
 
-A Sense grip press starts the grab at once, so the scene follows the hand from
-the first frame. If it is released **within 250 ms** and the hand moved less
-than **2 cm** and turned less than **3 deg**, it was a tap: the grab's own small
-delta is undone and the press steps the scene like the DualSense's L1/R1 (left =
-previous, right = next), logging `viewer: vr L1 tap -> scene N/M`. A longer
-hold, or more motion, stays a grab. Both grips down is never a tap.
+On the **PS5 Media Remote** (0.7): the D-pad is the panel's focus and, in a
+scene, its left/right step the album (previous/next), while up/down do nothing;
+**Enter** is Cross (held 1 s it recentres), **Back** is Circle and **Options**
+is Options. The console probe showed play/pause, rewind and fast-forward do not
+reach the title, so the remote has no other action.
+
+A headset that is turned on during a TV-only session is adopted without a
+restart (it switches to VR), and one that is turned off during VR sends the
+session back to the TV; the scene, the menu and the jobs keep running.
 
 
 **Rotation is a file action, and the viewer has none.** On the photo picker and
@@ -472,7 +469,7 @@ the toast says `the file itself was not changed`, with the turn stored in
 `<data>/state/photo-turns.json`. A scene turn is a background job: the tile
 says `Rotating`, the scene's own `scene.psplat`, `original.jpg`, `thumb.jpg` and
 `meta.json` are rewritten, and a scene that is open in the viewer (or already
-being turned) is refused. There is no grip tilt, no D-pad/Square step and no
+being turned) is refused. There is no scene tilt, no D-pad/Square step and no
 reset any more: left/right turning with the right stick, moving and scaling
 still work.
 A scene on a network library (Locations → Cross → a scene) is no exception: the
@@ -591,8 +588,7 @@ keeps streaming until that window closes even after the end line, so pass
   content's travel is capped at **4 m/s**. The scene loading and recentre
   behaviour is unchanged. The pivot comes from a decimated copy of the scene's
   splat positions (about 50k points, opacity > 0.3), taken once per loaded
-  scene; without it the fallback is the VR7 1.5 m point. The grab still moves
-  and turns the scene (both grips scale it between the hands). While pressing:
+  scene; without it the fallback is the VR7 1.5 m point. While pressing:
   a small world-locked ring at the pivot, the head-locked readout (`Capture
   0.08x`), and a light peripheral vignette; the readout stays 1.5 s, the marker
   0.5 s. `viewer: vr scale start: … about the capture pivot …` and
@@ -618,8 +614,8 @@ keeps streaming until that window closes even after the end line, so pass
   forward, the head's pitch and roll come out (the photo appears upright), and
   the scale, offset and turn are reset. A short press and R3 do nothing; letting
   go early cancels and the log says so.
-- Scenes: L1/R1 switch (on the DualSense), or a **tap** of a Sense L1/R1 (a
-  hold there is the grab). **A switch keeps the world placement, scale and offset**:
+- Scenes: **L1/R1** switch (the Sense grips are the same keys). **A switch
+  keeps the world placement, scale and offset**:
   the new scene's capture camera appears at the same world anchor as the
   previous one, so exploring is not interrupted by a recentre; only the new
   scene's centre and near-content depths change (the next press's pivot). The
@@ -698,7 +694,7 @@ keeps streaming until that window closes even after the end line, so pass
   <118>[PPSA99202] viewer: vr pad: DualSense controller open for user 1 (handle …)
   <118>[PPSA99202] viewer: vr pad: left Sense controller open for user 1 (handle …, raw buttons 0x00000000)
   <118>[PPSA99202] viewer: vr pad: right Sense controller open for user 1 (handle …, raw buttons 0x00000000)
-  <118>[PPSA99202] viewer: vr input: Options opens the menu (DualSense or right Sense; its Quit item ends the session), hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene about a point ahead of the eyes, left stick walks (forward/back, right/left), right stick rises and turns right; Create does nothing, one table for all pads
+  <118>[PPSA99202] viewer: vr input: Options opens the menu (DualSense or right Sense; its Quit item ends the session), hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change scene (the Sense grips are the same keys), L2/R2 scale the scene about a point ahead of the eyes, left stick walks (forward/back, right/left), right stick rises and turns right; Create does nothing, one table for all pads; the Media Remote's D-pad is the menu's focus and its left/right change scene, Enter is Cross, Back is Circle and Options is Options
   <118>[PPSA99202] hmd2: Hmd2 live at frame 1 (display +12000 us)
   <118>[PPSA99202] viewer: vr waiting for the headset: worn=0 tracked=0 after 0 s (up to 300 s)
   <118>[PPSA99202] viewer: vr waiting for the headset: worn=1 tracked=1 held=0.3 s after 1.0 s (up to 300 s; 0.5 s of a held pose places the scene)
@@ -770,10 +766,10 @@ and the `vr pose` lines share one clock).
 | `actions` | the action bits this frame (`0x…`: 1 the menu/panel button, 2 tooltips, 4 recentre — set on the frame the **scene's** Cross or Options hold completes, or a tracker re-anchor places the scene again; the same hold with the panel open recentres the **window**, sets no bit and is reported by `viewer: vr panel recentred: …` instead, 8 previous scene, 16 next scene; `platform/ps5/viewer/pad_input.h`). The 2026-10-27 evidence file's old "1 quit, 2 recentre, 4 previous, 8 next" row predated the panel bit |
 | `scale` | the scene's scale that frame (1.0 is the capture size, 0.001-4.0). **Capture** (the default) scales about the photo's capture point; **Centre/Front** scale about the visible 3D centre/near edge. The HUD shows this absolute scale (`Capture 0.08x`) |
 | `offset_x_m, offset_y_m, offset_z_m` | the scene's translation, metres in the placement frame (`offset_y_m` is **down** positive): the sticks walk/rise you, and a scale press adds its pivot compensation here - `offset' = pivot + f * (offset - pivot)`. A Front press whose pivot is 0.8 m ahead moves the offset 0.8 m for a 2x growth |
-| `turn_deg` | the scene's accumulated turn, degrees (positive turns the scene to the user's right): the right stick's turn and the yaw a one-hand grab adds. `yaw_deg` is the **camera's** yaw (scene yaw minus the turn). There is no other scene rotation any more and no `rot=yaw/pitch/roll` line: rotation is a file action on the panel, not a viewer control. At the 40 deg/s default one 60 Hz rendered frame is 0.67 deg |
+| `turn_deg` | the scene's accumulated turn, degrees (positive turns the scene to the user's right): the right stick's turn. `yaw_deg` is the **camera's** yaw (scene yaw minus the turn). There is no other scene rotation any more and no `rot=yaw/pitch/roll` line: rotation is a file action on the panel, not a viewer control. At the 40 deg/s default one 60 Hz rendered frame is 0.67 deg |
 | `hold_progress` | the **scene's** recentre hold progress, 0.00–1.00 (0 when Cross is not held, and while the panel is open: the window's hold is the `viewer: vr panel recentred: …` klog line, with no bar; the bar on the overlay shows the same value) |
 | `scene` | the scene folder on screen at that frame (quoted; a comma inside is safe) |
-| `event` | what happened before this frame: `recentre` (the scene's Cross or Options hold; the window's Cross hold is the klog line above), `reanchor` (the tracker's frame jumped and the scene was placed again), `scene`, `scale start`, `scale end`, `move start`, `move end`, `grab start`, `grab end`, `quit`, `cap`, `fail`, or empty |
+| `event` | what happened before this frame: `recentre` (the scene's Cross or Options hold; the window's Cross hold is the klog line above), `reanchor` (the tracker's frame jumped and the scene was placed again), `scene`, `scale start`, `scale end`, `move start`, `move end`, `quit`, `cap`, `fail`, or empty |
 
 A scale press shows in `scale` and in `offset_*`: the offset absorbs the pivot
 compensation so that the pivot point keeps its place in the picture while the
@@ -787,16 +783,11 @@ press whose folder does not change is a lost press - before VR6 every L1 that
 went back failed while the next scene was preloaded, and only the klog's
 `FAIL stage … a scene is already staged` said so.
 
-The Sense grab (W26) writes `grab start` / `grab end` in `event` and shows up in
-`scale`, `offset_*` and `turn_deg` like any other scene change: there is one transform,
-whatever moved it. A one-hand grab follows the hand (offset and heading); a two-hand grab
-sets `scale` and the offset's pivot compensation, with the point between the hands fixed
-in the picture. A quick still tap is a grab whose tiny delta is rolled back and whose
-release writes `scene` (with action bit 4 or 8), so the row's transform is the one before
-the press. `pos_*` and the comfort fade stay continuous through either, because the
-viewer never moves — only the scene does. The viewer has no rotation to change or save:
-a wrist roll or pitch is flattened to the heading a left/right turn can express
-(`viewer_adjust`), and the grip never tilts the scene out of level.
+The Sense controllers are the same keys as the DualSense: their grips are
+L1/R1, so a grip press steps the scene (left = previous, right = next) with no
+hold behaviour. One transform, whatever moved the scene: the sticks move the
+viewer, and only L2/R2 change the scene itself. The viewer has no rotation to
+change or save: a scene is turned on its panel entry, not in the scene view.
 
 Read it back (the console's file API; `ps5-env.sh`'s client is the same route,
 `convert-inbox.sh` fetches `viewer.env` this way):
@@ -906,20 +897,21 @@ as before, `UI=1` boots into the panel, `UI=0` turns it off. Install and launch 
 - [ ] 15. **Right Sense laser, armed by R2 (U3)**: the ring is **off** until you press **R2**. R2 once: a 12 px white ring appears where the right controller points, and klog says `viewer: pointer on (R2); the ray is armed`; that first press must **not** click anything (nor drag the Settings thumbnail-size slider). Point around with R2 released: the ring follows the controller, klog says `viewer: pointer hit x y` at most once a second. The DualSense's R2 arms it too.
 - [ ] 16. **R2 clicks** the widget under the ring (same as Cross): press R2 a second time while the ring is armed. Any d-pad/left-stick direction disarms it - the ring disappears and the focus steps as the stick says (`viewer: pointer off (joystick); focus stays where the stick moved it`), even when the ring was over another row; scrolling with a held stick must never be pulled back by the ring. R2 arms it again.
 - [ ] 17. Point away from the panel or hide the controller with the ray armed: the ring disappears, `pointer hit` stops, and it comes back when you point at the panel again (a d-pad/stick press disarms it); navigation keeps working (no pointer errors in klog). With the panel **closed** R2 still scales the scene (item 11); the pointer mode ignores it there, and every panel open starts with the ring off.
-- [ ] 18. Grab, one hand (W26): hold the left controller's **L1** (or the right's **R1**) and move that hand — the scene follows it, in translation and in turn. klog: `viewer: grab start: left hand, scale=1.00x`, and on release `viewer: grab end: scale=…`. Taking hold and letting go must not move the picture by themselves. A quick still **tap** (under 250 ms, hand not moved 2 cm) must not move the picture either: it steps the album instead (`viewer: vr L1 tap -> scene N/M`).
-- [ ] 19. Grab, two hands (every Scale mode, Capture by default): hold both grips and move your hands apart/together — the scene scales about the point between them, that point keeps its place, and **you** do not move. The scale stops at 0.001x / 4.0x, never "flies".
-- [ ] 20. With a grip held, the sticks still walk/turn you and L2/R2 still scale on top of the grab; a grip held while Options opens ends the gesture (`viewer: grab end: … (the menu suspended the scene controls)`) and the scene keeps its place.
-- [ ] 21. Sense L1/R1 are both keys: a **tap** (released within 250 ms with the hand still) steps the scene like the DualSense's L1/R1 — left L1 = previous, right R1 = next — and a **hold** (or more than 2 cm / 3 deg of motion) is the grab. The panel's ViewScene still works too.
+- [ ] 18. Sense L1/R1 are scene keys (the grips): a press on the left steps to the previous scene, on the right to the next (`viewer: vr L1 -> scene N/M` / `R1 -> …`). Holding a grip must **not** move or scale the scene — there is no grab any more; only L2/R2 scale.
+- [ ] 19. **Media Remote** (if paired): `viewer: pad: media remote open …` appears once. D-pad up/down/left/right moves the panel's focus; Enter selects; Back goes back; Options opens/closes the menu. With the panel closed, D-pad left/right step the album (`viewer: vr L1 -> …` / `R1 -> …`: the remote uses the same scene keys); D-pad up/down do nothing; Enter held 1 s recentres; no other remote button does anything (`play/pause`, rewind and fast-forward send nothing).
+- [ ] 20. **Headset off during VR -> TV**: while a scene runs in the headset, turn the PSVR2 off (hold its power button). Within ~2 s the klog shows one `viewer: hotplug: switched to the TV …` line (and Hmd2's teardown lines); the headset's "you need PS VR2" message must go away and the TV shows the same scene, controllable with the DualSense. The menu, a running download and a conversion job keep going. The system message clearing is the one thing only the console can confirm.
+- [ ] 21. **Headset on again**: turn it on and put it on. Within ~2 s the `hmd2:` init lines and one `viewer: hotplug: switched to VR …` line follow; the headset shows the same scene again (the TV keeps it). Repeat off/on a few times: each switch is one line and one teardown/bring-up, and Quit still ends cleanly (`viewer: teardown … ms`).
 - [ ] 22. **Flicker (VR9)**: with the panel open, look at a row's text from ~1 m and from arm's length. It must be **steady** — no crawling/dancing glyph edges as the head moves (the overlay textures now carry a full mip chain, trilinear + anisotropic where RADV supports it). Step through the scale range (0.1x) and check the panel and label stay smooth.
 - [ ] 23. **Keyboard (VR9)**: Scenes → New folder. The grid is **QWERTY** (1-0, qwertyuiop, asdfghjkl + Shift, zxcvbnm, then . - _ Space Delete OK), not ABC. **Hold** Down/Right (d-pad or left stick): the focus moves once, waits ~0.35 s, then repeats and visibly speeds up (8 to 20 steps/s) — no need to tap repeatedly. Shift types one capital, Square deletes, OK creates the folder.
 - [ ] 24. **System keyboard hook**: in this build the PS5 IME is not wired (the screen asks a text-input service that reports "not available"), so the panel grid must appear every time; there is no dead screen and no console error. The console IME is a separate spike.
 
-`viewer: grab` does not appear at all: look for the two registration lines
-`viewer: grab: left Sense pad … registered with VrTracker2 (device 2)` (and `right`,
-device 1). A failed registration means `controller_pose` has no pose and the tracked
-grab stays off — sticks, triggers, Cross hold and the panel are unaffected, and so is
-the scene. `viewer: vr pad: … raw buttons 0x…` shows the grip press itself (`0x400` on
-the left pad, `0x800` on the right).
+`viewer: grab` never appears: the Sense grips are plain L1/R1 scene keys now.
+The right Sense pad's only tracker registration is the panel pointer's, logged
+as `viewer: pointer: right Sense pad … registered with VrTracker2 (device 1)`
+the first time the panel opens; a failed registration leaves the ray off and
+the sticks, triggers, Cross hold and the rest of the panel working. `viewer: vr
+pad: … raw buttons 0x…` shows a grip press itself (`0x400` on the left pad,
+`0x800` on the right).
 
 ### 2. probe_agc — ~15 s — log `<UTC>-probe_agc.log`
 

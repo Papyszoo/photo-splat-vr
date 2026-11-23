@@ -184,6 +184,47 @@ bool init(const Config &config);   // false on failure; a failed init is cleaned
 void shutdown();
 bool active();
 
+// Whether a PSVR2 is plugged in and switched on, for a session that already
+// runs without VR (the viewer's TV-only session, 0.7: the user turns the headset
+// on and the running session switches instead of needing a restart).
+//
+// The only device-status call this firmware exports is
+// sceHmd2GetDeviceInformation (hmd2_funcs.h, and the 13.60 export list). It takes
+// no handle, and HLA-PSVR2 calls it between Initialize and Open (psvr2.c:350),
+// which would make a cheaper probe - but that one-shot diagnostic does not prove
+// the no-handle answer follows the live 2 -> 0 change of a headset being switched
+// on. So this probe uses the path the console klogs do prove (console-klog-067:
+// status 2 on an open session with the headset off), and init() uses for its
+// guard: Initialize, Open, GetDeviceInformation, Close, Terminate. Nothing of the
+// VR bring-up runs - no tracker, no VrHand, no reprojection, no VR mode and no
+// VideoOut port - so the display does not change mode and the TV keeps its
+// picture. It writes nothing to the logger (the caller polls it every
+// kHotplugProbeSeconds) and returns false on any call failure or a status word
+// that headset_on() does not accept.
+//
+// Cheap with the modules a failed init already loaded: they stay resident, so
+// the call is five exports and no module load. Only the console can confirm that
+// (a) opening and terminating an Hmd2 session without VR mode is invisible on
+// the TV, and (b) the open-session status word turns 2 -> 0 when the headset is
+// switched on while the title is in TV-only mode.
+bool headset_ready();
+
+// The device status of the session init() opened (0 = the headset is on and
+// usable; 2 = plugged in but switched off - the same word headset_on() takes).
+// False when init() has not succeeded, the export is missing, or the call
+// failed: `status` is then unknown and must not be read as "off". No log line,
+// and nothing of this function writes the library's state.
+//
+// This is the VR session's counterpart of headset_ready(): while Hmd2 is open,
+// the viewer's watch thread (vr_mode.cpp) calls it every 2 s off the render
+// thread, and the headset going off is the cue to leave VR and continue on the
+// TV. Only sceHmd2GetDeviceInformation is called - no BeginFrame/SetParam/flip
+// runs from the watch - and that call is serialised with the frame thread's
+// own status read (device_state) by one lock in hmd2.cpp, so the two threads
+// never run the export at the same time. The watch is joined before every
+// shutdown/init, so no Hmd2 session is opened or closed under it.
+bool device_status(uint32_t &status);
+
 // Holds the frame cadence: naps to the next 60 Hz slot measured from the
 // previous BeginFrame (HLA-PSVR2's rule, so a slow frame is not held back and
 // a fast one is not queued). Call once per frame, before begin_frame().

@@ -97,12 +97,34 @@ splat::OverlayCamera tv_camera(const splat::CameraIntrinsics& intrinsics, uint32
 }  // namespace
 
 UiHost::UiHost(splat::SplatRenderer& renderer, splat::IPanelContent& content, Mode mode)
-    : renderer_(renderer),
+    : renderer_(&renderer),
       content_(content),
       mode_(mode),
       canvas_(kDefaultCanvasWidth, kDefaultCanvasHeight) {}
 
 UiHost::~UiHost() = default;
+
+bool UiHost::create_textures() {
+    // The backdrop: the panel's plate behind a transparent canvas pixel.
+    const uint8_t backdrop[4] = {kBackdropSrgb[0], kBackdropSrgb[1], kBackdropSrgb[2], 255};
+    auto backdrop_texture = renderer_->add_overlay_rgba_texture(1, 1, backdrop);
+    if (!backdrop_texture.ok()) {
+        last_error_ = backdrop_texture.message();
+        return false;
+    }
+    backdrop_texture_ = backdrop_texture.value();
+    backdrop_ready_ = true;
+
+    // The panel: the canvas itself, uploaded whole again only when it changes.
+    auto panel_texture = renderer_->add_overlay_rgba_texture(
+        canvas_.width(), canvas_.height(), canvas_.pixels().data());
+    if (!panel_texture.ok()) {
+        last_error_ = panel_texture.message();
+        return false;
+    }
+    panel_texture_ = panel_texture.value();
+    return true;
+}
 
 bool UiHost::init(uint32_t width, uint32_t height,
                   const splat::CameraIntrinsics& eye_intrinsics) {
@@ -114,28 +136,28 @@ bool UiHost::init(uint32_t width, uint32_t height,
     canvas_ = splat::UiCanvas(width, height);
     intrinsics_ = eye_intrinsics;
 
-    // The backdrop: the panel's plate behind a transparent canvas pixel.
-    const uint8_t backdrop[4] = {kBackdropSrgb[0], kBackdropSrgb[1], kBackdropSrgb[2], 255};
-    auto backdrop_texture = renderer_.add_overlay_rgba_texture(1, 1, backdrop);
-    if (!backdrop_texture.ok()) {
-        last_error_ = backdrop_texture.message();
-        return false;
-    }
-    backdrop_texture_ = backdrop_texture.value();
-    backdrop_ready_ = true;
-
-    // The panel: the canvas itself, uploaded whole again only when it changes.
-    auto panel_texture = renderer_.add_overlay_rgba_texture(
-        canvas_.width(), canvas_.height(), canvas_.pixels().data());
-    if (!panel_texture.ok()) {
-        last_error_ = panel_texture.message();
-        return false;
-    }
-    panel_texture_ = panel_texture.value();
+    if (!create_textures()) return false;
 
     initialised_ = true;
     line("viewer: ui host: %ux%u canvas, %s mode, one RGBA8 overlay texture",
          canvas_.width(), canvas_.height(), mode_ == Mode::Tv ? "tv" : "vr");
+    return true;
+}
+
+bool UiHost::retarget(splat::SplatRenderer& renderer, Mode mode) {
+    // The old renderer owns the two textures; they go with it. The canvas is
+    // kept, so the app's menu state survives the switch.
+    renderer_ = &renderer;
+    mode_ = mode;
+    initialised_ = false;
+    backdrop_ready_ = false;
+    backdrop_texture_ = 0;
+    panel_texture_ = 0;
+    // The old quads name the old renderer's textures: never draw them again.
+    quads_.clear();
+    cursor_saved_ = false;
+    if (!create_textures()) return false;
+    initialised_ = true;
     return true;
 }
 
@@ -152,7 +174,7 @@ bool UiHost::upload_canvas() {
         static_cast<size_t>(canvas_.width()) * static_cast<size_t>(canvas_.height());
     const uint8_t* source = canvas_.pixels().data();
     if (pixels == 0 || source == nullptr) return false;
-    const splat::Status status = renderer_.update_overlay_rgba_texture(
+    const splat::Status status = renderer_->update_overlay_rgba_texture(
         panel_texture_, canvas_.width(), canvas_.height(), source);
     if (!status.ok()) {
         last_error_ = status.message();
@@ -203,7 +225,7 @@ splat::OverlayQuad UiHost::panel_quad(const splat::CameraPose& camera) {
     splat::OverlayQuad panel;
     if (mode_ == Mode::Tv) {
         panel = splat::tv_panel_quad(
-            tv_camera(intrinsics_, renderer_.eye_width(), renderer_.eye_height(), camera),
+            tv_camera(intrinsics_, renderer_->eye_width(), renderer_->eye_height(), camera),
             canvas_.width(), canvas_.height());
     } else {
         if (!panel_anchor_.latched()) {

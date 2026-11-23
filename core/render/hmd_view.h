@@ -606,8 +606,8 @@ private:
     bool scale_gesture_ = false;
     float initial_scale_ = 1.0f;
     // The scene's accumulated turn about the placement frame's vertical,
-    // radians (the right stick and the grab's yaw). Positive turns the scene to
-    // the user's right.
+    // radians (the right stick's turn). Positive turns the scene to the user's
+    // right.
     float turn_ = 0.0f;
 };
 

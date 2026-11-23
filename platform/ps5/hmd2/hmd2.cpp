@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 // System functions, declared here as PS5VR declares them: the payload SDK has
 // stubs for all of them but no headers.
@@ -205,6 +206,11 @@ struct State {
     bool mirror_on = false;
     bool mirror_resolved = false;     // the five mirroring exports are bound
     int hmd2_module = -1;             // libSceHmd2's handle, for a late resolve
+    bool hmd2_resolved = false;       // its required exports are bound
+    int tracker_module = -1;          // libSceVrTracker2's handle
+    bool tracker_resolved = false;    // its exports are bound
+    int vrhand_module = -1;           // libSceVrHand's handle
+    bool vrhand_bound = false;        // its exports are bound
     void *mirror_work = nullptr;
     void *mirror_display = nullptr;
     size_t mirror_work_bytes = 0;
@@ -262,6 +268,13 @@ struct State {
 };
 
 State s;
+
+// sceHmd2GetDeviceInformation is called from two threads in a VR session: the
+// frame thread's device_state() (the per-second "worn" number) and the 0.7
+// watch thread's device_status() (the headset-off probe). One lock serialises
+// the status calls with each other; the other Hmd2 calls (BeginFrame, SetParam,
+// the flip) stay on the frame thread and the watch runs no other call.
+std::mutex device_status_mutex;
 
 void logf(const char *fmt, ...) {
     if (s.log == nullptr)
@@ -435,7 +448,11 @@ bool resolve_module(int handle, const char *file, const Slot *slots, size_t n,
 // libSceVrHand is loaded for the state report only (hand tracking is not part
 // of C7 yet); failing to bind it is not fatal.
 void bind_vrhand() {
-    const int handle = load_sysmodule(0, "libSceVrHand");
+    // Loaded once per process, like Hmd2 and VrTracker2: a retried init reuses
+    // the handle instead of loading another copy.
+    if (s.vrhand_bound) return;
+    if (s.vrhand_module < 0) s.vrhand_module = load_sysmodule(0, "libSceVrHand");
+    const int handle = s.vrhand_module;
     if (handle < 0) {
         logf("hmd2: libSceVrHand unavailable (handle 0x%x)", handle);
         return;
@@ -443,10 +460,12 @@ void bind_vrhand() {
     const char *missing = nullptr;
     if (resolve_module(handle, "libSceVrHand.sprx", kVrHandSlots, kSlots(kVrHandSlots),
                        kTables_libSceVrHand,
-                       sizeof kTables_libSceVrHand / sizeof *kTables_libSceVrHand, &missing))
+                       sizeof kTables_libSceVrHand / sizeof *kTables_libSceVrHand, &missing)) {
+        s.vrhand_bound = true;
         logf("hmd2: libSceVrHand bound (%u exports)", (unsigned)kSlots(kVrHandSlots));
-    else
+    } else {
         logf("hmd2: libSceVrHand not usable here, hand tracking stays off");
+    }
 }
 
 // -- textures ---------------------------------------------------------------
@@ -901,7 +920,9 @@ bool setup(const Config &config) {
         return true;
     s.failed = false;
     s.error = {"", 0, nullptr};
-    s.fw = 0;
+    // Kept across a re-init: the modules (and their firmware table) are already
+    // resolved and are not loaded again.
+    if (!s.hmd2_resolved) s.fw = 0;
     s.submits = 0;
     s.errors = 0;
     s.external = config.external != nullptr && config.external_count > 0;
@@ -958,23 +979,34 @@ bool setup(const Config &config) {
 
     const char *missing = nullptr;
     bool no_table = false;
-    int handle = load_sysmodule(kSysmoduleHmd2, "libSceHmd2");
-    if (handle < 0 || !resolve_module(handle, "libSceHmd2.sprx", kHmd2Slots, kSlots(kHmd2Slots),
-                                      kTables_libSceHmd2,
-                                      sizeof kTables_libSceHmd2 / sizeof *kTables_libSceHmd2,
-                                      &missing, true, &no_table)) {
-        // The viewer draws its unsupported-firmware card for a missing table;
-        // every other failure keeps the plain FAIL path.
-        s.error = {missing != nullptr ? missing : "load libSceHmd2",
-                   handle < 0 ? handle : 0, no_table ? "libSceHmd2" : nullptr};
-        return abort_setup();
+    // The library modules are loaded once per process and stay loaded (teardown
+    // never unloads them), so an init after a failed one - the viewer's 0.7
+    // hot-plug switch retries - reuses the handles and the resolved exports
+    // instead of loading another copy. Nothing is loaded again on a successful
+    // first init, exactly as before.
+    if (s.hmd2_module < 0)
+        s.hmd2_module = load_sysmodule(kSysmoduleHmd2, "libSceHmd2");
+    if (!s.hmd2_resolved) {
+        const int handle = s.hmd2_module;
+        if (handle < 0 || !resolve_module(handle, "libSceHmd2.sprx", kHmd2Slots, kSlots(kHmd2Slots),
+                                          kTables_libSceHmd2,
+                                          sizeof kTables_libSceHmd2 / sizeof *kTables_libSceHmd2,
+                                          &missing, true, &no_table)) {
+            // The viewer draws its unsupported-firmware card for a missing table;
+            // every other failure keeps the plain FAIL path.
+            s.error = {missing != nullptr ? missing : "load libSceHmd2",
+                       handle < 0 ? handle : 0, no_table ? "libSceHmd2" : nullptr};
+            return abort_setup();
+        }
+        s.hmd2_resolved = true;
+    } else {
+        logf("hmd2: libSceHmd2 already loaded (handle 0x%x); reusing its %u exports",
+             s.hmd2_module, (unsigned)kSlots(kHmd2Slots));
     }
     // The mirroring exports are optional: MIRROR=0 does not resolve them at
     // all, and a library or firmware without them leaves the mirror off rather
     // than aborting the session. One line says why; VR continues.
-    s.hmd2_module = handle;
-    s.mirror_resolved = false;
-    if (s.mirror) {
+    if (s.mirror && !s.mirror_resolved) {
         const char *mirror_missing = nullptr;
         if (resolve_mirror_exports(&mirror_missing)) {
             s.mirror_resolved = true;
@@ -986,14 +1018,23 @@ bool setup(const Config &config) {
     }
     missing = nullptr;
     no_table = false;
-    handle = load_sysmodule(kSysmoduleVrTracker2, "libSceVrTracker2");
-    if (handle < 0 || !resolve_module(handle, "libSceVrTracker2.sprx", kVrTracker2Slots,
-                                      kSlots(kVrTracker2Slots), kTables_libSceVrTracker2,
-                                      sizeof kTables_libSceVrTracker2 / sizeof *kTables_libSceVrTracker2,
-                                      &missing, true, &no_table)) {
-        s.error = {missing != nullptr ? missing : "load libSceVrTracker2",
-                   handle < 0 ? handle : 0, no_table ? "libSceVrTracker2" : nullptr};
-        return abort_setup();
+    if (s.tracker_module < 0)
+        s.tracker_module = load_sysmodule(kSysmoduleVrTracker2, "libSceVrTracker2");
+    if (!s.tracker_resolved) {
+        const int handle = s.tracker_module;
+        if (handle < 0 ||
+            !resolve_module(handle, "libSceVrTracker2.sprx", kVrTracker2Slots,
+                            kSlots(kVrTracker2Slots), kTables_libSceVrTracker2,
+                            sizeof kTables_libSceVrTracker2 / sizeof *kTables_libSceVrTracker2,
+                            &missing, true, &no_table)) {
+            s.error = {missing != nullptr ? missing : "load libSceVrTracker2",
+                       handle < 0 ? handle : 0, no_table ? "libSceVrTracker2" : nullptr};
+            return abort_setup();
+        }
+        s.tracker_resolved = true;
+    } else {
+        logf("hmd2: libSceVrTracker2 already loaded (handle 0x%x); reusing its exports",
+             s.tracker_module);
     }
 
     uint8_t init_param[16];
@@ -1452,7 +1493,14 @@ DeviceState device_state() {
         s.worn_checked = now;
         uint8_t info[64];
         std::memset(info, 0, sizeof info);
-        if (sceHmd2GetDeviceInformation(info) == 0) {
+        bool read = false;
+        {
+            // The watch thread's device_status() asks the same export; one lock
+            // so the two status calls never run at the same time (0.7).
+            std::lock_guard<std::mutex> lock(device_status_mutex);
+            read = sceHmd2GetDeviceInformation(info) == 0;
+        }
+        if (read) {
             s.device.status = *reinterpret_cast<uint32_t *>(info);
             const bool worn = info[20] != 0;
             if (worn != s.device.worn)
@@ -1567,6 +1615,58 @@ int user_id() {
 
 Error error() {
     return s.error;
+}
+
+bool device_status(uint32_t &status) {
+    if (!s.inited || s.hmd < 0 || sceHmd2GetDeviceInformation == nullptr) return false;
+    uint8_t info[64];
+    std::memset(info, 0, sizeof info);
+    // Serialised with the frame thread's device_state(), which asks the same
+    // export (the watch thread is the only other caller).
+    {
+        std::lock_guard<std::mutex> lock(device_status_mutex);
+        if (sceHmd2GetDeviceInformation(info) != 0) return false;
+    }
+    status = *reinterpret_cast<uint32_t *>(info);
+    return true;
+}
+
+bool headset_ready() {
+    // A live session already knows: the status word device_state() refreshes.
+    // The VR watch uses device_status() instead, which asks the open session
+    // without opening a second one.
+    if (s.inited)
+        return headset_on(s.device.status);
+    // The only status call this firmware exports is sceHmd2GetDeviceInformation
+    // (hmd2_funcs.h). HLA-PSVR2 shows it can be called between Initialize and Open
+    // (psvr2.c:350 in dump_identity, before sceHmd2Open at :1144), which would make
+    // a cheaper probe - but that one-shot diagnostic does not prove the no-handle
+    // answer follows the live 2 -> 0 change when the headset is switched on. Only
+    // the console can prove that, so the shipped probe is the path the klogs do
+    // prove: Initialize -> Open -> GetDeviceInformation -> Close -> Terminate.
+    // No tracker, no VrHand, no reprojection, no VR mode and no VideoOut port, so
+    // the display does not change mode and the TV keeps its picture. Silent on
+    // purpose - this runs every 2 s and must not fill the klog.
+    if (sceHmd2Initialize == nullptr || sceHmd2Open == nullptr ||
+        sceHmd2GetDeviceInformation == nullptr || sceHmd2Close == nullptr ||
+        sceHmd2Terminate == nullptr) {
+        return false;
+    }
+    uint8_t init_param[16];
+    std::memset(init_param, 0, sizeof init_param);
+    if (sceHmd2Initialize(init_param) != 0) return false;
+    const int user = s.user >= 0 && s.user != 0xff ? s.user : pick_user();
+    const int hmd = sceHmd2Open(user, 0, 0, nullptr);
+    bool on = false;
+    if (hmd >= 0) {
+        uint8_t info[64];
+        std::memset(info, 0, sizeof info);
+        on = sceHmd2GetDeviceInformation(info) == 0 &&
+             headset_on(*reinterpret_cast<uint32_t *>(info));
+        sceHmd2Close(hmd);
+    }
+    sceHmd2Terminate();
+    return on;
 }
 
 void shutdown() {

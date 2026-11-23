@@ -57,6 +57,15 @@ public:
     bool init(uint32_t width = kDefaultCanvasWidth, uint32_t height = kDefaultCanvasHeight,
               const splat::CameraIntrinsics& eye_intrinsics = {});
 
+    // Points the host at another renderer and another panel geometry (0.7: the
+    // TV-only session switches to VR, so the renderer is rebuilt stereo and the
+    // panel becomes the world-fixed window). The app, its canvas and everything
+    // drawn on it are kept; only the two overlay textures live on the renderer
+    // and are made again here. The caller invalidates the app so the canvas is
+    // redrawn into the new texture. False when the textures cannot be created;
+    // the host then draws nothing until the next call.
+    bool retarget(splat::SplatRenderer& renderer, Mode mode);
+
     // One frame: update the content, upload when it changed, rebuild the quads.
     void frame(const splat::UiInput& input, const splat::CameraPose& camera);
 
@@ -107,6 +116,7 @@ public:
     uint64_t uploads() const { return uploads_; }
 
 private:
+    bool create_textures();
     bool upload_canvas();
     void build_quads(const splat::CameraPose& camera);
     // The Sense laser cursor: a 12 px ring drawn on the canvas after the
@@ -116,7 +126,7 @@ private:
     bool draw_cursor(const splat::UiInput& input, bool content_redrew);
     void restore_cursor();
 
-    splat::SplatRenderer& renderer_;
+    splat::SplatRenderer* renderer_;
     splat::IPanelContent& content_;
     Mode mode_;
     splat::UiCanvas canvas_;

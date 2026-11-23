@@ -43,9 +43,13 @@
 // instead of Hmd2's slots. The camera is a fixed seated head pose at the
 // capture point (identity, 63 mm IPD), so the menu, the sticks, L2/R2, the
 // panel's ViewScene, conversion, models, Quit and the per-second fps line all
-// run the same code as in VR; the scene label, the HUD and the Sense-based
-// grab/pointer are headset things and are not drawn or read. A firmware with no
+// run the same code as in VR; the scene label, the HUD and the Sense pointer
+// are headset things and are not drawn or read. A firmware with no
 // export table keeps its card first and continues on X (firmware_message.h).
+// A headset that is turned on later is adopted without a restart (hotplug.h),
+// and one that is turned off during VR sends the session back to the TV the
+// same way - the scene, the menu, the downloads and the conversion jobs keep
+// running.
 //
 // While it runs, the session can write a head-pose and input log to
 // /data/ps5-splat-vr/logs/session-<UTC>.csv (one row per submitted frame: the
@@ -79,6 +83,16 @@
 // offset belong to the session. Create does nothing, on
 // either device. All three go through one action/analogue table (pad_input.h);
 // any of them can trigger an action and each is optional.
+//
+// 0.7 adds the PS5 Media Remote as a fourth scePad device (remote_input.h), in
+// the TV-only session and in VR: the D-pad is the menu's navigation and, in a
+// scene, its left/right are the previous/next scene; Enter is Cross (a 1 s hold
+// recentres), Back is Circle and Options is Options. The console probe of
+// 2026-11-23 showed play/pause, rewind and fast-forward never reach the app,
+// so the remote has no other action. Its buttons go into the same per-frame OR
+// and the same action table as the pads; nothing here has a second input path.
+// Its open result is one klog line; the per-change raw probe log was removed
+// once the console had answered the port and the key offset.
 //
 // W16/VR8/U2: the panel is the TV's panel (ui_setup.h: the same UiApp and UiHost
 // the TV path builds). In VR it is a world-fixed window (hmd_view.h
@@ -126,13 +140,16 @@
 #include <ctime>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -140,7 +157,6 @@
 
 #include "gallery/gallery.h"
 #include "gallery/visibility.h"
-#include "render/grab.h"
 #include "render/hmd_view.h"
 #include "render/overlay_hud.h"
 #include "render/scene_label.h"
@@ -161,8 +177,10 @@
 #include "convert_gate.h"
 #include "eye_buffers.h"
 #include "firmware_message.h"
+#include "hotplug.h"
 #include "overlay_refresh.h"
 #include "pad_input.h"
+#include "remote_input.h"
 #include "scene_switch.h"
 #include "start_mode.h"
 #include "title_common.h"
@@ -183,6 +201,7 @@ int scePadGetHandle(int user_id, int type, int index);
 int scePadReadState(int handle, void* data);
 int scePadVrControllerReadState(int handle, void* state);
 int scePadClose(int handle);
+int sceUserServiceInitialize(const void* param);
 }
 
 namespace viewer {
@@ -316,6 +335,51 @@ void pad_init_once() {
     done = true;
 }
 
+// scePadOpen's "the port is already open" answer (SDL's PS5_Remote_Init checks
+// it, 0x80920004): the one case where scePadGetHandle can adopt an existing
+// handle. Every other failure is an error; asking for a handle on a port this
+// process does not own only risks reading, and closing, someone else's session.
+constexpr unsigned kPadAlreadyOpened = 0x80920004u;
+
+// One scePad port's open, shared by the DualSense, the Sense pair and the Media
+// Remote: the retry cadence is the caller's, the user service is initialised
+// once, and handle 0 is a valid handle (`< 0` is the failure test; SDL's remote
+// code's `<= 0` is how a present remote used to be reported missing and leaked).
+int pad_open_port(int user, int type, unsigned* open_rc_out = nullptr) {
+    pad_init_once();
+    const unsigned open_rc = static_cast<unsigned>(scePadOpen(user, type, 0, nullptr));
+    if (open_rc_out != nullptr) *open_rc_out = open_rc;
+    const int handle = static_cast<int>(open_rc);
+    if (handle >= 0) return handle;
+    if (open_rc == kPadAlreadyOpened) return scePadGetHandle(user, type, 0);
+    return handle;
+}
+
+// The one close: a closed handle is -1, so a second close does nothing.
+void pad_close_port(int& handle) {
+    if (handle >= 0) scePadClose(handle);
+    handle = -1;
+}
+
+// The edge bookkeeping every pad shares (the DualSense, the two Sense pads and
+// the Media Remote): a button already down when the pad opened is ignored until
+// it is let go, and only a button that went down since the previous call is a
+// press. One copy for Pad::poll and RemotePad::take_pressed.
+struct PadEdges {
+    uint32_t held = 0;      // the buttons still down after the open-time mask
+    uint32_t ignored = 0;   // the presses that were down at open, until released
+
+    // One read's word in, the buttons that went down since the last call out.
+    // `held` becomes the masked word, so the caller can read what is still down.
+    uint32_t down(uint32_t buttons) {
+        ignored &= buttons;   // a button is ignored only while it stays down
+        buttons &= ~ignored;
+        const uint32_t pressed = buttons & ~held;
+        held = buttons;
+        return pressed;
+    }
+};
+
 // One pad: the DualSense or one Sense controller. Opening, retrying, reading and
 // edge detection are the same for all three; which button means what is the one
 // table in pad_input.h. Every pad is optional and independent: any of them can
@@ -332,9 +396,7 @@ public:
     void open(int user, double now) {
         if (handle_ >= 0 || now < next_open_ms_) return;
         next_open_ms_ = now + kPadRetryMs;
-        pad_init_once();
-        int handle = scePadOpen(user, type_, 0, nullptr);
-        if (handle < 0) handle = scePadGetHandle(user, type_, 0);
+        const int handle = pad_open_port(user, type_);
         if (handle < 0) {
             if (!reported_missing_) {
                 reported_missing_ = true;
@@ -353,8 +415,8 @@ public:
         poll(false);
         // Buttons already down (poll()'s held set, or the ones it ignored when a
         // Sense controller reported itself connected) are not a press.
-        ignored_ |= held_;
-        held_ = 0;
+        edges_.ignored |= edges_.held;
+        edges_.held = 0;
         if (device_ == pad::Device::dualsense) {
             line("viewer: pad: %s controller open for user %d (handle %d)", name_, user,
                  handle_);
@@ -369,14 +431,21 @@ public:
     }
 
     void close() {
-        if (handle_ >= 0) scePadClose(handle_);
-        handle_ = -1;
-        held_ = 0;
-        ignored_ = 0;
+        pad_close_port(handle_);
+        // A closed pad contributes nothing: clear the axes and the button state,
+        // so a stick or trigger held while the pad goes away cannot keep driving
+        // the scene or the panel (0.7 VR -> TV: the Sense pair is closed when
+        // the headset is turned off).
+        edges_ = PadEdges{};
+        accumulated_ = 0;
+        raw_ = 0;
+        connected_ = false;
+        axes_ = pad::Axes{};
     }
 
     // The pad's raw button word as last read (the ScePadData word, or the Sense
-    // state's word at +0x00): what the head-pose log records per device.
+    // state's word at +0x00): what the head-pose log records per device. Zero
+    // once the pad is closed: a closed pad contributes nothing.
     uint32_t buttons() const { return raw_; }
 
     // The scePad handle while open, -1 when absent. The Sense right controller's
@@ -385,7 +454,7 @@ public:
 
     // The buttons still down after the open-time presses were discarded: what
     // the recentre hold reads. Zero while the pad is closed or gone.
-    uint32_t held() const { return held_; }
+    uint32_t held() const { return edges_.held; }
 
     // This pad's sticks and analogue triggers, decoded (0 at rest, y up
     // positive). Zero while the pad is closed or gone.
@@ -457,9 +526,9 @@ private:
                 // not fill the log every frame.
                 connected_ = connected;
                 if (connected) {
-                    ignored_ |= buttons;   // held while it connected: not a press
+                    edges_.ignored |= buttons;   // held while it connected: not a press
                 } else {
-                    held_ = 0;
+                    edges_.held = 0;
                     axes = pad::Axes{};
                 }
                 if (report_changes) {
@@ -469,15 +538,12 @@ private:
             }
             if (!connected) {
                 axes_ = pad::Axes{};
-                held_ = 0;
+                edges_.held = 0;
                 return 0;
             }
             if (report_changes) log_raw(raw_);
         }
-        ignored_ &= buttons;   // a button is ignored only while it stays down
-        buttons &= ~ignored_;
-        const uint32_t pressed = pad::actions_for(buttons & ~held_);
-        held_ = buttons;
+        const uint32_t pressed = pad::actions_for(edges_.down(buttons));
         axes_ = axes;
         return pressed;
     }
@@ -506,10 +572,128 @@ private:
     uint32_t raw_ = 0;            // the Sense state's word at +0x00, last read
     uint32_t raw_logged_ = 0;     // the word the log last carried
     double next_raw_log_ms_ = 0.0;
-    uint32_t held_ = 0;
-    uint32_t ignored_ = 0;
+    PadEdges edges_;
     uint32_t accumulated_ = 0;
     pad::Axes axes_;
+};
+
+// The PS5 Media Remote (0.7): one more scePad device, read with the same
+// scePadReadState as the DualSense and mapped by the pure remote_input.h. It is
+// optional and silent after its first open result: a session without a remote
+// behaves exactly as before. The port open/close is Pad's own code (one
+// pad_open_port/pad_close_port), the launch-press rule and the edge detection
+// are Pad's too, so the remote reaches the same action table (pad_input.h) and
+// the same held word the panel and the recentre hold read.
+class RemotePad {
+public:
+    // Opens the remote when it is not open, at most once per kPadRetryMs. The
+    // open result is one line; while the remote is absent nothing else is
+    // printed, so a console without a Media Remote does not fill the klog.
+    void open(double now) {
+        if (handle_ >= 0 || now < next_open_ms_) return;
+        next_open_ms_ = now + kPadRetryMs;
+        // SDL's PS5_Remote_Init initializes the user service before the remote
+        // open; the Hmd2 path does the same for its user. Once is enough
+        // (already initialized returns 0x80960003 and is harmless).
+        static bool user_service = false;
+        if (!user_service) {
+            sceUserServiceInitialize(nullptr);
+            user_service = true;
+        }
+        unsigned open_rc = 0;
+        const int handle = pad_open_port(remote::kUserIdSystem, remote::kPadType, &open_rc);
+        if (handle < 0) {
+            if (!reported_missing_) {
+                reported_missing_ = true;
+                line("viewer: pad: media remote: scePadOpen(0x%02x, %d, 0) -> 0x%08x (handle "
+                     "0x%08x): no remote; retrying every %.0f s without a line",
+                     remote::kUserIdSystem, remote::kPadType, open_rc,
+                     static_cast<uint32_t>(handle), kPadRetryMs / 1000.0);
+            }
+            return;
+        }
+        handle_ = handle;
+        reported_missing_ = false;
+        // Seed the state without reporting a transition: the open line is this
+        // moment's line. Buttons already down (a launch press) are not a press.
+        const uint32_t seed = poll();
+        edges_.ignored |= seed;
+        edges_.held = 0;
+        scene_held_ = 0;
+        line("viewer: pad: media remote open (scePadOpen -> 0x%08x, handle %d, connected %d)",
+             open_rc, handle_, connected_ ? 1 : 0);
+    }
+
+    void close() {
+        pad_close_port(handle_);
+        edges_ = PadEdges{};
+        scene_held_ = 0;
+        accumulated_ = 0;
+        read_failed_ = false;
+        connected_ = false;
+    }
+
+    // This remote's actions for the buttons that went down since the previous
+    // call, through the one action table: Options -> menu, and the D-pad's
+    // left/right -> previous/next scene (remote::scene_actions_for). Called
+    // once per frame, whether the remote is open or not.
+    uint32_t take_pressed() {
+        const uint32_t buttons = poll();
+        // Pad's own launch-press mask and edge rule (PadEdges).
+        const uint32_t pressed = edges_.down(buttons);
+        const uint32_t scene = remote::scene_actions_for(edges_.held);
+        accumulated_ |= pad::actions_for(pressed) | (scene & ~scene_held_);
+        scene_held_ = scene;
+        const uint32_t out = accumulated_;
+        accumulated_ = 0;
+        return out;
+    }
+
+    // The mapped word still down (D-pad, Cross, Circle, Options): what the
+    // panel's routing and the scene's recentre hold read.
+    uint32_t held() const { return edges_.held; }
+
+private:
+    // One read and one pure mapping. Returns the mapped word; the launch-press
+    // mask and the held/edge bookkeeping are take_pressed()'s, as in Pad.
+    uint32_t poll() {
+        if (handle_ < 0) {
+            connected_ = false;
+            return 0;
+        }
+        alignas(16) uint8_t data[256] = {};
+        const int read_rc = scePadReadState(handle_, data);
+        if (read_rc != 0) {
+            // One line per failure/recovery transition, not per frame.
+            if (!read_failed_) {
+                read_failed_ = true;
+                line("viewer: pad: media remote: scePadReadState -> 0x%08x; no input from it until "
+                     "a read succeeds",
+                     static_cast<unsigned>(read_rc));
+            }
+            connected_ = false;
+            return 0;
+        }
+        if (read_failed_) {
+            read_failed_ = false;
+            line("viewer: pad: media remote: reads again (handle %d)", handle_);
+        }
+        remote::State state;
+        std::memcpy(&state.buttons, data, sizeof state.buttons);
+        state.key = data[remote::kKeyOffset];
+        state.connected = data[remote::kConnectedOffset] != 0;
+        connected_ = state.connected;
+        return remote::map(state);
+    }
+
+    int handle_ = -1;
+    bool reported_missing_ = false;
+    bool read_failed_ = false;
+    bool connected_ = false;
+    double next_open_ms_ = 0.0;
+    PadEdges edges_;
+    uint32_t scene_held_ = 0;
+    uint32_t accumulated_ = 0;
 };
 
 // ---- head-pose and input log ----------------------------------------------
@@ -720,21 +904,29 @@ SceneDepths scene_depths(const splat::SplatScene& scene) {
 class VrSwitchSlot final : public SwitchSlot {
 public:
     VrSwitchSlot(splat::SplatRenderer& renderer, splat::ScenePlaylist& scenes)
-        : renderer_(renderer), scenes_(scenes) {}
+        : renderer_(&renderer), scenes_(scenes) {}
     ~VrSwitchSlot() override { preloader_.cancel(); }
+
+    // Points the slot at a replaced renderer (0.7 hot-plug: the TV session's
+    // mono renderer becomes the VR one). Whatever the old renderer still holds
+    // is released first, so its GPU buffers are free before it is destroyed.
+    void rebind(splat::SplatRenderer& renderer) {
+        release();
+        renderer_ = &renderer;
+    }
 
     // Called with every scene the slot reads (on demand or preloaded), for the
     // capture-intrinsics note.
     std::function<void(const splat::LoadedScene&)> on_load;
 
     long staged() const override { return staged_; }
-    bool holds_buffers() const override { return renderer_.has_staged_scene(); }
+    bool holds_buffers() const override { return renderer_->has_staged_scene(); }
 
     void release() override {
         // Unconditional and idempotent: SplatRenderer::discard_staged_scene()
         // does nothing when the slot is free. Dropping the index too is what
         // keeps the next attempt honest.
-        renderer_.discard_staged_scene();
+        renderer_->discard_staged_scene();
         staged_ = -1;
     }
 
@@ -771,7 +963,7 @@ public:
         if (on_load) on_load(next.value());
         const SceneDepths depths = scene_depths(next.value().scene);
         const double stage_started = now_ms();
-        const splat::Status staged = renderer_.stage_scene(next.value().scene);
+        const splat::Status staged = renderer_->stage_scene(next.value().scene);
         stage_ms_ = now_ms() - stage_started;
         if (!staged.ok()) {
             line("viewer: vr FAIL stage %s: %s (staying on %s)", path.string().c_str(),
@@ -788,11 +980,11 @@ public:
     bool activate(std::size_t index) override {
         if (staged_ != static_cast<long>(index)) return false;
         staged_ = -1;
-        if (!renderer_.has_staged_scene()) return false;  // bookkeeping was stale
-        const splat::Status status = renderer_.commit_staged_scene();
+        if (!renderer_->has_staged_scene()) return false;  // bookkeeping was stale
+        const splat::Status status = renderer_->commit_staged_scene();
         if (!status.ok()) {
             line("viewer: vr preloaded scene failed to commit: %s", status.message().c_str());
-            renderer_.discard_staged_scene();
+            renderer_->discard_staged_scene();
             return false;
         }
         // A new current scene: a preload refused for budget earlier may fit now,
@@ -823,7 +1015,7 @@ public:
             }
             const double stage_started = now_ms();
             const SceneDepths depths = scene_depths(next.value().scene);
-            const splat::Status staged = renderer_.stage_scene(next.value().scene);
+            const splat::Status staged = renderer_->stage_scene(next.value().scene);
             if (!staged.ok()) {
                 line("viewer: vr preload stage failed: %s", staged.message().c_str());
                 return;
@@ -837,7 +1029,7 @@ public:
                  "budget)",
                  scenes_.entry(static_cast<size_t>(want)).folder.filename().string().c_str(),
                  preloader_.last_load_ms(), now_ms() - stage_started,
-                 static_cast<double>(renderer_.staged_bytes()) / (1024.0 * 1024.0));
+                 static_cast<double>(renderer_->staged_bytes()) / (1024.0 * 1024.0));
             return;
         }
         // Idle: prefetch the next scene, unless it does not fit the budget or
@@ -866,7 +1058,7 @@ public:
     const std::vector<float>& applied_pivot_samples() const { return pivot_samples_; }
     double read_ms() const { return read_ms_; }
     double stage_ms() const { return stage_ms_; }
-    double commit_ms() const { return renderer_.last_commit_ms(); }
+    double commit_ms() const { return renderer_->last_commit_ms(); }
 
 private:
     const char* current_folder() {
@@ -888,13 +1080,13 @@ private:
         const size_t count = (static_cast<size_t>(status.st_size) - splat::kPsplatHeaderSize) /
                              splat::kPsplatBytesPerSplat;
         size_t bytes = count * splat::kPsplatBytesPerSplat;
-        if (count > renderer_.scene_count()) {
+        if (count > renderer_->scene_count()) {
             bytes += count * (3 * 16 + 4 + 4);
         }
         return bytes;
     }
 
-    splat::SplatRenderer& renderer_;
+    splat::SplatRenderer* renderer_;
     splat::ScenePlaylist& scenes_;
     splat::ScenePreloader preloader_;
     long staged_ = -1;              // playlist index in the slot, -1 = empty
@@ -967,6 +1159,138 @@ FirmwareAnswer show_firmware_message(TvOutput& tv, uint32_t firmware, const char
          cross ? "X pressed" : "120 s elapsed");
     return FirmwareAnswer::continue_on_tv;
 }
+
+// -- PSVR2 hot-plug (0.7) ----------------------------------------------------
+// The one watch thread of a session. It is the only thing that touches Hmd2 off
+// the render thread, and what it calls is a status answer only - no tracker, no
+// reprojection, no VR mode, no VideoOut, and no log line.
+//
+// In a TV-only session (Goal::on) it calls hmd2::headset_ready(), the minimal
+// status prefix of an init, and records when a headset that is on was first
+// seen; the render thread reads that through hotplug_should_switch() and runs
+// the switch itself. In a VR session (Goal::off) it calls
+// hmd2::device_status() on the open session and records the first answer that
+// is not status 0 (the start's headset_on() rule - status 2 is a headset that is
+// plugged in but switched off; worn is not used, because taking the headset off
+// while it stays on is normal). The render thread then asks
+// hotplug_should_leave_vr() and comes back on the TV.
+//
+// The render thread stops the watch before switching (so no Hmd2 call races an
+// init or a shutdown) and starts it again after the switch in the new mode.
+// `enabled_` is false for a session with no display path to poll (a TV session
+// whose output never came up), for a TV session on the firmware without an
+// export table (no probe, so no Hmd2 call there), and for the rest of a session
+// after a failed GPU wait. configure() stops, retargets and starts it in one
+// call.
+class HmdWatch {
+public:
+    enum class Goal {
+        on,   // TV-only: report when a usable headset is present
+        off,  // VR: report when the open session's status is no longer 0
+    };
+
+    HmdWatch(bool enabled, Goal goal) : enabled_(enabled), goal_(goal) { start(); }
+    ~HmdWatch() { stop(); }
+    HmdWatch(const HmdWatch&) = delete;
+    HmdWatch& operator=(const HmdWatch&) = delete;
+
+    bool enabled() const { return enabled_; }
+
+    // One snapshot of both values under one lock. The switch line names the
+    // status word and the time the goal was first seen; two separate reads could
+    // pair an old "seen" with a new word (the headset turned off and on inside
+    // one probe interval) and print "device status 0, not 0".
+    struct Snapshot {
+        double seen_s = -1.0;   // Goal::on: a headset that is on; Goal::off: a
+                                // status answer that is not 0; -1 when not.
+        uint32_t status = 0;    // the last successful status word (Goal::off)
+    };
+    Snapshot snapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return Snapshot{seen_s_, status_};
+    }
+
+    void start() {
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (thread_.joinable()) return;
+        stop_ = false;
+        seen_s_ = -1.0;
+        status_ = 0;
+        thread_ = std::thread([this] { run(); });
+    }
+
+    // The switch paths: join the old goal, then watch the new one. Stopping
+    // first is what keeps any Hmd2 call out of the init/shutdown that follows.
+    void configure(bool enabled, Goal goal) {
+        stop();
+        enabled_ = enabled;
+        goal_ = goal;
+        start();
+    }
+
+    // Ends the watch for the rest of the session (already stopped by the
+    // caller): a GPU wait failed, so the attempt's objects stay leaked under a
+    // device that is not trusted and no later Hmd2 init may run next to them.
+    // Same shape as configure(): the thread is joined before `enabled_` changes.
+    void disable() {
+        stop();
+        enabled_ = false;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            // The first probe waits one interval: the session has just given
+            // Hmd2 up (TV) or just come up (VR), and the display is settling
+            // into its mode.
+            wake_.wait_for(lock, std::chrono::duration<double>(kHotplugProbeSeconds),
+                           [this] { return stop_; });
+            if (stop_) return;
+            const Goal goal = goal_;
+            lock.unlock();
+            bool seen = false;
+            uint32_t status = 0;
+            bool answered = false;
+            if (goal == Goal::on) {
+                seen = hmd2::headset_ready();
+            } else {
+                // Only a successful read that is not 0 counts. A failed call is
+                // "no answer", not "the headset is off": a transient Hmd2 error
+                // must not drop VR.
+                answered = hmd2::device_status(status);
+                seen = answered && !hmd2::headset_on(status);
+            }
+            lock.lock();
+            if (stop_) return;
+            if (answered) status_ = status;
+            if (seen) {
+                if (seen_s_ < 0.0) seen_s_ = now_ms() / 1000.0;
+            } else {
+                seen_s_ = -1.0;
+            }
+        }
+    }
+
+    bool enabled_ = false;
+    Goal goal_ = Goal::on;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::thread thread_;
+    bool stop_ = false;
+    double seen_s_ = -1.0;
+    uint32_t status_ = 0;
+};
 
 }  // namespace
 
@@ -1120,12 +1444,35 @@ int run_vr(const VrOptions& options) {
     Pad dualsense(pad::Device::dualsense, "DualSense", kPadTypeDualsense);
     Pad sense_left(pad::Device::sense_left, "left Sense", kPadTypeSenseLeft);
     Pad sense_right(pad::Device::sense_right, "right Sense", kPadTypeSenseRight);
+    RemotePad remote;
     RunState run;
     bool hmd2_up = false;
     // 0.6.0: the TV's own output (tv_output.h). `tv_up` says it opened and has
     // not been given up; the Hmd2 mirror carries the TV when it is false.
     viewer::TvOutput tv_output;
     bool tv_up = false;
+
+    // The one VR teardown: Hmd2's own reverse-order shutdown (VR mode off, the
+    // VideoOut port, the tracker, reprojection, the VrHand exports and the Hmd2
+    // handle close) and the two VR-only Vulkan objects this title owns. Shared
+    // by the exit teardown and the 0.7 VR -> TV switch, so the order and the
+    // flags exist once. `free_gpu` is false only on the exit leak-on-timeout
+    // path, where nothing may be freed under a device that may still read it.
+    // A TV-only session has already freed both objects: destroy/forget are
+    // idempotent no-ops then.
+    auto leave_vr = [&](bool free_gpu) {
+        if (hmd2_up) {
+            hmd2::shutdown();
+            hmd2_up = false;
+        }
+        if (free_gpu) {
+            copy_pass.destroy();
+            eye_buffers.destroy();
+        } else {
+            copy_pass.forget();
+            eye_buffers.forget();
+        }
+    };
 
     auto teardown = [&]() {
         const double started = now_ms();
@@ -1139,23 +1486,19 @@ int run_vr(const VrOptions& options) {
         // the quit take ~15 s (runs/issue-1-crash/klog-analysis.md section 3).
         tv_output.stop_worker();
         // The pads first, before the headset's tracker/Hmd2 teardown, which is
-        // HLA-PSVR2's order for its Sense controllers (psvr2.c:1593-1613). We
-        // have nothing to unregister: the only VrTracker2 handle in this title is
-        // hmd2's own (it registers the headset), and the Sense pads are never
-        // registered, so closing them is all this side has to do. Pad handles
-        // hold no display or GPU memory, so this does not delay stopping
-        // reprojection.
+        // HLA-PSVR2's order for its Sense controllers (psvr2.c:1593-1613). The
+        // right Sense pad's pointer registration lives in hmd2 and is undone by
+        // its teardown; the pads themselves hold no display or GPU memory, so
+        // closing them here does not delay stopping reprojection.
         sense_left.close();
         sense_right.close();
         dualsense.close();
+        remote.close();
         // Then the headset on every path: VR mode off and the buffers
         // unregistered stop reprojection sampling memory this title is about to
         // free, and a title that ends with VrTracker2 live faults the tracker
         // (docs/research/hla-psvr2.md section 3).
-        if (hmd2_up) {
-            hmd2::shutdown();
-            hmd2_up = false;
-        }
+        leave_vr(run.gpu_ok);
         // VR mode is off: the main port closes now, so the display changes mode
         // once (the 0.5.x quit) instead of twice while VR mode was still on.
         // The renderer and its TV slots are still alive here; they are freed
@@ -1166,8 +1509,6 @@ int run_vr(const VrOptions& options) {
             renderer.reset();
             splat::destroy_vulkan_image(*context, target_image);
             splat::destroy_vulkan_image(*context, alt_target_image);
-            copy_pass.destroy();
-            eye_buffers.destroy();
             context.reset();
         } else if (context && !run.gpu_ok) {
             // A GPU wait timed out: the device may still be running, so nothing
@@ -1176,8 +1517,6 @@ int run_vr(const VrOptions& options) {
             // reclaims it; the log says what was leaked.
             line("viewer: teardown: leaking the renderer, its buffers, the eye buffers and the "
                  "device (a GPU wait timed out; nothing may be freed under it)");
-            copy_pass.forget();
-            eye_buffers.forget();
             if (renderer) renderer.release();
             context.release();
         }
@@ -1239,6 +1578,10 @@ int run_vr(const VrOptions& options) {
     // title's own picture and the panel is the same one. `no_vr` is the switch
     // the rest of the session reads (start_mode.h has the decision table).
     bool no_vr = false;
+    // Set when the failure was a firmware without an export table: the card's X
+    // continues on the TV, but a later PSVR2 must never be adopted (0.7 hot-plug):
+    // the same firmware would fail the same way, and the card already answered.
+    bool firmware_no_table = false;
     if (!hmd2::init(config)) {
         const hmd2::Error hmd_error = hmd2::error();
         const char *hmd_step =
@@ -1259,6 +1602,7 @@ int run_vr(const VrOptions& options) {
         // the user cannot fix it from the pad and the klog is not visible to
         // them. X (or the 120 s) continues on the TV, O ends the title.
         const bool firmware_card = hmd_error.missing_table_library != nullptr;
+        firmware_no_table = firmware_card;
         bool card_shown = false;
         bool card_continue = false;
         if (firmware_card) {
@@ -1386,55 +1730,76 @@ int run_vr(const VrOptions& options) {
     }
 
     // ---- renderer ---------------------------------------------------------
-    splat::RendererOptions renderer_options;
-    renderer_options.shader_dir = options.shader_dir;
-    // With a headset: both eyes at the headset's size, side by side. Without:
-    // one 1920x1080 image, which the TV output presents (the TV capture below is
-    // then a 1:1 copy of it) at the renderer's 60 degree fallback.
-    renderer_options.eye_width = no_vr ? splat::kTvWidth : kEyeWidth;
-    renderer_options.eye_height = no_vr ? splat::kTvHeight : kEyeHeight;
-    renderer_options.stereo = !no_vr;
-    // The eye buffer is linear RGBA8 (Hmd2's descriptor is UNORM); an sRGB
-    // target keeps the premultiplied blend in linear light and the bytes Hmd2
-    // samples are sRGB-encoded, the same colour path the TV viewer takes. The
-    // same target feeds the TV picture (present() swaps red and blue for it).
-    renderer_options.target_format = VK_FORMAT_R8G8B8A8_SRGB;
-    if (!no_vr) {
-        renderer_options.intrinsics = projection.intrinsics;
-        renderer_options.eye_center_shift[0] = projection.eye_shift[0];
-        renderer_options.eye_center_shift[1] = projection.eye_shift[1];
-    }
-    // Black everywhere the photo is not: the clear colour and the comfort fade's
-    // backdrop are one value (splat_renderer.h), so the void around the photo
-    // and the fade past the comfort radius are black in both eyes and on the TV
-    // picture.
-    renderer_options.backdrop[0] = 0.0f;
-    renderer_options.backdrop[1] = 0.0f;
-    renderer_options.backdrop[2] = 0.0f;
-    if (loaded.meta.intrinsics.fx > 0.0f && loaded.meta.intrinsics.width > 0) {
-        renderer_options.capture_intrinsics = {
-            loaded.meta.intrinsics.fx, loaded.meta.intrinsics.fy, loaded.meta.intrinsics.cx,
-            loaded.meta.intrinsics.cy};
-        renderer_options.capture_width = loaded.meta.intrinsics.width;
-        renderer_options.capture_height = loaded.meta.intrinsics.height;
-    } else if (boot_has_scene) {
-        line("viewer: vr no capture intrinsics in meta.json; the capture-frustum fade is off");
-    } else {
-        line("viewer: vr no scene yet: the renderer starts empty and keeps its 60 degree fallback "
-             "until the menu loads one");
-    }
-    const double renderer_started = now_ms();
-    splat::Result<std::unique_ptr<splat::SplatRenderer>> renderer_result;
-    auto create_renderer = [&]() {
-        renderer_result = splat::SplatRenderer::create(*context, renderer_options, loaded.scene);
+    // One builder for both display paths, because a TV-only session that adopts
+    // a headset (0.7 hot-plug) rebuilds the renderer in the same shape a VR
+    // start creates: stereo at the headset's eye size with its FOV. `vr` is the
+    // mode; `announce` prints the no-intrinsics notes only on the first build.
+    auto make_renderer_options = [&](bool vr, bool announce) {
+        splat::RendererOptions out;
+        out.shader_dir = options.shader_dir;
+        // With a headset: both eyes at the headset's size, side by side. Without:
+        // one 1920x1080 image, which the TV output presents (the TV capture below
+        // is then a 1:1 copy of it) at the renderer's 60 degree fallback.
+        out.eye_width = vr ? kEyeWidth : splat::kTvWidth;
+        out.eye_height = vr ? kEyeHeight : splat::kTvHeight;
+        out.stereo = vr;
+        // The eye buffer is linear RGBA8 (Hmd2's descriptor is UNORM); an sRGB
+        // target keeps the premultiplied blend in linear light and the bytes Hmd2
+        // samples are sRGB-encoded, the same colour path the TV viewer takes. The
+        // same target feeds the TV picture (present() swaps red and blue for it).
+        out.target_format = VK_FORMAT_R8G8B8A8_SRGB;
+        if (vr) {
+            out.intrinsics = projection.intrinsics;
+            out.eye_center_shift[0] = projection.eye_shift[0];
+            out.eye_center_shift[1] = projection.eye_shift[1];
+        }
+        // Black everywhere the photo is not: the clear colour and the comfort
+        // fade's backdrop are one value (splat_renderer.h), so the void around the
+        // photo and the fade past the comfort radius are black in both eyes and on
+        // the TV picture.
+        out.backdrop[0] = 0.0f;
+        out.backdrop[1] = 0.0f;
+        out.backdrop[2] = 0.0f;
+        if (loaded.meta.intrinsics.fx > 0.0f && loaded.meta.intrinsics.width > 0) {
+            out.capture_intrinsics = {
+                loaded.meta.intrinsics.fx, loaded.meta.intrinsics.fy, loaded.meta.intrinsics.cx,
+                loaded.meta.intrinsics.cy};
+            out.capture_width = loaded.meta.intrinsics.width;
+            out.capture_height = loaded.meta.intrinsics.height;
+        } else if (announce && boot_has_scene) {
+            line("viewer: vr no capture intrinsics in meta.json; the capture-frustum fade is off");
+        } else if (announce) {
+            line("viewer: vr no scene yet: the renderer starts empty and keeps its 60 degree "
+                 "fallback until the menu loads one");
+        }
+        return out;
     };
-    run_with_big_stack(create_renderer, "vr renderer");
-    if (!renderer_result.ok()) {
-        line("viewer: FAIL renderer: %s", renderer_result.message().c_str());
+    splat::RendererOptions renderer_options = make_renderer_options(!no_vr, true);
+    const double renderer_started = now_ms();
+    // One renderer builder for every bring-up: the start (VR or TV), the
+    // TV -> VR switch and the VR -> TV switch. The big stack covers the
+    // renderer's own create path; a failure hands back the message, the
+    // caller's policy (teardown, abort the switch) stays with the caller.
+    auto make_session_renderer = [&](const splat::RendererOptions& opts,
+                                     const splat::SplatScene& scene, const char* stack_name,
+                                     std::string& why)
+        -> std::unique_ptr<splat::SplatRenderer> {
+        splat::Result<std::unique_ptr<splat::SplatRenderer>> result;
+        auto create = [&]() { result = splat::SplatRenderer::create(*context, opts, scene); };
+        run_with_big_stack(create, stack_name);
+        if (!result.ok()) {
+            why = result.message();
+            return nullptr;
+        }
+        return result.take();
+    };
+    std::string renderer_error;
+    renderer = make_session_renderer(renderer_options, loaded.scene, "vr renderer", renderer_error);
+    if (renderer == nullptr) {
+        line("viewer: FAIL renderer: %s", renderer_error.c_str());
         teardown();
         return 6;
     }
-    renderer = renderer_result.take();
     if (no_vr) {
         line("viewer: no VR renderer: %ux%u mono, shaders %s, create %.1f ms",
              renderer->eye_width(), renderer->eye_height(), options.shader_dir.c_str(),
@@ -1571,57 +1936,116 @@ int run_vr(const VrOptions& options) {
              no_vr ? "no VR" : "vr");
     }
 
-    const VkExtent2D extent = renderer->target_extent();
-    auto image_result = splat::create_vulkan_color_image(
-        *context, renderer_options.target_format, extent,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    if (!image_result.ok()) {
-        line("viewer: FAIL target image: %s", image_result.message().c_str());
-        teardown();
-        return 6;
-    }
-    target_image = image_result.take();
-    // The copy pass only exists to hand a finished frame to Hmd2's eye buffer;
-    // on the TV the renderer's own TV capture is what the port reads.
-    if (!no_vr &&
-        !copy_pass.create(context->device(), context->queue_family(), context->queue(), error)) {
-        line("viewer: FAIL copy pass: %s", error.c_str());
-        teardown();
-        return 6;
-    }
-    splat::RenderTarget target;
-    target.image = target_image.image;
-    target.view = target_image.view;
-    target.extent = extent;
-    target.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    target.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // ---- the VR frame targets (one block for both bring-ups) ---------------
+    // The frame target at the renderer's extent, the second blend-space target
+    // for Settings > Display > Blending (non-fatal when it fails), and - on a
+    // display path - the eye-buffer copy pass. A VR start and a hot-plug switch
+    // create exactly this block, so it lives here once; the only difference is
+    // the failure policy, which stays with the caller (the start ends the
+    // session with 6, the switch aborts and leaves the TV untouched). On a
+    // failure nothing this made is left behind.
+    struct VrTargetImages {
+        splat::VulkanImage target;
+        splat::VulkanImage alt;
+        bool alt_ready = false;
+        VkFormat alt_format = VK_FORMAT_UNDEFINED;
+        VkExtent2D extent{};
+        std::string alt_error;   // empty when the format has no alternative
 
-    // The second blend-space target for Settings > Display > Blending: the
-    // renderer builds pipelines for both the sRGB and the UNORM format, so the
-    // loop only has to choose the image. Failure is not fatal: the setting
-    // falls back to Linear and the log says why.
-    splat::RenderTarget alt_target;
-    bool alt_target_ready = false;
-    const VkFormat alt_format = splat::blend_alt_format(renderer_options.target_format);
-    if (alt_format != renderer_options.target_format) {
-        auto alt_result = splat::create_vulkan_color_image(
-            *context, alt_format, extent,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-        if (alt_result.ok()) {
-            alt_target_image = alt_result.take();
-            alt_target.image = alt_target_image.image;
-            alt_target.view = alt_target_image.view;
-            alt_target.extent = extent;
-            alt_target.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            alt_target.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            alt_target.format = alt_format;
-            alt_target_ready = true;
-            line("viewer: vr display: two blend targets ready (sRGB for Linear, UNORM for sRGB); "
-                 "the Settings toggle switches between them per frame");
-        } else {
-            line("viewer: vr display: no gamma-blend target (%s); Blending stays Linear",
-                 alt_result.message().c_str());
+        splat::RenderTarget render_target() const {
+            splat::RenderTarget out;
+            out.image = target.image;
+            out.view = target.view;
+            out.extent = extent;
+            out.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            return out;
         }
+        splat::RenderTarget alt_render_target() const {
+            splat::RenderTarget out;
+            out.image = alt.image;
+            out.view = alt.view;
+            out.extent = extent;
+            out.final_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            out.format = alt_format;
+            return out;
+        }
+    };
+    auto make_vr_targets = [&](splat::SplatRenderer& vr_renderer, bool with_copy_pass,
+                               VrTargetImages& out, const char*& what,
+                               std::string& why) -> bool {
+        out = VrTargetImages{};
+        out.extent = vr_renderer.target_extent();
+        const VkFormat target_format = renderer_options.target_format;
+        auto image_result = splat::create_vulkan_color_image(
+            *context, target_format, out.extent,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (!image_result.ok()) {
+            what = "target image";
+            why = image_result.message();
+            return false;
+        }
+        out.target = image_result.take();
+        // The renderer builds pipelines for both the sRGB and the UNORM format,
+        // so the loop only has to choose the image. Failure is not fatal: the
+        // setting falls back to Linear and the caller logs why.
+        out.alt_format = splat::blend_alt_format(target_format);
+        if (out.alt_format != target_format) {
+            auto alt_result = splat::create_vulkan_color_image(
+                *context, out.alt_format, out.extent,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            if (alt_result.ok()) {
+                out.alt = alt_result.take();
+                out.alt_ready = true;
+            } else {
+                out.alt_error = alt_result.message();
+            }
+        }
+        if (with_copy_pass &&
+            !copy_pass.create(context->device(), context->queue_family(), context->queue(),
+                              why)) {
+            what = "copy pass";
+            splat::destroy_vulkan_image(*context, out.target);
+            splat::destroy_vulkan_image(*context, out.alt);
+            out = VrTargetImages{};
+            return false;
+        }
+        return true;
+    };
+
+    VrTargetImages first_targets;
+    std::string targets_error;
+    const char* targets_step = "target image";
+    if (!make_vr_targets(*renderer, !no_vr, first_targets, targets_step, targets_error)) {
+        line("viewer: FAIL %s: %s", targets_step, targets_error.c_str());
+        teardown();
+        return 6;
+    }
+    // The session's live frame targets: the start adopts the images it just
+    // made, and a hot-plug switch adopts its new set through the same block
+    // after freeing the old one (install_display). `first_layout` is the
+    // warm-up frame's, so the first real frame starts from the layout the
+    // previous one left instead of discarding it as UNDEFINED.
+    bool alt_target_ready = false;
+    VkExtent2D extent{};
+    splat::RenderTarget target;
+    splat::RenderTarget alt_target;
+    auto adopt_targets = [&](const VrTargetImages& images, VkImageLayout first_layout) {
+        target_image = images.target;
+        alt_target_image = images.alt;
+        alt_target_ready = images.alt_ready;
+        extent = images.extent;
+        target = images.render_target();
+        target.initial_layout = first_layout;
+        alt_target = splat::RenderTarget{};
+        if (alt_target_ready) alt_target = images.alt_render_target();
+    };
+    adopt_targets(first_targets, VK_IMAGE_LAYOUT_UNDEFINED);
+    if (alt_target_ready) {
+        line("viewer: vr display: two blend targets ready (sRGB for Linear, UNORM for sRGB); "
+             "the Settings toggle switches between them per frame");
+    } else if (!first_targets.alt_error.empty()) {
+        line("viewer: vr display: no gamma-blend target (%s); Blending stays Linear",
+             first_targets.alt_error.c_str());
     }
 
     // ---- viewer state -----------------------------------------------------
@@ -1653,9 +2077,6 @@ int run_vr(const VrOptions& options) {
     // folder has not taken it yet. A converted scene has no scale to store, so
     // its session scale never makes the view dirty.
     bool scale_dirty = false;
-    // A grab that scaled the scene releases repeatedly; at most one save a
-    // second.
-    double next_grab_save_ms = 0.0;
     // True when the scene on screen is an imported one: only then does save()
     // persist the scale (scene_view.h, SceneViewStore::persists_scale).
     bool scene_stores_scale = false;
@@ -1738,28 +2159,36 @@ int run_vr(const VrOptions& options) {
     // session was opened for (which the failed init has already resolved: the
     // user service call is the first thing hmd2::setup does). On the TV there is
     // no headset, so the Sense pair - VR controllers - is not opened, and the
-    // DualSense is the whole input. Missing ones are retried in the loop, slowly.
+    // DualSense and the Media Remote are the whole input. Missing ones are
+    // retried in the loop, slowly.
     const int user = hmd2::user_id();
     const double pads_started = now_ms();
     dualsense.open(user, pads_started);
+    // The Media Remote is the system user's port (remote_input.h), not the
+    // headset user's, and it exists in both sessions.
+    remote.open(pads_started);
     if (no_vr) {
-        line("viewer: no VR input: the DualSense only (the Sense controllers belong to the "
-             "headset): Options opens the menu and continues in the scene, Cross is the panel's "
-             "Select and a 1 s Cross hold recentres, L1/R1 change scene, L2/R2 scale the scene, "
-             "the left stick walks (forward/back, right/left) and the right stick rises and turns "
-             "right; Quit is the panel's last item");
+        line("viewer: no VR input: the DualSense and the Media Remote (if paired) only (the Sense "
+             "controllers belong to the headset): Options opens the menu and continues in the "
+             "scene, Cross is the panel's Select and a 1 s Cross hold recentres, L1/R1 change "
+             "scene, L2/R2 scale the scene, the left stick walks (forward/back, right/left) and "
+             "the right stick rises and turns right; on the remote the D-pad moves the menu's "
+             "focus and its left/right step the scene, Enter is Cross, Back is Circle and Options "
+             "is Options; Quit is the panel's last item");
     } else {
         sense_left.open(user, pads_started);
         sense_right.open(user, pads_started);
         line("viewer: vr input: an Options tap opens the menu on release (DualSense or right Sense; "
              "its Quit item ends the session), hold Options 1 s to recentre the scene and the open "
              "window, hold Cross 1 s to recentre (R3 and a short press do nothing), L1/R1 change "
-             "scene (a Sense grip hold grabs instead; a tap steps), L2/R2 scale the scene: by "
+             "scene (the Sense grips are the same keys), L2/R2 scale the scene: by "
              "default Capture zooms about the photo's capture point (Settings > Scale can pick "
              "Front or Centre), left stick walks "
              "(forward/back, right/left), right stick rises and turns right; the D-pad and Square "
              "have no scene action (the viewer has no rotation; turn a scene with L3/R3 on its "
-             "panel entry); Create does nothing, one table for all pads");
+             "panel entry); Create does nothing, one table for all pads; the Media Remote's D-pad "
+             "is the menu's focus and its left/right change scene, Enter is Cross, Back is Circle "
+             "and Options is Options");
     }
 
     // ---- the frame loop ---------------------------------------------------
@@ -1839,18 +2268,82 @@ int run_vr(const VrOptions& options) {
     std::string scale_text =
         scale_readout_text(headset.scale_pivot_mode(), headset.hud_scale());
 
-    // The solid texture the label plate and every HUD bar share.
-    {
-        const uint8_t white = 255;
-        auto texture = renderer->add_overlay_texture(1, 1, &white);
-        if (texture.ok()) {
-            solid_texture = texture.value();
-        } else {
-            line("viewer: vr overlay: %s; no label plate or HUD background",
-                 texture.message().c_str());
+    uint32_t marker_texture = UINT32_MAX;
+    // The overlay's own textures: one solid 1x1 for the label plate and the HUD
+    // bars, the pivot marker, and the two text masks. They live on the renderer,
+    // so the 0.7 hot-plug switch (a rebuilt renderer) calls this again; every id
+    // it replaces belongs to the old renderer and is dropped with it.
+    auto make_overlay_textures = [&]() {
+        solid_texture = UINT32_MAX;
+        label_text_texture = UINT32_MAX;
+        marker_texture = UINT32_MAX;
+        hud_textures = splat::HudTextures{};
+        label_base.clear();
+        // The solid texture the label plate and every HUD bar share.
+        {
+            const uint8_t white = 255;
+            auto texture = renderer->add_overlay_texture(1, 1, &white);
+            if (texture.ok()) {
+                solid_texture = texture.value();
+            } else {
+                line("viewer: vr overlay: %s; no label plate or HUD background",
+                     texture.message().c_str());
+            }
         }
-    }
-    hud_textures.solid = solid_texture;
+        hud_textures.solid = solid_texture;
+
+        // The scale press's pivot marker: a 64x64 R8 ring, drawn as a small
+        // world-locked billboard at the pivot (nothing to model, one texture).
+        {
+            constexpr int kRingSize = 64;
+            std::vector<uint8_t> ring(static_cast<size_t>(kRingSize) * kRingSize, 0);
+            const float centre = 0.5f * static_cast<float>(kRingSize - 1);
+            for (int y = 0; y < kRingSize; ++y) {
+                for (int x = 0; x < kRingSize; ++x) {
+                    const float dx = static_cast<float>(x) - centre;
+                    const float dy = static_cast<float>(y) - centre;
+                    const float radius = std::sqrt(dx * dx + dy * dy) / centre;
+                    // A soft 1.5 px ring at ~0.78 of the cell.
+                    const float edge = 1.0f - std::min(1.0f, std::fabs(radius - 0.78f) * 10.0f);
+                    ring[static_cast<size_t>(y) * kRingSize + x] =
+                        static_cast<uint8_t>(std::clamp(edge, 0.0f, 1.0f) * 255.0f);
+                }
+            }
+            auto texture = renderer->add_overlay_texture(kRingSize, kRingSize, ring.data());
+            if (texture.ok()) {
+                marker_texture = texture.value();
+            } else {
+                line("viewer: vr HUD: %s; the scale pivot has no marker",
+                     texture.message().c_str());
+            }
+        }
+
+        // The hold line's mask never changes; the scale line changes one decimal
+        // at a time while the trigger is held, and keeps one mask size throughout.
+        {
+            const splat::TextImage hold_image =
+                splat::rasterise_text({splat::kHoldHudText}, hud_layout.pixel_scale);
+            auto texture = renderer->add_overlay_texture(hold_image.width, hold_image.height,
+                                                         hold_image.pixels.data());
+            if (texture.ok()) {
+                hud_textures.hold_text = texture.value();
+            } else {
+                line("viewer: vr HUD: %s; the recentre hold has no text",
+                     texture.message().c_str());
+            }
+            const splat::TextImage scale_image =
+                splat::rasterise_text({scale_text}, hud_layout.pixel_scale);
+            auto scale_texture = renderer->add_overlay_texture(
+                scale_image.width, scale_image.height, scale_image.pixels.data());
+            if (scale_texture.ok()) {
+                hud_textures.scale_text = scale_texture.value();
+            } else {
+                line("viewer: vr HUD: %s; the scale readout has no text",
+                     scale_texture.message().c_str());
+            }
+        }
+    };
+    make_overlay_textures();
 
     // ---- the TV's own quads (0.6.0) --------------------------------------------
     // Drawn only onto the TV picture (SplatRenderer::set_tv_overlay_quads), never
@@ -1860,7 +2353,11 @@ int run_vr(const VrOptions& options) {
     // can open the menu before anyone wears the headset. The banner is one plate
     // (the solid texture) and one text mask, placed in TV pixels.
     std::vector<splat::OverlayQuad> tv_banner;
-    if (tv_up && !no_vr && solid_texture != UINT32_MAX) {
+    // The banner's one text mask lives on the renderer too: the hot-plug switch
+    // makes it again while the session waits for the headset to be worn.
+    auto make_tv_banner = [&]() {
+        tv_banner.clear();
+        if (!(tv_up && !no_vr && solid_texture != UINT32_MAX)) return;
         constexpr uint32_t kBannerScale = 3;   // font pixels on the 1920x1080 picture
         const splat::TextImage text = splat::rasterise_text(
             {"Waiting for the headset - put it on, or use this menu"}, kBannerScale);
@@ -1885,7 +2382,8 @@ int run_vr(const VrOptions& options) {
                  "it waits for the headset",
                  text.empty() ? "empty text" : texture.message().c_str());
         }
-    }
+    };
+    make_tv_banner();
     bool tv_quads_dirty = true;
     bool tv_menu_shown = false;
     bool tv_banner_shown = false;
@@ -1908,60 +2406,7 @@ int run_vr(const VrOptions& options) {
         if (!quads_status.ok()) line("viewer: vr tv quads: %s", quads_status.message().c_str());
     };
 
-    // The scale press's pivot marker: a 64x64 R8 ring, drawn as a small
-    // world-locked billboard at the pivot (nothing to model, one texture).
-    uint32_t marker_texture = UINT32_MAX;
-    {
-        constexpr int kRingSize = 64;
-        std::vector<uint8_t> ring(static_cast<size_t>(kRingSize) * kRingSize, 0);
-        const float centre = 0.5f * static_cast<float>(kRingSize - 1);
-        for (int y = 0; y < kRingSize; ++y) {
-            for (int x = 0; x < kRingSize; ++x) {
-                const float dx = static_cast<float>(x) - centre;
-                const float dy = static_cast<float>(y) - centre;
-                const float radius = std::sqrt(dx * dx + dy * dy) / centre;
-                // A soft 1.5 px ring at ~0.78 of the cell.
-                const float edge = 1.0f - std::min(1.0f, std::fabs(radius - 0.78f) * 10.0f);
-                ring[static_cast<size_t>(y) * kRingSize + x] =
-                    static_cast<uint8_t>(std::clamp(edge, 0.0f, 1.0f) * 255.0f);
-            }
-        }
-        auto texture = renderer->add_overlay_texture(kRingSize, kRingSize, ring.data());
-        if (texture.ok()) {
-            marker_texture = texture.value();
-        } else {
-            line("viewer: vr HUD: %s; the scale pivot has no marker", texture.message().c_str());
-        }
-    }
-
-    // The hold line's mask never changes; the scale line changes one decimal at
-    // a time while the trigger is held, and keeps one mask size throughout.
-    {
-        const splat::TextImage hold_image =
-            splat::rasterise_text({splat::kHoldHudText}, hud_layout.pixel_scale);
-        auto texture =
-            renderer->add_overlay_texture(hold_image.width, hold_image.height,
-                                          hold_image.pixels.data());
-        if (texture.ok()) {
-            hud_textures.hold_text = texture.value();
-        } else {
-            line("viewer: vr HUD: %s; the recentre hold has no text",
-                 texture.message().c_str());
-        }
-        const splat::TextImage scale_image =
-            splat::rasterise_text({scale_text}, hud_layout.pixel_scale);
-        auto scale_texture =
-            renderer->add_overlay_texture(scale_image.width, scale_image.height,
-                                          scale_image.pixels.data());
-        if (scale_texture.ok()) {
-            hud_textures.scale_text = scale_texture.value();
-        } else {
-            line("viewer: vr HUD: %s; the scale readout has no text",
-                 scale_texture.message().c_str());
-        }
-    }
-
-    auto refresh_label = [&](size_t index) {
+    auto refresh_label = [&](size_t index, bool announce = true) {
         const double started = now_ms();
         const splat::Path folder = scenes.entry(index).folder;
         const std::string folder_name = folder.filename().string();
@@ -2008,6 +2453,7 @@ int run_vr(const VrOptions& options) {
         label.text.texture = label_text_texture;
         label_base = {label.plate, label.text};
         overlay_dirty = true;
+        if (!announce) return;
         line("viewer: vr label \"%s\" / \"%s\": %ux%u R8, %.1f cm glyphs at %.1f m, %.0f cm "
              "below the photo, %.1f x %.1f cm plate, updated in %.1f ms",
              label.title.c_str(), label.counter.c_str(), label.image.width, label.image.height,
@@ -2233,7 +2679,7 @@ int run_vr(const VrOptions& options) {
             return false;
         }
         // The outgoing scene's own scale is stored before it leaves the screen
-        // (a grab saves its own release, this catches anything else).
+        // (a scale release has its own save point; this catches anything else).
         if (scale_dirty) save_view("scene switch");
         const double started = now_ms();
         const viewer::SwitchReport report = viewer::switch_scene(switch_slot, index);
@@ -2269,6 +2715,10 @@ int run_vr(const VrOptions& options) {
     // The first stats line is due one second after the session starts, even
     // while the loop is still waiting for the headset.
     double second_started = session_started;
+    // The per-second `t=` counts from here while the scene is not placed: the
+    // session start, or the switch that started the current segment, so a
+    // TV -> VR switch's VR wait never includes the TV time.
+    double log_epoch = session_started;
     double project_second = 0.0;
     double sort_second = 0.0;
     double draw_second = 0.0;
@@ -2333,16 +2783,6 @@ int run_vr(const VrOptions& options) {
     double previous_head_ms = 0.0;
     bool have_previous_head = false;
     bool move_gesture = false;
-    // W26: the Sense grab. `grab_state` is the gesture's memory (the hands'
-    // previous poses), `grab_gesture` its start/end log edge, and the two
-    // booleans the one-time VrTracker2 registration each Sense pad needs before
-    // controller_pose() returns anything. UNVERIFIED on hardware.
-    splat::GrabState grab_state;
-    bool grab_gesture = false;
-    // Each Sense pad's VrTracker2 registration: 0 not tried yet, 1 registered,
-    // -1 refused (one attempt, one line - a failure must not retry every frame).
-    int sense_left_tracker = 0;
-    int sense_right_tracker = 0;
     // The pose log's per-frame state: the tracker result this frame rendered
     // from (the same values Hmd2 got in SetParam) and the event of this frame,
     // if any. `last_raw` starts untracked, so the rows written while the
@@ -2380,9 +2820,9 @@ int run_vr(const VrOptions& options) {
         return removed_yaw;
     };
 
-    // The scene step the DualSense's L1/R1 and a Sense grip tap share (W26:
-    // a held Sense grip is the grab, a tap steps). `key` names the press in
-    // the log; `next` is the direction, and the event is the same `scene`.
+    // The scene step the DualSense's L1/R1, the Sense grips and the remote's
+    // D-pad left/right share. `key` names the press in the log; `next` is the
+    // direction, and the event is the same `scene`.
     auto step_scene = [&](const char* key, bool next) {
         if (scenes.size() <= 1) return;
         const size_t target_index =
@@ -2423,7 +2863,7 @@ int run_vr(const VrOptions& options) {
             line("viewer: tv t=%.0fs fps=%.1f project=%.2f sort=%.2f draw=%.2f copy=%.2f "
                  "gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx tv=%s tvfps=%.1f tvtile=%.2f ms "
                  "tvgpu=%.2f ms tvdrop=%llu tverr=%llu slow=%llu/%llu",
-                 (now - (placed ? placed_at : session_started)) / 1000.0, frames / seconds,
+                 (now - (placed ? placed_at : log_epoch)) / 1000.0, frames / seconds,
                  frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
                  frames ? draw_second / frames : 0.0, frames ? counters.copy_second / frames : 0.0,
                  frames ? (project_second + sort_second + draw_second) / frames : 0.0,
@@ -2473,7 +2913,7 @@ int run_vr(const VrOptions& options) {
              "copy=%.2f gpu=%.2f ms visible=%u fade=%.3f scale=%.2fx ipd=%.1f mm "
              "slow=%llu/%llu missed=%d shown=%llu repeated=%d queue-full=%d err=%d worn=%d mirror=%s "
              "tv=%s tvfps=%.1f tvtile=%.2f ms tvgpu=%.2f ms tvdrop=%llu tverr=%llu",
-             (now - (placed ? placed_at : session_started)) / 1000.0, frames / seconds,
+             (now - (placed ? placed_at : log_epoch)) / 1000.0, frames / seconds,
              frames ? project_second / frames : 0.0, frames ? sort_second / frames : 0.0,
              frames ? draw_second / frames : 0.0, frames ? draw_second / frames / 2.0 : 0.0,
              frames ? counters.copy_second / frames : 0.0,
@@ -2564,6 +3004,441 @@ int run_vr(const VrOptions& options) {
              removed_yaw, static_cast<double>(headset.hud_scale()), headset.ipd() * 1000.0);
     }
 
+    // ---- PSVR2 hot-plug (0.7) ---------------------------------------------
+    // A session follows the headset in both directions without a restart: a
+    // TV-only session adopts one that is turned on, and a VR session whose
+    // headset is turned off comes back to the TV. One watch thread (HmdWatch)
+    // polls the status off the render thread; `switch_to_vr` and `switch_to_tv`
+    // run the same bring-ups a start uses, between two frames. Everything the
+    // session already owns keeps running: the scene, the menu state and its
+    // screen stack, the model downloads and the conversion jobs. Only the
+    // renderer is rebuilt (mono TV <-> stereo VR, which is a create-time
+    // property in core/render) and the TV output is paused for the swap so its
+    // worker never reads a slot buffer that is being freed.
+    //
+    // A firmware without an export table never switches: the card already
+    // answered, and the same firmware would fail again. The retry rule is
+    // hotplug.h's pure function: one attempt, then kHotplugRetrySeconds before
+    // the next, so a failing switch cannot fill the klog or cycle Hmd2.
+
+    // The current scene's CPU copy again, for a renderer that is about to be
+    // rebuilt: the live renderer owns the GPU copy and dropped the CPU one.
+    // `why` carries the read error; `loaded` is always left consistent (empty
+    // on failure), so the caller's failure policy is the only difference
+    // between the two switches: the TV -> VR switch aborts with the display
+    // still on the TV, the VR -> TV switch has no VR to stay on and comes up on
+    // the empty view with the menu.
+    auto reread_scene = [&](std::string& why) -> bool {
+        if (scenes.empty()) {
+            loaded = splat::LoadedScene{};
+            return true;
+        }
+        splat::Result<splat::LoadedScene> current =
+            splat::read_scene_path(scenes.current().scene_file);
+        if (!current.ok()) {
+            why = current.message();
+            loaded = splat::LoadedScene{};
+            return false;
+        }
+        loaded = std::move(current.value());
+        return true;
+    };
+
+    // The one display-path swap, between two frames: the slot is released on
+    // the old renderer and re-pointed at the new one while that renderer is
+    // still alive (rebind() releases what it held), the old target images are
+    // freed, and the new renderer/targets become the session's. `warm_target`
+    // carries the warm-up frame's final layout, so the first real frame starts
+    // from it instead of discarding it. The caller has stopped the TV worker
+    // (it reads the old renderer's slot buffers).
+    auto install_display = [&](std::unique_ptr<splat::SplatRenderer> next,
+                               const VrTargetImages& images,
+                               const splat::RenderTarget& warm_target) {
+        switch_slot.reset();
+        switch_slot.rebind(*next);
+        splat::destroy_vulkan_image(*context, target_image);
+        splat::destroy_vulkan_image(*context, alt_target_image);
+        renderer = std::move(next);
+        adopt_targets(images, warm_target.initial_layout);
+        if (tv_up) {
+            splat::SplatRenderer* next_renderer = renderer.get();
+            tv_output.attach(
+                [next_renderer](int slot) { return next_renderer->tv_frame_pixels(slot); });
+        }
+    };
+
+    // The UI side of a display swap: the same UiApp and canvas (its screen
+    // stack, focus and toasts stay) re-pointed at the new renderer in the new
+    // mode, the overlay textures and banner rebuilt (they live on the
+    // renderer), the per-frame overlay caches invalidated and the scene label
+    // remade. Both switch directions run exactly this after the swap.
+    auto swap_panel = [&](bool tv) {
+        no_vr = tv;
+        if (ui_runtime != nullptr && ui_runtime->host != nullptr) {
+            const viewer::UiHost::Mode mode =
+                tv ? viewer::UiHost::Mode::Tv : viewer::UiHost::Mode::Vr;
+            if (ui_runtime->host->retarget(*renderer, mode)) {
+                ui_runtime->app->invalidate();
+            } else {
+                line("viewer: hotplug: the panel could not move to the %s renderer (%s); the "
+                     "session runs without it",
+                     tv ? "TV" : "VR", ui_runtime->host->last_error().c_str());
+            }
+        }
+        make_overlay_textures();
+        make_tv_banner();
+        overlay_dirty = true;
+        overlay_ui = false;
+        overlay_marker = false;
+        overlay_scale = -1.0f;
+        tv_quads_dirty = true;
+        tv_menu_shown = false;
+        tv_banner_shown = false;
+        if (!scenes.empty()) refresh_label(scenes.index(), false);
+    };
+
+    // The per-second and per-run numbers restart at every switch: a run's
+    // totals and PASS count only the current segment, never the TV frames or
+    // the TV placement before a switch (0.7 verification, LOW).
+    auto reset_counters = [&](double from) {
+        counters = Counters{};
+        project_second = sort_second = draw_second = 0.0;
+        second_started = from;
+    };
+
+    double last_switch_attempt_s = -1.0;
+    bool switch_gpu_failed = false;
+    auto switch_to_vr = [&]() -> bool {
+        const double switch_started = now_ms();
+        switch_gpu_failed = false;
+        // On failure nothing of the VR side may stay behind: the headset goes
+        // down (if it came up), the eye buffers and the copy pass are freed, and
+        // the TV session continues exactly as it was. `gpu_failed` is the one
+        // exception, matching the start path's leak-on-timeout rule: after a
+        // failed GPU wait nothing this attempt allocated is freed or destroyed.
+        auto abort_switch = [&](const char* what, const std::string& why,
+                                bool gpu_failed = false) {
+            const std::string tail =
+                gpu_failed
+                    ? "staying on the TV, and the failed attempt's Vulkan objects are not freed "
+                      "(a GPU wait failed), so no switch is attempted again this session"
+                    : "staying on the TV, retrying in " +
+                          std::to_string(static_cast<int>(viewer::kHotplugRetrySeconds)) + " s";
+            line("viewer: hotplug: FAIL the switch to VR: %s%s%s; %s", what,
+                 why.empty() ? "" : ": ", why.c_str(), tail.c_str());
+            leave_vr(!gpu_failed);
+            loaded.scene = splat::SplatScene{};
+            return false;
+        };
+
+        // 1. The eye buffers Hmd2 samples (the TV session gave them back).
+        std::string eye_error;
+        if (!eye_buffers.create(context->device(), context->memory_properties(), kEyeBufferCount,
+                                2 * kEyeWidth, kEyeHeight, eye_error)) {
+            return abort_switch("eye buffers", eye_error);
+        }
+
+        // 2. The current scene, read again before Hmd2 comes up: the TV
+        // renderer owns the GPU copy and dropped the CPU one, and a read that
+        // fails must abort with the display still on the TV. The read does not
+        // need Hmd2, so it runs before the init and a failure never takes the
+        // display through a VR-mode transition.
+        std::string scene_error;
+        if (!reread_scene(scene_error)) {
+            return abort_switch("the current scene will not read", scene_error);
+        }
+
+        // 3. The full Hmd2 init: the same config and the same calls a VR start
+        // runs (tracker, reprojection, VR mode, mirror rule).
+        hmd2::Config hotplug_config;
+        hmd2::ExternalImage hotplug_external[splat::ps5::kMaxEyeBuffers] = {};
+        for (int i = 0; i < kEyeBufferCount; i++) {
+            hotplug_external[i].address = eye_buffers.mapped(i);
+            hotplug_external[i].bytes = static_cast<size_t>(eye_buffers.bytes());
+        }
+        hotplug_config.external = hotplug_external;
+        hotplug_config.external_count = kEyeBufferCount;
+        hotplug_config.image_width = 2 * kEyeWidth;
+        hotplug_config.image_height = kEyeHeight;
+        // The mirror rule of a start with the TV output up: the title drives the
+        // TV itself, so Hmd2's social screen stays off.
+        hotplug_config.mirror = options.mirror && !tv_up;
+        if (!hmd2::init(hotplug_config)) {
+            const hmd2::Error hotplug_error = hmd2::error();
+            // The same rc spelling a start prints: 0x then eight hex digits,
+            // not a decimal number after 0x.
+            char rc_text[24];
+            std::snprintf(rc_text, sizeof rc_text, "rc 0x%08x",
+                          static_cast<unsigned>(hotplug_error.rc));
+            return abort_switch(
+                hotplug_error.step != nullptr && hotplug_error.step[0] != '\0'
+                    ? hotplug_error.step
+                    : "hmd2 init",
+                rc_text);
+        }
+        hmd2_up = true;
+
+        // 4. The headset's projection and the stereo renderer the projected
+        // frame needs.
+        const hmd2::Fov fov = hmd2::field_of_view();
+        projection =
+            splat::hmd_projection({fov.out, fov.in, fov.top, fov.bottom}, kEyeWidth, kEyeHeight);
+
+        // 5. The stereo renderer, built exactly as a VR start builds it, before
+        // anything of the TV path is taken down: a failure here leaves the TV
+        // session untouched.
+        renderer_options = make_renderer_options(true, false);
+        std::string vr_error;
+        std::unique_ptr<splat::SplatRenderer> vr_renderer =
+            make_session_renderer(renderer_options, loaded.scene, "hotplug renderer", vr_error);
+        if (vr_renderer == nullptr) {
+            return abort_switch("renderer", vr_error);
+        }
+        loaded.scene = splat::SplatScene{};
+        if (tv_up) {
+            const splat::Status tv_status = vr_renderer->enable_tv_capture(
+                splat::kTvWidth, splat::kTvHeight, viewer::TvOutput::kSlots);
+            if (!tv_status.ok()) {
+                vr_renderer.reset();
+                return abort_switch("the TV picture", tv_status.message());
+            }
+        }
+
+        // 6. The frame target, the alternative blend target and the eye-buffer
+        // copy pass, from the same block a VR start uses (the TV path never
+        // makes a copy pass).
+        VrTargetImages vr_targets;
+        std::string targets_error;
+        const char* targets_step = "target image";
+        if (!make_vr_targets(*vr_renderer, true, vr_targets, targets_step, targets_error)) {
+            vr_renderer.reset();
+            return abort_switch(targets_step, targets_error);
+        }
+
+        // 7. One warm-up frame on the new renderer, before the swap. The stereo
+        // pipeline's first compile must not land in the first frame the headset
+        // shows; a failed render aborts the bring-up with the TV untouched.
+        splat::RenderTarget warm_target = vr_targets.render_target();
+        {
+            const splat::FrameView warm;   // capture pose
+            const splat::Status rendered = vr_renderer->render(warm, warm_target, false);
+            if (!rendered.ok()) {
+                // A failed warm-up is a GPU wait failure: like the start, the
+                // attempt's objects are not freed or destroyed under the device
+                // (the renderer is released, the eye buffers and copy pass are
+                // forgotten by abort_switch). Unlike the start, the session does
+                // not end here: the TV path was never touched and its next frame
+                // is the device's health check (a wedged device ends the run on
+                // that frame's FAIL render). The caller disables the watch: a
+                // second attempt would leak a second set, and the run's verdict
+                // must not be forced by an abandoned attempt.
+                vr_renderer.release();
+                switch_gpu_failed = true;
+                return abort_switch("the warm-up render", rendered.message(), true);
+            }
+            warm_target.initial_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
+
+        // 8. The swap. The TV worker is paused (the old renderer's slot buffers
+        // are about to be freed) and everything fallible has already run: from
+        // here the session is on the VR path.
+        if (tv_up) tv_output.stop_worker();
+        install_display(std::move(vr_renderer), vr_targets, warm_target);
+        // The same app and canvas, now the world-fixed VR window: its canvas
+        // keeps the TV size, and retarget() redraws nothing, so the app is
+        // invalidated for the next frame (swap_panel).
+        swap_panel(false);
+        if (tv_up && !tv_output.resume_worker()) {
+            tv_fall_back("the TV worker would not restart after the switch");
+        }
+
+        // 9. The state the loop reads. The scene is placed by the existing
+        // waiting-for-the-headset placement (the same one a VR start uses), so
+        // `placed` goes back to false and the placement clock restarts. The
+        // scene, the menu and the jobs are kept, but the frame counters and the
+        // placement clock are not: this run's VR totals and PASS must count the
+        // VR frames from this switch, never the TV frames or the TV placement
+        // before it (0.7 verification, LOW).
+        placed = false;
+        wait_started = now_ms();
+        next_wait_log = 0.0;
+        placement_wait = splat::PlacementWait{};
+        reanchor_watch = splat::ReanchorWatch{};
+        run.tracking_lost = false;
+        wait_submit_errors = 0;
+        begin_failures = 0;
+        have_previous_head = false;
+        next_tv_ms = wait_started;
+        placed_at = wait_started;
+        log_epoch = wait_started;
+        reset_counters(wait_started);
+        mirror_ok = hmd2::mirroring();
+        // The success line's mirror phrase follows the state after the TV
+        // worker's resume: a failed resume closes the port and starts the Hmd2
+        // mirror, so the fixed "no mirror with the TV output up" would be
+        // false (0.7 verification, LOW).
+        const char* tv_note = tv_up ? "no mirror with the TV output up"
+                                    : (mirror_ok ? "the Hmd2 mirror carries the TV"
+                                                 : "no TV output and no mirror");
+        line("viewer: hotplug: switched to VR in %.0f ms: Hmd2 up (%d px per eye, fov %.2f %.2f "
+             "%.2f %.2f, %s), stereo renderer %ux%u per eye, %d eye buffers, the menu and the jobs "
+             "kept; waiting for the headset to be worn",
+             now_ms() - switch_started, hmd2::eye_size(), static_cast<double>(fov.out),
+             static_cast<double>(fov.in), static_cast<double>(fov.top),
+             static_cast<double>(fov.bottom), tv_note, renderer->eye_width(),
+             renderer->eye_height(), hmd2::buffer_count());
+        return true;
+    };
+
+    // ---- Back to the TV when the headset is turned off (0.7) --------------
+    // The reverse of switch_to_vr, run between two frames after the VR watch
+    // (hotplug_should_leave_vr) saw the open session's status leave 0. The
+    // scene, the menu, the downloads and the conversion jobs keep running:
+    // only the display path changes. `status_word` is the answer that
+    // triggered it, for the one line.
+    auto switch_to_tv = [&](uint32_t status_word) -> bool {
+        const double switch_started = now_ms();
+        // The VR renderer owns the GPU copy of the scene and the CPU copy was
+        // dropped; read it again for the mono renderer. A read failure cannot
+        // keep the session in VR (the headset is gone): the TV comes up on the
+        // empty view with the menu, as a TV-only start with no readable scene
+        // does.
+        std::string scene_error;
+        if (!reread_scene(scene_error)) {
+            line("viewer: hotplug: %s will not read for the TV (%s); the TV comes up on the "
+                 "empty view and the menu",
+                 scenes.current().folder.filename().string().c_str(), scene_error.c_str());
+        }
+
+        // 1. The mono TV renderer and its frame target/alt image, from the same
+        //    builders a TV-only start uses (make_renderer_options(false) and
+        //    make_vr_targets without the eye-buffer copy pass). Built before
+        //    anything of VR is taken down, so a failure leaves the VR session
+        //    untouched; the caller then ends the session, because the headset is
+        //    already gone.
+        renderer_options = make_renderer_options(false, false);
+        std::string tv_error;
+        std::unique_ptr<splat::SplatRenderer> tv_renderer =
+            make_session_renderer(renderer_options, loaded.scene, "hotplug TV renderer", tv_error);
+        if (tv_renderer == nullptr) {
+            status = 6;
+            reason = "FAIL the TV renderer";
+            line("viewer: hotplug: FAIL the switch to the TV: renderer: %s; the headset is off, so "
+                 "the session ends",
+                 tv_error.c_str());
+            return false;
+        }
+        loaded.scene = splat::SplatScene{};
+        // The TV picture is always part of this path: the session continues on
+        // the TV, and a port that is not up yet is opened below.
+        const splat::Status tv_status = tv_renderer->enable_tv_capture(
+            splat::kTvWidth, splat::kTvHeight, viewer::TvOutput::kSlots);
+        if (!tv_status.ok()) {
+            status = 6;
+            reason = "FAIL the TV picture";
+            line("viewer: hotplug: FAIL the switch to the TV: the TV picture: %s; the session ends",
+                 tv_status.message().c_str());
+            return false;
+        }
+        VrTargetImages tv_targets;
+        std::string targets_error;
+        const char* targets_step = "target image";
+        if (!make_vr_targets(*tv_renderer, false, tv_targets, targets_step, targets_error)) {
+            status = 6;
+            reason = "FAIL the TV target";
+            line("viewer: hotplug: FAIL the switch to the TV: %s: %s; the session ends",
+                 targets_step, targets_error.c_str());
+            return false;
+        }
+
+        // 2. One warm-up frame on the TV renderer before the swap: its pipeline
+        //    compile must not land in the first TV frame. A failed render is the
+        //    one GPU fault in this path and the session ends here (the caller
+        //    breaks out), so the start's leak-on-timeout rule applies: nothing
+        //    this attempt made is freed or destroyed under the device (the
+        //    renderer is released; the target images are raw handles and stay
+        //    allocated too), and the exit teardown then frees nothing either.
+        splat::RenderTarget warm_target = tv_targets.render_target();
+        {
+            const splat::FrameView capture;   // capture pose
+            const splat::Status rendered = tv_renderer->render(capture, warm_target, false);
+            if (!rendered.ok()) {
+                line("viewer: hotplug: FAIL the switch to the TV: the warm-up render: %s",
+                     rendered.message().c_str());
+                run.gpu_ok = false;
+                status = 7;
+                reason = "FAIL render";
+                tv_renderer.release();
+                return false;
+            }
+            warm_target.initial_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
+
+        // 3. The swap. The TV worker reads the VR renderer's slot buffers, so it
+        //    stops before anything is freed. Hmd2 goes down before the eye
+        //    buffers and the copy pass (reprojection must not sample memory this
+        //    title is about to free); this is the same leave_vr() the exit
+        //    teardown uses, so VR mode off, port, tracker, reprojection, the
+        //    VrHand exports and the Hmd2 close happen once, in one order.
+        if (tv_up) tv_output.stop_worker();
+        // The Sense pair belongs to the headset, as at a TV-only start; the
+        // pointer registration is undone by hmd2::shutdown within leave_vr().
+        sense_left.close();
+        sense_right.close();
+        pointer_registered = false;
+        leave_vr(true);
+        if (!tv_up) {
+            // The Hmd2 mirror was the TV's only picture (TV_OUTPUT=0, or a port
+            // that had failed). VR mode is off now, so open the title's own port
+            // as the TV-only start does; without one the loop ends the session.
+            std::string open_error;
+            if (tv_output.start(open_error)) {
+                tv_up = true;
+            } else {
+                line("viewer: hotplug: the TV output would not open after the headset went off "
+                     "(%s)",
+                     open_error.c_str());
+            }
+        }
+        install_display(std::move(tv_renderer), tv_targets, warm_target);
+        // The same app and canvas, now the flat TV panel (swap_panel); the TV
+        // banner builds nothing here because the TV scene is placed at once.
+        swap_panel(true);
+        // The TV session is placed at once (the camera stays where the headset
+        // left it, so the scene does not jump); its 60 Hz pacing restarts here
+        // and its totals start from this switch.
+        placed = true;
+        placed_at = now_ms();
+        next_tv_ms = placed_at;
+        next_tv_frame_ms = placed_at;
+        last_input_ms = placed_at;
+        log_epoch = placed_at;
+        reset_counters(placed_at);
+        tv_gpu_ms_second = 0.0;
+        tv_frames_second = 0;
+        mirror_ok = false;   // no Hmd2 session any more
+        if (tv_up && !tv_output.resume_worker()) {
+            tv_fall_back("the TV worker would not start after the headset went off");
+        }
+        line("viewer: hotplug: switched to the TV in %.0f ms: the headset is off (device status %u, "
+             "not 0), %s, mono renderer %ux%u, the scene, the menu and the jobs kept",
+             now_ms() - switch_started, status_word,
+             tv_up ? "the TV output carries it" : "no TV output", renderer->eye_width(),
+             renderer->eye_height());
+        return true;
+    };
+
+    // The watch runs while the session has a display path to poll; the pure
+    // rules below decide whether a switch is possible (tv_only, switchable),
+    // not this condition. `hmd2_up` is true for every VR session here. A TV
+    // session on the firmware without an export table gets no watch at all:
+    // the card already answered, no switch can work, and the probe would
+    // otherwise still run its Initialize/Open/status/Close/Terminate cycle when
+    // the module resolved the five probe names and missed only a later slot
+    // (hmd2.cpp resolve_module).
+    HmdWatch hotplug(no_vr ? (tv_up && !firmware_no_table) : hmd2_up,
+                     no_vr ? HmdWatch::Goal::on : HmdWatch::Goal::off);
+
     for (;;) {
         const double now_loop = now_ms();
         log_event[0] = '\0';
@@ -2578,46 +3453,24 @@ int run_vr(const VrOptions& options) {
         }
         // Input: edge-triggered, once per frame, from every pad that is there.
         // A missing pad is retried here at kPadRetryMs, not every frame. The
-        // Sense pair is not opened at all on the TV (it belongs to the headset).
+        // Sense pair is not opened at all on the TV (it belongs to the headset;
+        // a VR -> TV switch closes the pair again); the Media Remote is opened
+        // in both sessions.
         dualsense.open(user, now_loop);
+        remote.open(now_loop);
         if (!no_vr) {
             sense_left.open(user, now_loop);
             sense_right.open(user, now_loop);
         }
-        // W26: the grab reads both hands every frame, so each Sense pad is
-        // registered with VrTracker2 as soon as it is open - W25 registered the
-        // right one only while the panel was up, which a grab behind a closed
-        // panel never reaches. register_controller() is idempotent per handle,
-        // so W25's own call is a no-op once this has run. UNVERIFIED on
-        // hardware: the runbook's morning check is what proves the tracked grab.
-        if (sense_left.handle() >= 0 && sense_left_tracker == 0) {
-            sense_left_tracker = hmd2::register_controller(sense_left.handle(), false) ? 1 : -1;
-            line("viewer: grab: left Sense pad %d %s (device 2)%s", sense_left.handle(),
-                 sense_left_tracker > 0 ? "registered with VrTracker2"
-                                        : "tracker registration failed",
-                 sense_left_tracker > 0 ? "; the tracked grab is UNVERIFIED on hardware"
-                                        : "; the grab stays off for that hand");
-        }
-        if (sense_right.handle() >= 0 && sense_right_tracker == 0) {
-            sense_right_tracker = hmd2::register_controller(sense_right.handle(), true) ? 1 : -1;
-            line("viewer: grab: right Sense pad %d %s (device 1)%s", sense_right.handle(),
-                 sense_right_tracker > 0 ? "registered with VrTracker2"
-                                         : "tracker registration failed",
-                 sense_right_tracker > 0 ? "; the tracked grab is UNVERIFIED on hardware"
-                                         : "; the grab stays off for that hand");
-        }
-        // A Sense L1/R1 is its grip (W26), so it is not an immediate scene
-        // switch like the DualSense's: a held grip is the grab, and only a tap
-        // (released inside the tap window with the hand still) steps the scene,
-        // through grab_state.take_tap() below. Dropping the action bits here is
-        // what keeps the press from both grabbing and stepping at once; the
-        // panel's ViewScene is still there. Everything else a Sense pad sends
-        // is unchanged.
-        const uint32_t scene_keys = pad::kPrevScene | pad::kNextScene;
-        const uint32_t pressed = dualsense.take_pressed() |
-                                 (sense_left.take_pressed() & ~scene_keys) |
-                                 (sense_right.take_pressed() & ~scene_keys);
-        const uint32_t held_buttons = dualsense.held() | sense_left.held() | sense_right.held();
+        // Every device goes through the one action table: L1/R1 (the Sense
+        // grips are the same buttons) step the scene, Options opens the menu,
+        // the remote's D-pad left/right step it too (remote_input.h). The right
+        // Sense pad's VrTracker2 registration for the panel's pointer happens
+        // below, while the panel is open.
+        const uint32_t pressed = dualsense.take_pressed() | remote.take_pressed() |
+                                 sense_left.take_pressed() | sense_right.take_pressed();
+        const uint32_t held_buttons =
+            dualsense.held() | remote.held() | sense_left.held() | sense_right.held();
         log_actions = pressed;
         // W16: one frame's routing (ui_mode.h). Options opens the panel; while it
         // is up it takes the whole button word and the left stick through
@@ -2643,6 +3496,66 @@ int run_vr(const VrOptions& options) {
                      kQuitPath.c_str());
                 log_pose("quit");
                 break;
+            }
+        }
+        // 0.7 hot-plug, VR -> TV: the watch thread saw the open session's
+        // device status leave 0 - the headset was turned off (taking it off
+        // while it stays on is not this). The watch is joined first (no Hmd2
+        // call may race the shutdown), then the same between-frame switch
+        // rebuilds the TV path. The TV watch takes over so turning the headset
+        // on again switches back. The pure rule gets the session's own fact
+        // (`vr`), not a precondition that already guarantees it.
+        if (hotplug.enabled() && run.gpu_ok) {
+            const HmdWatch::Snapshot watch = hotplug.snapshot();
+            viewer::VrOffState off;
+            off.vr = !no_vr;
+            off.off_s = watch.seen_s;
+            if (viewer::hotplug_should_leave_vr(off)) {
+                hotplug.stop();
+                if (!switch_to_tv(watch.status)) {
+                    // The TV path would not build on a dead/absent headset;
+                    // there is nothing to show, so end through the one teardown.
+                    break;
+                }
+                hotplug.configure(tv_up, HmdWatch::Goal::on);
+            }
+        }
+        // 0.7 hot-plug: a TV-only session with a headset that has just been
+        // turned on starts the switch here, between two frames. The probe thread
+        // is stopped first (no Hmd2 call may race the init) and started again if
+        // the switch failed. hotplug_should_switch() is the pure rate limit
+        // (hotplug.h): an available headset, a switchable session, and
+        // kHotplugRetrySeconds since the last attempt.
+        if (hotplug.enabled() && run.gpu_ok) {
+            const HmdWatch::Snapshot watch = hotplug.snapshot();
+            viewer::HotplugState plug;
+            // The session's own facts, not constants: the pure rule decides
+            // whether this session may adopt a headset (a TV-only session, a
+            // firmware that can still switch) and whether one has been seen on.
+            plug.tv_only = no_vr;
+            plug.switchable = !firmware_no_table;
+            plug.available_s = watch.seen_s;
+            plug.now_s = now_loop / 1000.0;
+            plug.last_attempt_s = last_switch_attempt_s;
+            if (viewer::hotplug_should_switch(plug)) {
+                last_switch_attempt_s = plug.now_s;
+                hotplug.stop();
+                // A failed attempt probes again only if the GPU is still
+                // trusted: after a failed warm-up (a GPU wait) the attempt's
+                // objects stay leaked and the TV frame that follows is the
+                // device's health check, so the watch is disabled instead of
+                // retrying. A success turns the same watch to VR's own goal (the
+                // headset going away) and clears the retry window: that window
+                // is for failures, so a headset turned off and on again switches
+                // back without a wait.
+                if (switch_to_vr()) {
+                    last_switch_attempt_s = -1.0;
+                    hotplug.configure(hmd2_up, HmdWatch::Goal::off);
+                } else if (switch_gpu_failed) {
+                    hotplug.disable();
+                } else if (run.gpu_ok) {
+                    hotplug.start();
+                }
             }
         }
         // With the TV output up the session has a user at the TV, who may be in
@@ -2721,155 +3634,6 @@ int run_vr(const VrOptions& options) {
                  panel.open() ? "; the open window follows" : "");
         }
         if (placed && route.scene_controls) {
-            // ---- Sense grab (W26) ------------------------------------------
-            // L1 (left Sense) and R1 (right Sense) are the grips (pad_input.h
-            // kGripLeft/kGripRight, HLA-PSVR2 psvr2.c:530). One held: the
-            // scene keeps its place in that hand's frame, so it follows the
-            // hand's motion and turn. Both held: it scales about the point
-            // between the hands. Only the scene transform changes - the head,
-            // the anchor and the comfort radius are untouched, so the viewer
-            // never moves ("sends us flying" was VR5's scale compensation).
-            // A press starts that grab at once; released inside the tap window
-            // with the hand still, it is a tap instead: the grab's own delta is
-            // undone and the press steps the scene (GrabTap, the DualSense
-            // L1/R1 mapping). The panel's route suspends this whole block, so a
-            // grab cannot run behind the menu; the sticks below act on its
-            // result in the same frame. UNVERIFIED on hardware.
-            const bool grip_left = (sense_left.held() & pad::kGripLeft) != 0;
-            const bool grip_right = (sense_right.held() & pad::kGripRight) != 0;
-            // The head pose the previous frame was rendered with (the tracker
-            // sample `last_raw` holds), which is the one the hand poses belong
-            // to: frame() is the same call the renderer below uses.
-            const bool gripping = grip_left || grip_right;
-            splat::HandPose hands[2];
-            splat::FrameView grab_view;
-            if (gripping || grab_state.active()) grab_view = headset.frame();
-            if (gripping && last_raw.head.tracked) {
-                splat::GrabFrame frame;
-                for (int axis = 0; axis < 3; ++axis) {
-                    frame.head_position[axis] = last_raw.head.position[axis];
-                    frame.scene_offset[axis] = headset.scene_offset()[axis];
-                }
-                for (int i = 0; i < 4; ++i) {
-                    frame.head_quaternion[i] = last_raw.head.quaternion[i];
-                }
-                frame.head_scene = grab_view.midpoint;
-                // The head's own yaw in the placement frame: the renderer's
-                // camera yaw has the right-stick turn taken out of it, and the
-                // turn is not part of where the head is.
-                frame.head_scene.yaw = static_cast<float>(headset.scene_yaw());
-                float position[3];
-                float quaternion[4];
-                if (grip_left && hmd2::controller_pose(sense_left.handle(), position, quaternion)) {
-                    hands[0] = splat::grab_hand_pose(frame, position, quaternion, true);
-                }
-                if (grip_right &&
-                    hmd2::controller_pose(sense_right.handle(), position, quaternion)) {
-                    hands[1] = splat::grab_hand_pose(frame, position, quaternion, true);
-                }
-            }
-            if (hands[0].grabbing || hands[1].grabbing || grab_state.active()) {
-                // The viewer's own transform -> the grab's -> back. The grab
-                // always works from what the viewer actually stores, so a stick
-                // press composes instead of fighting it.
-                float head_placement[3];
-                splat::ViewerAdjust adjust;
-                adjust.scale = headset.world_scale();
-                adjust.turn = headset.scene_turn();
-                for (int axis = 0; axis < 3; ++axis) {
-                    head_placement[axis] =
-                        grab_view.midpoint.position[axis] + headset.scene_offset()[axis];
-                    adjust.offset[axis] = headset.scene_offset()[axis];
-                }
-                const splat::SceneTransform before =
-                    splat::scene_transform(adjust, head_placement);
-                const splat::SceneTransform after =
-                    splat::update_grab(grab_state, hands[0], hands[1], before,
-                                       now_loop / 1000.0);
-                bool changed = after.scale != before.scale;
-                for (int i = 0; i < 4; ++i) {
-                    changed = changed || after.rotation[i] != before.rotation[i];
-                }
-                for (int axis = 0; axis < 3; ++axis) {
-                    changed = changed || after.offset[axis] != before.offset[axis];
-                }
-                if (changed) {
-                    const splat::ViewerAdjust wanted = splat::viewer_adjust(after, head_placement);
-                    if (wanted.scale != adjust.scale && adjust.scale > 0.0f) {
-                        headset.scale_scene(wanted.scale / adjust.scale);
-                        set_scale_text(headset.hud_scale());
-                        scale_hint_until = now_loop + kScaleHintMs;
-                        if (scene_stores_scale) scale_dirty = true;
-                    }
-                    // A hand that turns the wrist still turns the scene
-                    // left/right (the same heading the sticks use); pitch and
-                    // roll are not part of the viewer's transform.
-                    if (wanted.turn != adjust.turn) {
-                        headset.turn_scene(wanted.turn - adjust.turn);
-                    }
-                    // scale_scene() keeps its own frozen cone pivot fixed, so
-                    // it moves the offset too; read the offset back and move the
-                    // rest of the way to the grab's. turn_scene() leaves it
-                    // alone.
-                    const float dx = wanted.offset[0] - headset.scene_offset()[0];
-                    const float dy = wanted.offset[1] - headset.scene_offset()[1];
-                    const float dz = wanted.offset[2] - headset.scene_offset()[2];
-                    if (dx != 0.0f || dy != 0.0f || dz != 0.0f) {
-                        // move_scene() moves the scene along the head's yaw
-                        // frame (the frame the sticks use), the grab's offset
-                        // is in the placement frame.
-                        const float yaw = static_cast<float>(headset.scene_yaw());
-                        const float c = std::cos(yaw);
-                        const float s = std::sin(yaw);
-                        headset.move_scene(c * dx - s * dz, s * dx + c * dz, -dy);
-                    }
-                }
-                const bool grabbing_now = hands[0].grabbing || hands[1].grabbing;
-                if (grabbing_now && !grab_gesture) {
-                    grab_gesture = true;
-                    std::snprintf(log_event, sizeof log_event, "%s", "grab start");
-                    line("viewer: grab start: %s, scale=%.2fx (the scene follows the hand; the "
-                         "viewer does not move)",
-                         hands[0].grabbing && hands[1].grabbing
-                             ? "both hands"
-                             : (hands[0].grabbing ? "left hand" : "right hand"),
-                         static_cast<double>(headset.hud_scale()));
-                } else if (!grabbing_now && grab_gesture) {
-                    grab_gesture = false;
-                    // The grab's own scaling went through scale_scene(), which
-                    // begins a scale gesture; end it here, so the pivot state
-                    // is clean for the next L2/R2 press and its "scale end"
-                    // event. A trigger that is down at the same time keeps its
-                    // own gesture (the block below ends that one).
-                    if (!scale_gesture) headset.end_scale_gesture();
-                    std::snprintf(log_event, sizeof log_event, "%s", "grab end");
-                    line("viewer: grab end: scale=%.2fx, offset %.2f %.2f %.2f m kept (the viewer "
-                         "moved 0.00 m)",
-                         static_cast<double>(headset.hud_scale()),
-                         static_cast<double>(headset.scene_offset()[0]),
-                         static_cast<double>(headset.scene_offset()[1]),
-                         static_cast<double>(headset.scene_offset()[2]));
-                    // A grab may have scaled an imported scene: release is a
-                    // save point, debounced to one write a second.
-                    if (scale_dirty && now_loop >= next_grab_save_ms) {
-                        next_grab_save_ms = now_loop + 1000.0;
-                        save_view("grab release");
-                    }
-                }
-                // A grip released inside the tap window with the hand still
-                // was a tap, not a grab: the grab's own tiny delta has been
-                // undone above, and the press steps the scene like the
-                // DualSense's L1/R1 (left = previous, right = next).
-                const splat::GrabTap tap = grab_state.take_tap();
-                if (tap == splat::GrabTap::previous) {
-                    log_actions |= pad::kPrevScene;
-                    step_scene("L1 tap", false);
-                } else if (tap == splat::GrabTap::next) {
-                    log_actions |= pad::kNextScene;
-                    step_scene("R1 tap", true);
-                }
-            }
-
             // Cross held for one second recentres the *scene*; this block only
             // runs with the panel closed (route.scene_controls), so the same
             // button is the panel's Select/recentre while it is up. A short
@@ -2909,8 +3673,8 @@ int run_vr(const VrOptions& options) {
             // the frozen cone pivot, the left stick walks and the right stick
             // rises and turns (all three move the *viewer*, not the scene in
             // the opposite direction - headset test 4).
-            const pad::ViewControl control =
-                pad::view_control(dualsense.axes(), sense_left.axes(), sense_right.axes());
+            const pad::ViewControl control = pad::view_control(
+                dualsense.axes(), sense_left.axes(), sense_right.axes());
 
             if (control.scale != 0.0f && (!scale_gesture &&
                                           head_speed_dps > kScaleMaxHeadDegreesPerSecond)) {
@@ -3023,17 +3787,6 @@ int run_vr(const VrOptions& options) {
                      static_cast<double>(headset.scene_offset()[1]),
                      static_cast<double>(headset.scene_offset()[2]),
                      headset.scene_turn() * kRadToDeg);
-            }
-            if (grab_gesture) {
-                // The grip is still down, but the menu owns the input now: the
-                // gesture ends here and keeps the scene where it is, instead of
-                // resuming behind the panel when it closes. The grab's scaling
-                // (if any) goes with it: no scale gesture outlives the grab.
-                grab_gesture = false;
-                grab_state.reset();
-                headset.end_scale_gesture();
-                line("viewer: grab end: scale=%.2fx (the menu suspended the scene controls)",
-                     static_cast<double>(headset.hud_scale()));
             }
             service_preload();
         } else {
@@ -3645,6 +4398,13 @@ int run_vr(const VrOptions& options) {
         const double now = now_ms();
         if (now - second_started >= 1000.0) log_vr_second(now);
     }
+
+    // The watch thread stops before anything is read from Hmd2 or torn down: no
+    // Hmd2 call runs next to the final counters, the teardown or the exit. After
+    // a switch it was stopped before the init/shutdown and restarted in the new
+    // mode; this stop covers whichever mode the session ends in, after any
+    // number of switches.
+    hotplug.stop();
 
     // v0.2 RC: an imported scene's scale that no save point caught up with is
     // stored here, on the one exit every path goes through (Quit, the quit file,
